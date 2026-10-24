@@ -1,6 +1,7 @@
 # Limits and failure modes
 
-Implemented: real differentiable neural rectified-flow training; CPU Adam updates;
+Implemented: real differentiable neural rectified-flow training; CPU and optional
+OpenCL Adam updates;
 WAV/FFmpeg ingestion; mono f32 output; unconditional and masked sampling; exact
 canonical protected samples; learned prefix continuation and hole inpainting;
 experimental anchored variation; Euler/Heun; seeded noise scaling and bounded
@@ -50,9 +51,9 @@ output for any of those results. No subjective listening evaluation is claimed.
 * FFmpeg/FFprobe must be available; codec support depends on their build. The
   tests exercise six transcoded formats on this installation. Unsupported input
   is an error/recorded skip, not fake training success.
-* GPU/OpenCL training is not implemented. Existing OpenCL work was inspected
-  read-only. See reports/OPENCL.md for runtime discovery, reusable patterns and a
-  concrete acceleration gate. There is no hidden CPU/GPU switch.
+* Optional complete FP32 OpenCL training is verified on Adreno830. CPU remains
+  default; GPU selection is explicit. See reports/OPENCL_TRAINING.md for parity,
+  process-local runtime setup and measured performance limits.
 
 Phase 2 adds longer pooled context and reproducible held-out diagnostics, not a
 perceptual quality solution. The equal-step pooled candidate underperformed. Its
@@ -89,3 +90,7 @@ automatic fallback, recorded queue optimization or claim of maximum hardware
 performance. The short paired benchmark was foreground but thermally uncontrolled.
 The long-run supervisor reads temperatures before/after chunks, not continuously;
 its cooling settings are operator thresholds, not manufacturer safety ratings.
+
+The100k follow-up improves same-song endpoint probes but retains spectral imbalance.
+More training does not establish music or cross-recording generalization; see
+[OpenCL training results](reports/OPENCL_TRAINING.md).

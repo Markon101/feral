@@ -189,3 +189,8 @@ continuity fix are documented in [PHASE2.md](PHASE2.md).
 
 Phase 3: the current 25-test suite, versioned scale-aware flow, replicated comparisons
 and level-matched audio/control export are documented in [PHASE3.md](PHASE3.md).
+
+Current follow-up: all25 reference tests plus2 explicitly run OpenCL hardware
+tests pass. Complete resident GPU training and the100k continuation, including
+measured limits and new listening artifacts, are in [OPENCL_TRAINING.md](OPENCL_TRAINING.md).
+Earlier deferral/timing statements above are historical.

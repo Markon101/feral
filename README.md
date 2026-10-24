@@ -214,3 +214,12 @@ failure is an error, never silent CPU fallback. `gpu-audit` requires a checkpoin
 whose dataset is still available. Hardware tests are explicit and ignored in
 ordinary test runs. Read the [protocol](reports/OPENCL_TRAINING_PROTOCOL.md) for
 parity gates, measured warm-phone timings and the checkpointed cooling supervisor.
+
+The verified longer run reaches **100,000 total updates** from the calibrated3k
+checkpoint. Same-song held-out endpoint MSE improved43.3%; this is not a musical
+quality score. Ten-second listening packs are at
+`/sdcard/FERAL_OpenCL_100k_20261024/` (seed42) and
+`/sdcard/FERAL_OpenCL_100k_Take2_20261024/` (fresh seed99). Compare
+`level_matched/current.wav` with `baseline.wav` and the labeled noise controls.
+The checkpoint is `runs/opencl-long100k-v1/final-checkpoint.json`.
+See [full results and reproduction](reports/OPENCL_TRAINING.md).

@@ -16,9 +16,11 @@
    variation. Separate signal, phase, timbral and musical continuity measurements.
    Preserve the new transient slope/headroom tests and exact known samples.
 
-Optional OpenCL remains behind actual discovery and forward/backward/update parity.
-The smaller pooled computation reduces CPU work; quantify end-to-end benefit before
-adding kernels, transfer synchronization or a new optimizer backend.
+Complete optional FP32 OpenCL training now passes discovery, forward/backward/Adam
+parity and resume tests on Adreno830. The100k continuation improves same-song
+held-out reconstruction. Profile host/dispatch overhead next; recorded queues,
+FP16 and other devices need separate correctness and performance gates. See
+reports/OPENCL_TRAINING.md.
 
 Later: learned codec + sample correction, recurrent latent context, coarse musical
 structure/fine waveform heads, alternative continuous objectives, interpolation,

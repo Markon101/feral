@@ -110,7 +110,11 @@ impl OpenClTrainer {
         let cache = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("cache/opencl")
             .join(format!("{key}.bin"));
-        let program = if let Ok(bytes) = fs::read(&cache) {
+        let cached = fs::metadata(&cache)
+            .ok()
+            .filter(|m| m.len() <= 32 * 1024 * 1024)
+            .and_then(|_| fs::read(&cache).ok());
+        let program = if let Some(bytes) = cached {
             if bytes.len() <= 32 * 1024 * 1024 {
                 Program::create_and_build_from_binary(&context, &[&bytes], OPTIONS).ok()
             } else {

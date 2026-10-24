@@ -115,7 +115,8 @@ kernel void statistics(global const float *grad,global const float *loss_parts,g
 }
 kernel void adam_update(global float *weights,global float *m,global float *v,global const float *grad,
                         global float *stats,uint n,float lr,float c1,float c2) {
-  uint i=get_global_id(0);if(i>=n||stats[3]!=0.0f)return;
+  // stats[3] is the atomic error flag. Do not concurrently read it nonatomically.
+  uint i=get_global_id(0);if(i>=n||!isfinite(stats[0])||!isfinite(stats[1]))return;
   float g=grad[i]*stats[2],mm=0.9f*m[i]+0.1f*g,vv=0.999f*v[i]+0.001f*g*g;
   float p=weights[i]-lr*(mm/c1)/(sqrt(vv/c2)+1e-8f);m[i]=mm;v[i]=vv;weights[i]=p;
   if(!isfinite(p)||!isfinite(mm)||!isfinite(vv))atomic_or((volatile global int*)(stats+3),1);

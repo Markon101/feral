@@ -1,7 +1,7 @@
 # OpenCL readiness audit (historical)
 
 Superseded on 2026-10-24: process-local vendor runtime discovery and complete
-FP32 GPU training now pass parity gates. See [training protocol](OPENCL_TRAINING_PROTOCOL.md).
+FP32 GPU training now pass parity gates. See [training results](OPENCL_TRAINING.md) and [protocol](OPENCL_TRAINING_PROTOCOL.md).
 The original failed launch context and deferral below are retained as evidence.
 
 Read-only bounded inspection on 2026-10-24:

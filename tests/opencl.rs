@@ -52,3 +52,26 @@ fn full_gpu_training_and_checkpoint_roundtrip() {
     assert!(root.join("all/generated.wav").exists());
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+#[ignore = "requires actual OpenCL GPU; no CPU fallback"]
+fn gpu_reports_optimizer_overflow() {
+    use feral::{gpu::OpenClTrainer, model::Model, runtime::Adam};
+    let model = Model::new(
+        Architecture {
+            block: 4,
+            width: 5,
+            dilations: vec![1, 2],
+            scales: vec![1, 2],
+        },
+        7,
+    );
+    let mut adam = Adam::new(model.count(), 1.);
+    // Finite but deliberately impossible optimizer state: the first bias-corrected
+    // moment overflows. Exercise actual device error reporting, not a host input gate.
+    adam.m.fill(f32::MAX);
+    let mut gpu = OpenClTrainer::new(&model, &adam, 68, FlowConfig::Velocity).unwrap();
+    let result = gpu.train_step(&[0.1; 68], &[0.; 68], &[0.2; 68], 0.37);
+    assert!(result.err().unwrap().to_string().contains("nonfinite"));
+    assert_eq!(gpu.step, 0);
+}
