@@ -9,6 +9,8 @@ pub struct Architecture {
     pub block: usize,
     pub width: usize,
     pub dilations: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scales: Vec<usize>,
 }
 impl Default for Architecture {
     fn default() -> Self {
@@ -16,10 +18,38 @@ impl Default for Architecture {
             block: 32,
             width: 64,
             dilations: vec![1, 2, 4, 8],
+            scales: vec![],
         }
     }
 }
 impl Architecture {
+    pub fn pyramid() -> Self {
+        Self {
+            scales: vec![1, 4, 16, 64],
+            dilations: vec![1, 1, 1, 1],
+            ..Self::default()
+        }
+    }
+    pub fn scale(&self, layer: usize) -> usize {
+        self.scales.get(layer).copied().unwrap_or(1)
+    }
+    /// Structural interior support, including aligned average-pooling groups.
+    pub fn context_samples(&self) -> usize {
+        let period = self.scales.iter().copied().max().unwrap_or(1);
+        (0..period)
+            .map(|p| {
+                let (mut lo, mut hi) = (p as isize, p as isize);
+                for j in (0..self.dilations.len()).rev() {
+                    let s = self.scale(j) as isize;
+                    let d = self.dilations[j] as isize;
+                    lo = lo.div_euclid(s) * s - d * s;
+                    hi = hi.div_euclid(s) * s + d * s + s - 1;
+                }
+                (hi - lo + 1) as usize * self.block
+            })
+            .max()
+            .unwrap_or(self.block)
+    }
     pub fn validate(&self) -> Result<()> {
         ensure!(
             (1..=64).contains(&self.block) && (1..=128).contains(&self.width),
@@ -31,8 +61,52 @@ impl Architecture {
                 && self.dilations.iter().all(|d| (1..=64).contains(d)),
             "invalid dilations"
         );
+        ensure!(
+            self.scales.is_empty()
+                || (self.scales.len() == self.dilations.len()
+                    && self
+                        .scales
+                        .iter()
+                        .all(|s| [1, 2, 4, 8, 16, 32, 64].contains(s))),
+            "invalid residual scales"
+        );
         Ok(())
     }
+}
+// Average-pooling and its transpose use the actual final-group length, never padded zeros.
+fn pool(x: &[f32], frames: usize, channels: usize, scale: usize) -> Vec<f32> {
+    let mut y = vec![0.; frames.div_ceil(scale) * channels];
+    for p in 0..frames {
+        let count = scale.min(frames - (p / scale) * scale) as f32;
+        for c in 0..channels {
+            y[(p / scale) * channels + c] += x[p * channels + c] / count;
+        }
+    }
+    y
+}
+fn pool_transpose(x: &[f32], frames: usize, channels: usize, scale: usize) -> Vec<f32> {
+    let mut y = vec![0.; frames * channels];
+    for p in 0..frames {
+        let count = scale.min(frames - (p / scale) * scale) as f32;
+        for c in 0..channels {
+            y[p * channels + c] = x[(p / scale) * channels + c] / count;
+        }
+    }
+    y
+}
+fn repeat(x: &[f32], frames: usize, channels: usize, scale: usize) -> Vec<f32> {
+    (0..frames * channels)
+        .map(|i| x[(i / channels / scale) * channels + i % channels])
+        .collect()
+}
+fn repeat_transpose(x: &[f32], frames: usize, channels: usize, scale: usize) -> Vec<f32> {
+    let mut y = vec![0.; frames.div_ceil(scale) * channels];
+    for p in 0..frames {
+        for c in 0..channels {
+            y[(p / scale) * channels + c] += x[p * channels + c];
+        }
+    }
+    y
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Layer {
@@ -176,13 +250,27 @@ impl Model {
         let mut nonlinear = vec![];
         let mut h = features.clone();
         for (j, l) in self.layers.iter().enumerate() {
-            let mut z = l.forward(&h, frames);
+            let residual = j > 0 && j + 1 < self.layers.len();
+            let scale = if residual {
+                self.architecture.scale(j - 1)
+            } else {
+                1
+            };
+            let pooled = if scale > 1 {
+                pool(&h, frames, l.input, scale)
+            } else {
+                h.clone()
+            };
+            let mut z = l.forward(&pooled, frames.div_ceil(scale));
             if j + 1 < self.layers.len() {
                 for v in &mut z {
                     *v = v.tanh();
                 }
                 nonlinear.push(z.clone());
-                if j > 0 {
+                if scale > 1 {
+                    z = repeat(&z, frames, l.output, scale);
+                }
+                if residual {
                     for (v, old) in z.iter_mut().zip(&h) {
                         *v = old + 0.5 * *v;
                     }
@@ -207,7 +295,17 @@ impl Model {
         let mut grads = vec![Vec::new(); self.layers.len()];
         for j in (0..self.layers.len()).rev() {
             let residual = j > 0 && j + 1 < self.layers.len();
-            let mut dz = dh.clone();
+            let layer = &self.layers[j];
+            let scale = if residual {
+                self.architecture.scale(j - 1)
+            } else {
+                1
+            };
+            let mut dz = if scale > 1 {
+                repeat_transpose(&dh, frames, layer.output, scale)
+            } else {
+                dh.clone()
+            };
             if j + 1 < self.layers.len() {
                 for (g, &a) in dz.iter_mut().zip(&tape.nonlinear[j]) {
                     *g *= (1. - a * a) * if residual { 0.5 } else { 1. };
@@ -218,7 +316,17 @@ impl Model {
             } else {
                 &tape.acts[j - 1]
             };
-            let (mut dx, dw, db) = self.layers[j].backward(input, &dz, frames);
+            let pooled = if scale > 1 {
+                pool(input, frames, layer.input, scale)
+            } else {
+                input.clone()
+            };
+            let (dx, dw, db) = layer.backward(&pooled, &dz, frames.div_ceil(scale));
+            let mut dx = if scale > 1 {
+                pool_transpose(&dx, frames, layer.input, scale)
+            } else {
+                dx
+            };
             if residual {
                 for (g, old) in dx.iter_mut().zip(&dh) {
                     *g += old;

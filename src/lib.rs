@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod conditioning;
 pub mod data;
+pub mod evaluate;
 pub mod flow;
 pub mod model;
 pub mod rng;

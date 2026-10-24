@@ -47,6 +47,28 @@ enum Commands {
     Inpaint(RenderArgs),
     /// Regenerate between short protected anchors (experimental).
     Variation(RenderArgs),
+    /// Fixed paired held-out flow probes, acoustic metrics and zero/noisy controls.
+    Evaluate {
+        #[arg(long)]
+        checkpoint: PathBuf,
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 4)]
+        crops: usize,
+        #[arg(long, default_value_t = 7001)]
+        seed: u64,
+    },
+    /// Signal descriptors and bounded copying screen with shuffled/noise/copy controls.
+    Analyze {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        reference: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Tiny actual training + sampling on deterministic diagnostic audio.
     Smoke {
         #[arg(long)]
@@ -82,6 +104,9 @@ impl AudioArgs {
 }
 #[derive(Args)]
 struct TrainArgs {
+    /// baseline preserves v1; pyramid pools residual branches at scales 1/4/16/64.
+    #[arg(long, default_value="baseline", value_parser=["baseline", "pyramid"])]
+    network: String,
     #[arg(long)]
     input: PathBuf,
     #[arg(long)]
@@ -245,13 +270,33 @@ fn main() -> Result<()> {
                 checkpoint_every: a.checkpoint_every,
                 resume: a.resume,
                 weights_only: a.weights_only,
-                architecture: Architecture::default(),
+                architecture: if a.network == "pyramid" {
+                    Architecture::pyramid()
+                } else {
+                    Architecture::default()
+                },
             })?;
         }
         Commands::Generate(a) => runtime::render(a.config(Mode::Generate))?,
         Commands::Continue(a) => runtime::render(a.config(Mode::Continue))?,
         Commands::Inpaint(a) => runtime::render(a.config(Mode::Inpaint))?,
         Commands::Variation(a) => runtime::render(a.config(Mode::Variation))?,
+        Commands::Evaluate {
+            checkpoint,
+            input,
+            output,
+            crops,
+            seed,
+        } => {
+            feral::evaluate::evaluate(&checkpoint, &input, &output, crops, seed)?;
+        }
+        Commands::Analyze {
+            input,
+            reference,
+            output,
+        } => {
+            feral::evaluate::analyze(&input, &reference, &output)?;
+        }
         Commands::Smoke { run, steps } => {
             if let Some(parent) = run.parent() {
                 fs::create_dir_all(parent)?;

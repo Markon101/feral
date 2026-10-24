@@ -28,6 +28,7 @@ fn tiny() -> Model {
             block: 4,
             width: 5,
             dilations: vec![1, 2],
+            scales: vec![],
         },
         7,
     )
@@ -262,6 +263,7 @@ fn config(root: &Path, run: &str, steps: usize, resume: Option<PathBuf>) -> Trai
             block: 4,
             width: 5,
             dilations: vec![1, 2],
+            scales: vec![],
         },
     }
 }
@@ -378,5 +380,151 @@ fn smoke_cli_creates_nested_parent_and_refuses_existing_run() {
     assert!(run.join("training/checkpoint.json").exists());
     assert!(run.join("training/generated.wav").exists());
     assert!(!invoke().status.success());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn pyramid_gradients_shapes_and_partial_pool_groups() {
+    let a = Architecture {
+        block: 4,
+        width: 5,
+        dilations: vec![1, 2, 4],
+        scales: vec![1, 2, 4],
+    };
+    a.validate().unwrap();
+    let mut m = Model::new(a, 7);
+    // 17 frames deliberately leaves incomplete pooling groups.
+    let (y, z, mask) = vectors(68);
+    let p = m.parameters();
+    let (loss, g) = flow::loss_gradient(&m, &y, &mask, &z, 0.37);
+    assert!(loss.is_finite());
+    let mut offset = 0;
+    let mut indices = vec![];
+    for l in &m.layers {
+        indices.extend([
+            offset,
+            offset + l.w.len() / 2,
+            offset + l.w.len() - 1,
+            offset + l.w.len(),
+            offset + l.w.len() + l.b.len() - 1,
+        ]);
+        offset += l.w.len() + l.b.len();
+    }
+    for i in indices {
+        let mut pp = p.clone();
+        pp[i] += 0.002;
+        m.set_parameters(&pp);
+        let hi = flow::loss_gradient(&m, &y, &mask, &z, 0.37).0;
+        pp[i] -= 0.004;
+        m.set_parameters(&pp);
+        let lo = flow::loss_gradient(&m, &y, &mask, &z, 0.37).0;
+        let fd = (hi - lo) / 0.004;
+        assert!(
+            (fd - g[i]).abs() < 0.0005 + 0.02 * fd.abs(),
+            "pyramid gradient {i}: {} vs {fd}",
+            g[i]
+        );
+    }
+    m.set_parameters(&p);
+    Adam::new(m.count(), 0.001).update(&mut m, &g).unwrap();
+    assert_ne!(p, m.parameters());
+    let c = Sampling {
+        steps: 3,
+        ..Default::default()
+    };
+    let out = flow::sample(&m, &y, &mask, &c).unwrap();
+    assert_eq!(out.len(), 68);
+    for i in 0..68 {
+        if mask[i] == 1. {
+            assert_eq!(out[i], y[i]);
+        }
+    }
+}
+#[test]
+fn pyramid_adds_real_differentiable_context_without_parameters() {
+    let baseline = Model::new(Architecture::default(), 7);
+    let pyramid = Model::new(Architecture::pyramid(), 7);
+    assert_eq!(baseline.parameters(), pyramid.parameters());
+    assert_eq!(baseline.architecture.context_samples(), 992);
+    assert_eq!(pyramid.architecture.context_samples(), 7488);
+    let n = 8192;
+    let x = vec![0.; n];
+    let mut changed = x.clone();
+    changed[4096 + 1024] = 1.;
+    let zeros = vec![0.; n];
+    let b0 = baseline.velocity(&x, &zeros, &zeros, 0.5);
+    let b1 = baseline.velocity(&changed, &zeros, &zeros, 0.5);
+    assert_eq!(&b0[4096..4128], &b1[4096..4128]);
+    let p0 = pyramid.velocity(&x, &zeros, &zeros, 0.5);
+    let p1 = pyramid.velocity(&changed, &zeros, &zeros, 0.5);
+    assert!(p0[4096..4128]
+        .iter()
+        .zip(&p1[4096..4128])
+        .any(|(a, b)| (a - b).abs() > 1e-7));
+    let old = serde_json::to_value(&baseline).unwrap();
+    assert!(old["architecture"].get("scales").is_none());
+    let restored: Model = serde_json::from_value(old).unwrap();
+    assert_eq!(b0, restored.velocity(&x, &zeros, &zeros, 0.5));
+}
+
+#[test]
+fn acoustic_metrics_and_copy_detector_have_hostile_controls() {
+    use feral::evaluate::{acoustic, nearest_correlation};
+    let mut rng = Rng::new(12);
+    let x: Vec<f32> = (0..512).map(|_| rng.normal() * 0.2).collect();
+    let exact = acoustic(&x, &x);
+    assert_eq!(exact.mse, 0.);
+    assert_eq!(exact.derivative_mse, 0.);
+    assert_eq!(exact.log_spectral_l1, 0.);
+    assert!(exact.coarse_mse.iter().all(|&v| v == 0.));
+    let mut changed = x.clone();
+    changed[100] += 0.1;
+    let m = acoustic(&x, &changed);
+    assert!(m.mse > 0. && m.log_spectral_l1 > 0. && m.derivative_mse > 0.);
+    let mut reference = vec![0.; 64];
+    reference.extend(&x);
+    reference.extend([0.; 64]);
+    assert!(nearest_correlation(&x, &reference, 16) > 0.99999);
+    let noise: Vec<f32> = (0..512).map(|_| rng.normal()).collect();
+    assert!(nearest_correlation(&noise, &reference, 16) < 0.5);
+}
+#[test]
+fn heldout_probe_controls_and_pyramid_full_resume() {
+    let m = tiny();
+    let (y, z, _) = vectors(64);
+    let p = feral::evaluate::probe(&m, &y, &z, 2, 0.5);
+    assert!(p.velocity_mse.is_finite() && p.endpoint.log_spectral_l1.is_finite());
+    assert_eq!(p.task, "hole");
+    let dir = temp();
+    audio::synthetic(&dir.join("corpus"), 16000).unwrap();
+    let cfg = |name, steps, resume| {
+        let mut c = config(&dir, name, steps, resume);
+        c.architecture.scales = vec![2, 4];
+        c
+    };
+    let all = runtime::train(cfg("p-all", 4, None)).unwrap();
+    let first = runtime::train(cfg("p-first", 2, None)).unwrap();
+    let second = runtime::train(cfg("p-second", 2, Some(first))).unwrap();
+    let a = Checkpoint::load(&all).unwrap();
+    let b = Checkpoint::load(&second).unwrap();
+    assert_eq!(a.model.parameters(), b.model.parameters());
+    assert_eq!(a.adam.m, b.adam.m);
+    assert_eq!(a.rng.state, b.rng.state);
+    feral::evaluate::evaluate(
+        &all,
+        &dir.join("corpus/pattern-1.wav"),
+        &dir.join("eval.json"),
+        1,
+        21,
+    )
+    .unwrap();
+    assert!(feral::evaluate::evaluate(
+        &all,
+        &dir.join("corpus/pattern-1.wav"),
+        &dir.join("eval.json"),
+        1,
+        21
+    )
+    .is_err());
     fs::remove_dir_all(dir).unwrap();
 }
