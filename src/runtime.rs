@@ -350,6 +350,8 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     let mut optimizer_ms = 0.;
     let mut step_ms = Vec::new();
     let mut task_counts = std::collections::BTreeMap::new();
+    let mut source_counts = std::collections::BTreeMap::new();
+    let mut silence_retries = 0usize;
     let training_start = Instant::now();
     eprintln!(
         "FERAL training: {} parameters, {} samples/crop, {} files, preprocessing {:.1} ms",
@@ -360,11 +362,12 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     );
     for local in 1..=c.steps {
         let start = Instant::now();
-        let clean = dataset.crop(n, &mut ck.rng);
-        ensure!(
-            !clean.is_empty(),
-            "16 crop attempts were silent; reduce --silence-rms or select useful audio"
-        );
+        let crop = dataset
+            .crop_traced(n, &mut ck.rng)
+            .context("16 crop attempts were silent; reduce --silence-rms or select useful audio")?;
+        *source_counts.entry(crop.source_index).or_insert(0usize) += 1;
+        silence_retries += crop.silence_rejections;
+        let clean = crop.samples;
         let (mask, task) = conditioning::training_mask(n, &mut ck.rng);
         *task_counts.entry(task).or_insert(0usize) += 1;
         let noise: Vec<f32> = (0..n)
@@ -393,7 +396,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         writeln!(
             log,
             "{}",
-            serde_json::json!({"step":ck.completed_steps,"loss":loss,"gradient_norm":norm,"task":task,"t":t,"milliseconds":ms,"rng_state":ck.rng.state})
+            serde_json::json!({"step":ck.completed_steps,"loss":loss,"gradient_norm":norm,"task":task,"t":t,"milliseconds":ms,"rng_state":ck.rng.state,"source_index":crop.source_index,"crop_start_sample":crop.start_sample,"crop_attempts":crop.attempts,"silence_rejections":crop.silence_rejections})
         )?;
         if local == 1 || local % 10 == 0 || local == c.steps {
             eprintln!(
@@ -440,7 +443,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     step_ms.sort_by(|a, b| a.total_cmp(b));
     write_json(
         &c.run.join("metrics.json"),
-        &serde_json::json!({"backend":trainer.name(),"backend_info":trainer.info(),"timing_scope":if c.backend=="cpu" {"CPU wall operations"}else{"GPU event operation totals; step wall includes transfers, enqueue and sync"},"flow":ck.flow,"loss_units":if ck.flow.is_legacy(){"waveform velocity MSE"}else{"normalized Gaussian-residual MSE"},"parameters":ck.model.count(),"steps":c.steps,"total_steps":ck.completed_steps,"preprocessing_ms":preprocessing_ms,"neural_forward_backward_ms":neural_ms,"optimizer_ms":optimizer_ms,"training_wall_ms_with_previews":training_wall_ms,"step_mean_ms":step_ms.iter().sum::<f64>()/step_ms.len() as f64,"step_median_ms":step_ms[step_ms.len()/2],"step_max_ms":step_ms.last(),"final_sampling_ms":final_sampling_ms,"other_sampling_ms":sampling_ms,"sampling":sample_config,"peak_rss_kib":peak_rss_kib(),"fixed_probe_initial_loss":initial_eval,"fixed_probe_final_loss":final_eval,"same_noise_output_mse_change":delta,"generated_rms":audio::rms(&final_audio),"task_counts":task_counts,"quality_claim":"pipeline verification only; no perceptual quality or generalization established"}),
+        &serde_json::json!({"backend":trainer.name(),"backend_info":trainer.info(),"timing_scope":if c.backend=="cpu" {"CPU wall operations"}else{"GPU event operation totals; step wall includes transfers, enqueue and sync"},"flow":ck.flow,"loss_units":if ck.flow.is_legacy(){"waveform velocity MSE"}else{"normalized Gaussian-residual MSE"},"parameters":ck.model.count(),"steps":c.steps,"total_steps":ck.completed_steps,"preprocessing_ms":preprocessing_ms,"neural_forward_backward_ms":neural_ms,"optimizer_ms":optimizer_ms,"training_wall_ms_with_previews":training_wall_ms,"step_mean_ms":step_ms.iter().sum::<f64>()/step_ms.len() as f64,"step_median_ms":step_ms[step_ms.len()/2],"step_max_ms":step_ms.last(),"final_sampling_ms":final_sampling_ms,"other_sampling_ms":sampling_ms,"sampling":sample_config,"peak_rss_kib":peak_rss_kib(),"fixed_probe_initial_loss":initial_eval,"fixed_probe_final_loss":final_eval,"same_noise_output_mse_change":delta,"generated_rms":audio::rms(&final_audio),"task_counts":task_counts,"source_counts":source_counts,"silence_retries":silence_retries,"crop_sampling":"uniform file then uniform start; retry silent crops","quality_claim":"pipeline verification only; no perceptual quality or generalization established"}),
     )?;
     eprintln!(
         "checkpoint {} | probe {:.6} -> {:.6} | output delta MSE {:.6}",

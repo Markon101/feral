@@ -163,3 +163,26 @@ V1 means raw velocity; v2 means unit-prior preconditioning; v3 permits non-unit
 priors. Loading and resume validate the version/configuration contract. Missing
 legacy fields retain their original semantics and outputs. GaussianReference and
 AR(1) examples are non-neural falsification controls, not the primary generator.
+
+## Explicit capacity and data diagnostics (Phase4)
+
+Training width is configurable through Architecture::with_width and --width;
+64 remains the default,128 has214,176 parameters,256 has821,536. The existing
+network topology, scalar objective, flow prior and checkpoint format do not change.
+CPU finite differences and actual GPU forward/backward/Adam parity gate widening.
+Same-width old seeded renders remain byte-identical. Wider full resume requires
+an explicit matching CLI width.
+
+Dataset::crop_traced exposes accepted source/start/attempts without extra RNG
+operations. Its legacy crop wrapper remains exact. Runtime records those traces
+and source/retry counts; sampling remains uniform-file then uniform-start. Prepared
+equal-duration files make the primary diversity experiment's weighting explicit.
+Original source intervals and hashes are recorded by the preparation sidecar;
+loader dataset hashes identify the exact resulting PCM files.
+
+structure is forward-only diagnostic code using existing RustFFT. Its f64
+phase null preserves DC, Nyquist and conjugate symmetry; magnitude/power/RMS errors
+are measured. Ten-millisecond envelopes, modulation and normalized overlap
+correlations describe time variation. The surrogate never enters the neural
+training path or replaces learned generation. Phase-null differences are not
+proof of music, pitch competence, useful memory or generalization.

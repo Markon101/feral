@@ -12,3 +12,5 @@ pub mod runtime;
 pub mod gpu;
 
 pub mod backend;
+
+pub mod structure;

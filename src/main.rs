@@ -129,6 +129,9 @@ struct TrainArgs {
     /// baseline preserves v1; pyramid pools residual branches at scales 1/4/16/64.
     #[arg(long, default_value="baseline", value_parser=["baseline", "pyramid"])]
     network: String,
+    /// Hidden channels; 32..256 in multiples of 16. Width changes require fresh weights.
+    #[arg(long, default_value_t = 64, value_parser = parse_width)]
+    width: usize,
     #[arg(long)]
     input: PathBuf,
     #[arg(long)]
@@ -210,6 +213,13 @@ impl RenderArgs {
             mode,
         }
     }
+}
+fn parse_width(value: &str) -> std::result::Result<usize, String> {
+    let width = value.parse::<usize>().map_err(|e| e.to_string())?;
+    Architecture::default()
+        .with_width(width)
+        .map_err(|e| e.to_string())?;
+    Ok(width)
 }
 fn main() -> Result<()> {
     match Cli::parse().command {
@@ -305,11 +315,12 @@ fn main() -> Result<()> {
                 checkpoint_every: a.checkpoint_every,
                 resume: a.resume,
                 weights_only: a.weights_only,
-                architecture: if a.network == "pyramid" {
+                architecture: (if a.network == "pyramid" {
                     Architecture::pyramid()
                 } else {
                     Architecture::default()
-                },
+                })
+                .with_width(a.width)?,
             })?;
         }
         Commands::Generate(a) => runtime::render(a.config(Mode::Generate))?,

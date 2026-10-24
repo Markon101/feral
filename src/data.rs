@@ -24,6 +24,17 @@ pub struct DatasetIdentity {
     pub preprocess: Preprocess,
     pub manifest_hash: String,
 }
+/// A successful canonical crop and the sampling decisions that selected it.
+/// Source indices refer directly to `DatasetIdentity::sources` and `Dataset::audio`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Crop {
+    pub samples: Vec<f32>,
+    pub source_index: usize,
+    pub start_sample: usize,
+    /// Includes the successful attempt; at most sixteen candidates are drawn.
+    pub attempts: usize,
+    pub silence_rejections: usize,
+}
 pub struct Dataset {
     pub audio: Vec<Vec<f32>>,
     pub identity: DatasetIdentity,
@@ -123,15 +134,32 @@ impl Dataset {
         };
         Ok(Self { audio, identity })
     }
+    /// Preserve the original uniform-file sampling and random stream exactly.
     pub fn crop(&self, n: usize, rng: &mut Rng) -> Vec<f32> {
-        for _ in 0..16 {
-            let a = &self.audio[rng.index(self.audio.len())];
-            let start = rng.index(a.len() - n + 1);
-            let x = &a[start..start + n];
+        self.crop_traced(n, rng)
+            .map(|crop| crop.samples)
+            .unwrap_or_default()
+    }
+
+    /// Sample with provenance, without changing candidate weighting or RNG draws.
+    /// As with `crop`, callers must use the crop length validated by `load` (or a
+    /// smaller length). Sixteen rejected silent candidates return `None`.
+    pub fn crop_traced(&self, n: usize, rng: &mut Rng) -> Option<Crop> {
+        for attempts in 1..=16 {
+            let source_index = rng.index(self.audio.len());
+            let a = &self.audio[source_index];
+            let start_sample = rng.index(a.len() - n + 1);
+            let x = &a[start_sample..start_sample + n];
             if audio::rms(x) >= self.identity.preprocess.silence_rms {
-                return x.to_vec();
+                return Some(Crop {
+                    samples: x.to_vec(),
+                    source_index,
+                    start_sample,
+                    attempts,
+                    silence_rejections: attempts - 1,
+                });
             }
         }
-        vec![]
+        None
     }
 }

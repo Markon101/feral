@@ -223,3 +223,22 @@ quality score. Ten-second listening packs are at
 `level_matched/current.wav` with `baseline.wav` and the labeled noise controls.
 The checkpoint is `runs/opencl-long100k-v1/final-checkpoint.json`.
 See [full results and reproduction](reports/OPENCL_TRAINING.md).
+
+## Controlled scaling experiments
+
+`train --width 128` selects214,176 parameters (default64 stays57,952). CLI widths
+32..256 in multiples16 are supported; resume must repeat the checkpoint width.
+This is a capacity control, not a claim that a bigger model makes music.
+
+`scripts/prepare_scaling_data.py` creates sample-exact audio-window manifests with
+source hashes and holdout guards; `scripts/level_match_scaling_data.py` optionally
+creates separately recorded constant-gain copies. Original recordings/raw crops
+remain unchanged. Training logs now identify each crop's source, offset and silence
+retry count, with the original RNG stream retained. The[scaling protocol](reports/SCALING_PROTOCOL.md)
+keeps data and width as separate axes; [data contracts](reports/SCALING_DATA_CONTRACT.md)
+describe provenance and limits.
+
+The `structure_eval` example compares10ms envelopes with seeded phase-randomized
+surrogates preserving the whole-clip spectrum. These diagnostics test organization
+beyond a spectral envelope; they are not music/quality scores. The owner still
+hears broadband noise from the100k model. Stereo remains deferred.

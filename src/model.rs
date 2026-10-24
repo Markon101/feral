@@ -23,6 +23,17 @@ impl Default for Architecture {
     }
 }
 impl Architecture {
+    /// Select a bounded training width without changing the baseline topology.
+    /// Small custom architectures remain valid for numerical-reference tests.
+    pub fn with_width(mut self, width: usize) -> Result<Self> {
+        ensure!(
+            (32..=256).contains(&width) && width.is_multiple_of(16),
+            "training width must be a multiple of 16 between 32 and 256"
+        );
+        self.width = width;
+        self.validate()?;
+        Ok(self)
+    }
     pub fn pyramid() -> Self {
         Self {
             scales: vec![1, 4, 16, 64],
@@ -52,7 +63,7 @@ impl Architecture {
     }
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            (1..=64).contains(&self.block) && (1..=128).contains(&self.width),
+            (1..=64).contains(&self.block) && (1..=256).contains(&self.width),
             "invalid model size"
         );
         ensure!(
