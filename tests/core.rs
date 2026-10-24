@@ -357,3 +357,26 @@ fn invalid_configs_rejected() {
     };
     assert!(flow::sample(&m, &y, &mask, &c).is_err());
 }
+
+#[test]
+fn smoke_cli_creates_nested_parent_and_refuses_existing_run() {
+    let dir = temp();
+    let run = dir.join("new-parent/smoke");
+    let invoke = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_feral"))
+            .args(["smoke", "--steps", "1", "--run"])
+            .arg(&run)
+            .output()
+            .unwrap()
+    };
+    let first = invoke();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(run.join("training/checkpoint.json").exists());
+    assert!(run.join("training/generated.wav").exists());
+    assert!(!invoke().status.success());
+    fs::remove_dir_all(dir).unwrap();
+}

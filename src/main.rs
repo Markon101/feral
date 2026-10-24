@@ -253,6 +253,9 @@ fn main() -> Result<()> {
         Commands::Inpaint(a) => runtime::render(a.config(Mode::Inpaint))?,
         Commands::Variation(a) => runtime::render(a.config(Mode::Variation))?,
         Commands::Smoke { run, steps } => {
+            if let Some(parent) = run.parent() {
+                fs::create_dir_all(parent)?;
+            }
             fs::create_dir(&run)?;
             let corpus = run.join("corpus");
             audio::synthetic(&corpus, 16000)?;
