@@ -528,3 +528,46 @@ fn heldout_probe_controls_and_pyramid_full_resume() {
     .is_err());
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn continuity_retains_feasible_transient_slopes() {
+    let mut known = vec![0.; 32];
+    known[6] = 0.05;
+    known[7] = 0.20;
+    known[24] = 0.10;
+    known[25] = -0.02;
+    let mut mask = vec![1.; 32];
+    mask[8..24].fill(0.);
+    let mut x = vec![-0.4; 32];
+    conditioning::continuity(&mut x, &known, &mask, 8);
+    assert!(((x[8] - x[7]) - (known[7] - known[6])).abs() < 1e-6);
+    assert!(((x[24] - x[23]) - (known[25] - known[24])).abs() < 1e-6);
+    for i in 0..32 {
+        if mask[i] == 1. {
+            assert_eq!(x[i], known[i]);
+        }
+    }
+}
+
+#[test]
+fn collar_tangent_adapts_to_headroom_and_limiter_handles_impossible_slope() {
+    let mut known = vec![0.; 64];
+    known[14] = 0.85;
+    known[15] = 0.90;
+    let mut mask = vec![0.; 64];
+    mask[..16].fill(1.);
+    let mut x = vec![0.2; 64];
+    conditioning::continuity(&mut x, &known, &mask, 16);
+    assert!((x[16] - 0.95).abs() < 1e-6);
+    assert!(x[16..].iter().all(|v| v.abs() <= 0.98));
+    known[14] = 0.5;
+    known[15] = 0.97;
+    let c = Sampling {
+        steps: 2,
+        collar: 16,
+        ..Default::default()
+    };
+    let out = flow::sample(&Constant, &known, &mask, &c).unwrap();
+    assert!(out[16..].iter().all(|v| v.abs() <= 0.98));
+    assert_eq!(&out[..16], &known[..16]);
+}
