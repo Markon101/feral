@@ -1,0 +1,3308 @@
+{
+  "equal_steps": [
+    {
+      "network": "baseline",
+      "seed": 42,
+      "metrics": {
+        "final_sampling_ms": 701.301562,
+        "fixed_probe_final_loss": 0.1337948590517044,
+        "fixed_probe_initial_loss": 1.226591944694519,
+        "generated_rms": 0.2419498860836029,
+        "neural_forward_backward_ms": 19665.924627999997,
+        "optimizer_ms": 416.89859600000017,
+        "other_sampling_ms": 549.341875,
+        "parameters": 57952,
+        "peak_rss_kib": 9560,
+        "preprocessing_ms": 68.790052,
+        "quality_claim": "pipeline verification only; no perceptual quality or generalization established",
+        "same_noise_output_mse_change": 0.367355078458786,
+        "sampling": {
+          "collar": 128,
+          "noise_scale": 1.0,
+          "perturb": 0.0,
+          "seed": 42,
+          "solver": "heun",
+          "steps": 16
+        },
+        "step_max_ms": 46.968282,
+        "step_mean_ms": 33.75421553500004,
+        "step_median_ms": 32.897031,
+        "steps": 600,
+        "task_counts": {
+          "hole": 147,
+          "prefix": 146,
+          "suffix": 148,
+          "unconditional": 159
+        },
+        "total_steps": 600,
+        "training_wall_ms_with_previews": 20393.160043999997
+      },
+      "signal": {
+        "copied_reference_control": 0.9999999999999994,
+        "correlation_decimation": 4,
+        "correlation_stride_samples": 256,
+        "input": "/data/data/com.termux/files/home/projects/feral/runs/phase2-v1/baseline-42/generated.wav",
+        "input_sha256": "79989bddac27306b70c2836c2765125ad0cc6b84dc94221ab7438782535196a0",
+        "limits": "correlation is a bounded screen over stride-aligned windows; low scores do not exclude transformed memorization",
+        "nearest_absolute_correlation": 0.09424336310970492,
+        "noise": {
+          "derivative_rms": 1.414868283977899,
+          "lag1_uncentered": -0.007604803658742433,
+          "limiter_hits": 2658,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.996648898356088,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.02528589034793353,
+            0.09348772766301837,
+            0.369719301993797,
+            0.5115070799952514
+          ],
+          "spectral_flatness": 0.9842206419832181
+        },
+        "noise_correlation_control": 0.06984649872235171,
+        "reference": {
+          "derivative_rms": 0.04307612809637674,
+          "lag1_uncentered": 0.9186300998042488,
+          "limiter_hits": 0,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.10677982550470438,
+          "sample_rate": 16000,
+          "samples": 384000,
+          "spectral_band_fractions": [
+            0.31230569632879,
+            0.5516441263639289,
+            0.1104920236826982,
+            0.025558153624581866
+          ],
+          "spectral_flatness": 0.13130095254084395
+        },
+        "reference_path": "/data/data/com.termux/files/home/projects/feral/runs/phase2-v1/train.wav",
+        "reference_sha256": "9fa787982de1bf0d8777b5cec7b0246eff2b2d0e07092ae49d7f07221c923d09",
+        "shuffled_signal": {
+          "derivative_rms": 0.34008873585294264,
+          "lag1_uncentered": 0.012230504971489411,
+          "limiter_hits": 3,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.2419497002508743,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.025234946388001413,
+            0.09042386876054223,
+            0.3898245390415283,
+            0.494516645809928
+          ],
+          "spectral_flatness": 0.9816517570657121
+        },
+        "signal": {
+          "derivative_rms": 0.292762612364761,
+          "lag1_uncentered": 0.26799153230355,
+          "limiter_hits": 3,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.24194970025087434,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.0952391939731919,
+            0.22345282434461944,
+            0.3112903381296218,
+            0.370017643552567
+          ],
+          "spectral_flatness": 0.8652700552741781
+        }
+      },
+      "scores": {
+        "train": {
+          "velocity_mse": 0.32680611434494905,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.138804487510496,
+                "derivative_mse": 0.25003872343080236,
+                "log_spectral_l1": 1.3272225680682144
+              },
+              "zero_audio": {
+                "mse": 0.012774137132390373,
+                "derivative_mse": 0.001204747198996509,
+                "log_spectral_l1": 0.2400753653910547
+              },
+              "noisy_input": {
+                "mse": 0.818280182623858,
+                "derivative_mse": 1.6128039620561094,
+                "log_spectral_l1": 2.0585911116409896
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.028460659237346888,
+                "derivative_mse": 0.02887555753296616,
+                "log_spectral_l1": 0.7140123964892625
+              },
+              "zero_audio": {
+                "mse": 0.012774137132390373,
+                "derivative_mse": 0.001204747198996509,
+                "log_spectral_l1": 0.2400753653910547
+              },
+              "noisy_input": {
+                "mse": 0.2525556248719408,
+                "derivative_mse": 0.4977790262357647,
+                "log_spectral_l1": 1.580373305895227
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.00695212465577823,
+                "derivative_mse": 0.012441130539101345,
+                "log_spectral_l1": 0.49580350887259733
+              },
+              "zero_audio": {
+                "mse": 0.012774137132390373,
+                "derivative_mse": 0.001204747198996509,
+                "log_spectral_l1": 0.2400753653910547
+              },
+              "noisy_input": {
+                "mse": 0.010102229813718246,
+                "derivative_mse": 0.0199111705331656,
+                "log_spectral_l1": 0.5893422291296214
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.3261180339142047,
+            "prefix": 0.3208033483962887,
+            "hole": 0.32908263033575186,
+            "suffix": 0.33122044473355106
+          }
+        },
+        "validation": {
+          "velocity_mse": 0.36802001278367813,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.1539194413766242,
+                "derivative_mse": 0.25250419370408445,
+                "log_spectral_l1": 1.194445302729096
+              },
+              "zero_audio": {
+                "mse": 0.02827702161333921,
+                "derivative_mse": 0.004197728096733099,
+                "log_spectral_l1": 0.39606356504318724
+              },
+              "noisy_input": {
+                "mse": 0.8342066894062485,
+                "derivative_mse": 1.6170199895039652,
+                "log_spectral_l1": 1.9112428233460872
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.03714834302151274,
+                "derivative_mse": 0.03181090119384091,
+                "log_spectral_l1": 0.6062312391999862
+              },
+              "zero_audio": {
+                "mse": 0.02827702161333921,
+                "derivative_mse": 0.004197728096733099,
+                "log_spectral_l1": 0.39606356504318724
+              },
+              "noisy_input": {
+                "mse": 0.25747121362802755,
+                "derivative_mse": 0.49908026953608986,
+                "log_spectral_l1": 1.4390967996972466
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.007654430204977931,
+                "derivative_mse": 0.012845667541098504,
+                "log_spectral_l1": 0.40635008732868394
+              },
+              "zero_audio": {
+                "mse": 0.02827702161333921,
+                "derivative_mse": 0.004197728096733099,
+                "log_spectral_l1": 0.39606356504318724
+              },
+              "noisy_input": {
+                "mse": 0.010298853455742801,
+                "derivative_mse": 0.019963220320167202,
+                "log_spectral_l1": 0.488801416516776
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.3674019936040399,
+            "prefix": 0.3819911767187233,
+            "hole": 0.36999515470497363,
+            "suffix": 0.35269172610697563
+          }
+        },
+        "test": {
+          "velocity_mse": 0.3303497329260238,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.13968302948951938,
+                "derivative_mse": 0.25185678156614527,
+                "log_spectral_l1": 1.2374331040061906
+              },
+              "zero_audio": {
+                "mse": 0.013095941535998445,
+                "derivative_mse": 0.0026429101013809683,
+                "log_spectral_l1": 0.3310157382451491
+              },
+              "noisy_input": {
+                "mse": 0.8203038561872146,
+                "derivative_mse": 1.6145555228761568,
+                "log_spectral_l1": 1.9680969944357636
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.029012852183059316,
+                "derivative_mse": 0.030434142635478296,
+                "log_spectral_l1": 0.6330777542094829
+              },
+              "zero_audio": {
+                "mse": 0.013095941535998445,
+                "derivative_mse": 0.0026429101013809683,
+                "log_spectral_l1": 0.3310157382451491
+              },
+              "noisy_input": {
+                "mse": 0.2531802156035972,
+                "derivative_mse": 0.4983196315633905,
+                "log_spectral_l1": 1.4900930027026333
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.007025499311294496,
+                "derivative_mse": 0.012604976739710401,
+                "log_spectral_l1": 0.4314979606811384
+              },
+              "zero_audio": {
+                "mse": 0.013095941535998445,
+                "derivative_mse": 0.0026429101013809683,
+                "log_spectral_l1": 0.3310157382451491
+              },
+              "noisy_input": {
+                "mse": 0.010127213442615988,
+                "derivative_mse": 0.019932794753319865,
+                "log_spectral_l1": 0.5200945026124455
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.33065110125757546,
+            "prefix": 0.3309603945951653,
+            "hole": 0.32975277354070776,
+            "suffix": 0.33003466231064665
+          }
+        }
+      }
+    },
+    {
+      "network": "pyramid",
+      "seed": 42,
+      "metrics": {
+        "final_sampling_ms": 226.337604,
+        "fixed_probe_final_loss": 0.21157462894916534,
+        "fixed_probe_initial_loss": 1.1773149967193604,
+        "generated_rms": 0.3336218595504761,
+        "neural_forward_backward_ms": 9240.066410000012,
+        "optimizer_ms": 430.3632870000002,
+        "other_sampling_ms": 179.637656,
+        "parameters": 57952,
+        "peak_rss_kib": 9728,
+        "preprocessing_ms": 68.969688,
+        "quality_claim": "pipeline verification only; no perceptual quality or generalization established",
+        "same_noise_output_mse_change": 0.2658999264240265,
+        "sampling": {
+          "collar": 128,
+          "noise_scale": 1.0,
+          "perturb": 0.0,
+          "seed": 42,
+          "solver": "heun",
+          "steps": 16
+        },
+        "step_max_ms": 22.750105,
+        "step_mean_ms": 16.42337351833333,
+        "step_median_ms": 18.494271,
+        "steps": 600,
+        "task_counts": {
+          "hole": 147,
+          "prefix": 146,
+          "suffix": 148,
+          "unconditional": 159
+        },
+        "total_steps": 600,
+        "training_wall_ms_with_previews": 9996.627288
+      },
+      "signal": {
+        "copied_reference_control": 0.9999999999999994,
+        "correlation_decimation": 4,
+        "correlation_stride_samples": 256,
+        "input": "/data/data/com.termux/files/home/projects/feral/runs/phase2-v1/pyramid-42/generated.wav",
+        "input_sha256": "5ecfde68d43484ec33a3dae412ae72fcd5919af7cdabeb880a0f670211901a62",
+        "limits": "correlation is a bounded screen over stride-aligned windows; low scores do not exclude transformed memorization",
+        "nearest_absolute_correlation": 0.08131831749821407,
+        "noise": {
+          "derivative_rms": 1.414868283977899,
+          "lag1_uncentered": -0.007604803658742433,
+          "limiter_hits": 2658,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.996648898356088,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.02528589034793353,
+            0.09348772766301837,
+            0.369719301993797,
+            0.5115070799952514
+          ],
+          "spectral_flatness": 0.9842206419832181
+        },
+        "noise_correlation_control": 0.06984649872235171,
+        "reference": {
+          "derivative_rms": 0.04307612809637674,
+          "lag1_uncentered": 0.9186300998042488,
+          "limiter_hits": 0,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.10677982550470438,
+          "sample_rate": 16000,
+          "samples": 384000,
+          "spectral_band_fractions": [
+            0.31230569632879,
+            0.5516441263639289,
+            0.1104920236826982,
+            0.025558153624581866
+          ],
+          "spectral_flatness": 0.13130095254084395
+        },
+        "reference_path": "/data/data/com.termux/files/home/projects/feral/runs/phase2-v1/train.wav",
+        "reference_sha256": "9fa787982de1bf0d8777b5cec7b0246eff2b2d0e07092ae49d7f07221c923d09",
+        "shuffled_signal": {
+          "derivative_rms": 0.4673171457683414,
+          "lag1_uncentered": 0.01907782771274693,
+          "limiter_hits": 39,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.3336217359802977,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.02607219543643213,
+            0.09283305709571651,
+            0.39286142203680674,
+            0.48823332543104453
+          ],
+          "spectral_flatness": 0.9831932718112847
+        },
+        "signal": {
+          "derivative_rms": 0.44352696441535594,
+          "lag1_uncentered": 0.11637325639196164,
+          "limiter_hits": 39,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.3336217359802974,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.06678330711798514,
+            0.17587924037126287,
+            0.3067611769842259,
+            0.45057627552652624
+          ],
+          "spectral_flatness": 0.924996242475569
+        }
+      },
+      "scores": {
+        "train": {
+          "velocity_mse": 0.3679292437923611,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.118887585424994,
+                "derivative_mse": 0.19946786185271612,
+                "log_spectral_l1": 1.2423006526695315
+              },
+              "zero_audio": {
+                "mse": 0.012774137132390373,
+                "derivative_mse": 0.001204747198996509,
+                "log_spectral_l1": 0.2400753653910547
+              },
+              "noisy_input": {
+                "mse": 0.818280182623858,
+                "derivative_mse": 1.6128039620561094,
+                "log_spectral_l1": 2.0585911116409896
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.047637676145995005,
+                "derivative_mse": 0.07168701614309952,
+                "log_spectral_l1": 0.9301299529378583
+              },
+              "zero_audio": {
+                "mse": 0.012774137132390373,
+                "derivative_mse": 0.001204747198996509,
+                "log_spectral_l1": 0.2400753653910547
+              },
+              "noisy_input": {
+                "mse": 0.2525556248719408,
+                "derivative_mse": 0.4977790262357647,
+                "log_spectral_l1": 1.580373305895227
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.007664625889110483,
+                "derivative_mse": 0.014212939767000662,
+                "log_spectral_l1": 0.5197874600839997
+              },
+              "zero_audio": {
+                "mse": 0.012774137132390373,
+                "derivative_mse": 0.001204747198996509,
+                "log_spectral_l1": 0.2400753653910547
+              },
+              "noisy_input": {
+                "mse": 0.010102229813718246,
+                "derivative_mse": 0.0199111705331656,
+                "log_spectral_l1": 0.5893422291296214
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.36760201237726836,
+            "prefix": 0.3633585217258931,
+            "hole": 0.3692225882950988,
+            "suffix": 0.37153385277118395
+          }
+        },
+        "validation": {
+          "velocity_mse": 0.40556560724433494,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.13430485140891732,
+                "derivative_mse": 0.20224153520107882,
+                "log_spectral_l1": 1.10890629285352
+              },
+              "zero_audio": {
+                "mse": 0.02827702161333921,
+                "derivative_mse": 0.004197728096733099,
+                "log_spectral_l1": 0.39606356504318724
+              },
+              "noisy_input": {
+                "mse": 0.8342066894062485,
+                "derivative_mse": 1.6170199895039652,
+                "log_spectral_l1": 1.9112428233460872
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.056067257515013326,
+                "derivative_mse": 0.07433055343627146,
+                "log_spectral_l1": 0.808500213748426
+              },
+              "zero_audio": {
+                "mse": 0.02827702161333921,
+                "derivative_mse": 0.004197728096733099,
+                "log_spectral_l1": 0.39606356504318724
+              },
+              "noisy_input": {
+                "mse": 0.25747121362802755,
+                "derivative_mse": 0.49908026953608986,
+                "log_spectral_l1": 1.4390967996972466
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.00826619718049228,
+                "derivative_mse": 0.014488101888827026,
+                "log_spectral_l1": 0.42692551448336546
+              },
+              "zero_audio": {
+                "mse": 0.02827702161333921,
+                "derivative_mse": 0.004197728096733099,
+                "log_spectral_l1": 0.39606356504318724
+              },
+              "noisy_input": {
+                "mse": 0.010298853455742801,
+                "derivative_mse": 0.019963220320167202,
+                "log_spectral_l1": 0.488801416516776
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.4052789728930488,
+            "prefix": 0.41933317026324,
+            "hole": 0.4069233528809314,
+            "suffix": 0.3907269329401193
+          }
+        },
+        "test": {
+          "velocity_mse": 0.3712013846433775,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.11943293774991012,
+                "derivative_mse": 0.20069410002144664,
+                "log_spectral_l1": 1.1534625778177354
+              },
+              "zero_audio": {
+                "mse": 0.013095941535998445,
+                "derivative_mse": 0.0026429101013809683,
+                "log_spectral_l1": 0.3310157382451491
+              },
+              "noisy_input": {
+                "mse": 0.8203038561872146,
+                "derivative_mse": 1.6145555228761568,
+                "log_spectral_l1": 1.9680969944357636
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.04814192072318116,
+                "derivative_mse": 0.07272516258756462,
+                "log_spectral_l1": 0.8439001987147826
+              },
+              "zero_audio": {
+                "mse": 0.013095941535998445,
+                "derivative_mse": 0.0026429101013809683,
+                "log_spectral_l1": 0.3310157382451491
+              },
+              "noisy_input": {
+                "mse": 0.2531802156035972,
+                "derivative_mse": 0.4983196315633905,
+                "log_spectral_l1": 1.4900930027026333
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.00773588760233058,
+                "derivative_mse": 0.014328557786036153,
+                "log_spectral_l1": 0.45394852894375876
+              },
+              "zero_audio": {
+                "mse": 0.013095941535998445,
+                "derivative_mse": 0.0026429101013809683,
+                "log_spectral_l1": 0.3310157382451491
+              },
+              "noisy_input": {
+                "mse": 0.010127213442615988,
+                "derivative_mse": 0.019932794753319865,
+                "log_spectral_l1": 0.5200945026124455
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.371886891398632,
+            "prefix": 0.37246505484991055,
+            "hole": 0.36956180132006583,
+            "suffix": 0.3708917910049012
+          }
+        }
+      }
+    },
+    {
+      "network": "pyramid",
+      "seed": 43,
+      "metrics": {
+        "final_sampling_ms": 285.377031,
+        "fixed_probe_final_loss": 0.21282914280891418,
+        "fixed_probe_initial_loss": 1.1773428916931152,
+        "generated_rms": 0.3404415249824524,
+        "neural_forward_backward_ms": 7087.278187999992,
+        "optimizer_ms": 338.1163079999999,
+        "other_sampling_ms": 229.107969,
+        "parameters": 57952,
+        "peak_rss_kib": 9188,
+        "preprocessing_ms": 53.236041,
+        "quality_claim": "pipeline verification only; no perceptual quality or generalization established",
+        "same_noise_output_mse_change": 0.2584824562072754,
+        "sampling": {
+          "collar": 128,
+          "noise_scale": 1.0,
+          "perturb": 0.0,
+          "seed": 42,
+          "solver": "heun",
+          "steps": 16
+        },
+        "step_max_ms": 21.998125,
+        "step_mean_ms": 12.607939050000002,
+        "step_median_ms": 12.040937999999999,
+        "steps": 600,
+        "task_counts": {
+          "hole": 166,
+          "prefix": 149,
+          "suffix": 141,
+          "unconditional": 144
+        },
+        "total_steps": 600,
+        "training_wall_ms_with_previews": 7677.128747000001
+      },
+      "signal": {
+        "copied_reference_control": 0.9999999999999994,
+        "correlation_decimation": 4,
+        "correlation_stride_samples": 256,
+        "input": "/data/data/com.termux/files/home/projects/feral/runs/phase2-v1/pyramid-43/generated.wav",
+        "input_sha256": "bacb3d3716e84d5d879b51dbb6171717901e4f40367aa3fc2fcd29c3cd9160f4",
+        "limits": "correlation is a bounded screen over stride-aligned windows; low scores do not exclude transformed memorization",
+        "nearest_absolute_correlation": 0.08920147892928362,
+        "noise": {
+          "derivative_rms": 1.414868283977899,
+          "lag1_uncentered": -0.007604803658742433,
+          "limiter_hits": 2658,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.996648898356088,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.02528589034793353,
+            0.09348772766301837,
+            0.369719301993797,
+            0.5115070799952514
+          ],
+          "spectral_flatness": 0.9842206419832181
+        },
+        "noise_correlation_control": 0.06984649872235171,
+        "reference": {
+          "derivative_rms": 0.04307612809637674,
+          "lag1_uncentered": 0.9186300998042488,
+          "limiter_hits": 0,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.10677982550470438,
+          "sample_rate": 16000,
+          "samples": 384000,
+          "spectral_band_fractions": [
+            0.31230569632879,
+            0.5516441263639289,
+            0.1104920236826982,
+            0.025558153624581866
+          ],
+          "spectral_flatness": 0.13130095254084395
+        },
+        "reference_path": "/data/data/com.termux/files/home/projects/feral/runs/phase2-v1/train.wav",
+        "reference_sha256": "9fa787982de1bf0d8777b5cec7b0246eff2b2d0e07092ae49d7f07221c923d09",
+        "shuffled_signal": {
+          "derivative_rms": 0.4822887216346679,
+          "lag1_uncentered": -0.003345263801915112,
+          "limiter_hits": 62,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.34044161973945514,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.024837278817284036,
+            0.08748365961994008,
+            0.3844991346094239,
+            0.5031799269533518
+          ],
+          "spectral_flatness": 0.9828577893276008
+        },
+        "signal": {
+          "derivative_rms": 0.45715071517016065,
+          "lag1_uncentered": 0.09848153082913202,
+          "limiter_hits": 62,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.3404416197394543,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.06404724457019387,
+            0.13328515507489141,
+            0.3535864627963851,
+            0.4490811375585293
+          ],
+          "spectral_flatness": 0.9471826347500518
+        }
+      },
+      "scores": {
+        "train": {
+          "velocity_mse": 0.37146756745677917,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.12346626881570227,
+                "derivative_mse": 0.21618002323191524,
+                "log_spectral_l1": 1.2688908572226367
+              },
+              "zero_audio": {
+                "mse": 0.012774137132390373,
+                "derivative_mse": 0.001204747198996509,
+                "log_spectral_l1": 0.2400753653910547
+              },
+              "noisy_input": {
+                "mse": 0.818280182623858,
+                "derivative_mse": 1.6128039620561094,
+                "log_spectral_l1": 2.0585911116409896
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.048054444881804576,
+                "derivative_mse": 0.07394854878905234,
+                "log_spectral_l1": 0.9445817797648075
+              },
+              "zero_audio": {
+                "mse": 0.012774137132390373,
+                "derivative_mse": 0.001204747198996509,
+                "log_spectral_l1": 0.2400753653910547
+              },
+              "noisy_input": {
+                "mse": 0.2525556248719408,
+                "derivative_mse": 0.4977790262357647,
+                "log_spectral_l1": 1.580373305895227
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.007697577903142336,
+                "derivative_mse": 0.014228898627016422,
+                "log_spectral_l1": 0.520141935756011
+              },
+              "zero_audio": {
+                "mse": 0.012774137132390373,
+                "derivative_mse": 0.001204747198996509,
+                "log_spectral_l1": 0.2400753653910547
+              },
+              "noisy_input": {
+                "mse": 0.010102229813718246,
+                "derivative_mse": 0.0199111705331656,
+                "log_spectral_l1": 0.5893422291296214
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.37022634882682487,
+            "prefix": 0.369509984088096,
+            "hole": 0.374524952899749,
+            "suffix": 0.37160898401244724
+          }
+        },
+        "validation": {
+          "velocity_mse": 0.4105847920400947,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.13940337199477965,
+                "derivative_mse": 0.2182541093178181,
+                "log_spectral_l1": 1.134638062996886
+              },
+              "zero_audio": {
+                "mse": 0.02827702161333921,
+                "derivative_mse": 0.004197728096733099,
+                "log_spectral_l1": 0.39606356504318724
+              },
+              "noisy_input": {
+                "mse": 0.8342066894062485,
+                "derivative_mse": 1.6170199895039652,
+                "log_spectral_l1": 1.9112428233460872
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.05676476004986589,
+                "derivative_mse": 0.07630073592028802,
+                "log_spectral_l1": 0.8227267542680479
+              },
+              "zero_audio": {
+                "mse": 0.02827702161333921,
+                "derivative_mse": 0.004197728096733099,
+                "log_spectral_l1": 0.39606356504318724
+              },
+              "noisy_input": {
+                "mse": 0.25747121362802755,
+                "derivative_mse": 0.49908026953608986,
+                "log_spectral_l1": 1.4390967996972466
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.008325927964989722,
+                "derivative_mse": 0.014502710177332966,
+                "log_spectral_l1": 0.4276548758979655
+              },
+              "zero_audio": {
+                "mse": 0.02827702161333921,
+                "derivative_mse": 0.004197728096733099,
+                "log_spectral_l1": 0.39606356504318724
+              },
+              "noisy_input": {
+                "mse": 0.010298853455742801,
+                "derivative_mse": 0.019963220320167202,
+                "log_spectral_l1": 0.488801416516776
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.4096149108434663,
+            "prefix": 0.42695541033264844,
+            "hole": 0.4127615225341131,
+            "suffix": 0.3930073244501508
+          }
+        },
+        "test": {
+          "velocity_mse": 0.3737112923374099,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.12358883002167494,
+                "derivative_mse": 0.21692687200870533,
+                "log_spectral_l1": 1.1783834429928488
+              },
+              "zero_audio": {
+                "mse": 0.013095941535998445,
+                "derivative_mse": 0.0026429101013809683,
+                "log_spectral_l1": 0.3310157382451491
+              },
+              "noisy_input": {
+                "mse": 0.8203038561872146,
+                "derivative_mse": 1.6145555228761568,
+                "log_spectral_l1": 1.9680969944357636
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.04841868636477787,
+                "derivative_mse": 0.07488552306700134,
+                "log_spectral_l1": 0.8574192986172233
+              },
+              "zero_audio": {
+                "mse": 0.013095941535998445,
+                "derivative_mse": 0.0026429101013809683,
+                "log_spectral_l1": 0.3310157382451491
+              },
+              "noisy_input": {
+                "mse": 0.2531802156035972,
+                "derivative_mse": 0.4983196315633905,
+                "log_spectral_l1": 1.4900930027026333
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.007748806905797597,
+                "derivative_mse": 0.014315358204092563,
+                "log_spectral_l1": 0.45452398546476414
+              },
+              "zero_audio": {
+                "mse": 0.013095941535998445,
+                "derivative_mse": 0.0026429101013809683,
+                "log_spectral_l1": 0.3310157382451491
+              },
+              "noisy_input": {
+                "mse": 0.010127213442615988,
+                "derivative_mse": 0.019932794753319865,
+                "log_spectral_l1": 0.5200945026124455
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.3737410529478833,
+            "prefix": 0.37688056507750295,
+            "hole": 0.3730746628436761,
+            "suffix": 0.3711488884805771
+          }
+        }
+      }
+    },
+    {
+      "network": "baseline",
+      "seed": 43,
+      "metrics": {
+        "final_sampling_ms": 542.647604,
+        "fixed_probe_final_loss": 0.14171303808689117,
+        "fixed_probe_initial_loss": 1.212942123413086,
+        "generated_rms": 0.2568971812725067,
+        "neural_forward_backward_ms": 18115.49591599998,
+        "optimizer_ms": 382.86953300000016,
+        "other_sampling_ms": 413.31708299999997,
+        "parameters": 57952,
+        "peak_rss_kib": 9384,
+        "preprocessing_ms": 60.209218,
+        "quality_claim": "pipeline verification only; no perceptual quality or generalization established",
+        "same_noise_output_mse_change": 0.34683141112327576,
+        "sampling": {
+          "collar": 128,
+          "noise_scale": 1.0,
+          "perturb": 0.0,
+          "seed": 42,
+          "solver": "heun",
+          "steps": 16
+        },
+        "step_max_ms": 48.148281000000004,
+        "step_mean_ms": 31.096155615000043,
+        "step_median_ms": 29.580624999999998,
+        "steps": 600,
+        "task_counts": {
+          "hole": 166,
+          "prefix": 149,
+          "suffix": 141,
+          "unconditional": 144
+        },
+        "total_steps": 600,
+        "training_wall_ms_with_previews": 18807.660513
+      },
+      "signal": {
+        "copied_reference_control": 0.9999999999999994,
+        "correlation_decimation": 4,
+        "correlation_stride_samples": 256,
+        "input": "/data/data/com.termux/files/home/projects/feral/runs/phase2-v1/baseline-43/generated.wav",
+        "input_sha256": "2fecc3bc7100eeae86d1811a46e4450e0f10b93311a015fd5fe9bdb6fa59a0be",
+        "limits": "correlation is a bounded screen over stride-aligned windows; low scores do not exclude transformed memorization",
+        "nearest_absolute_correlation": 0.08693769252259456,
+        "noise": {
+          "derivative_rms": 1.414868283977899,
+          "lag1_uncentered": -0.007604803658742433,
+          "limiter_hits": 2658,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.996648898356088,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.02528589034793353,
+            0.09348772766301837,
+            0.369719301993797,
+            0.5115070799952514
+          ],
+          "spectral_flatness": 0.9842206419832181
+        },
+        "noise_correlation_control": 0.06984649872235171,
+        "reference": {
+          "derivative_rms": 0.04307612809637674,
+          "lag1_uncentered": 0.9186300998042488,
+          "limiter_hits": 0,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.10677982550470438,
+          "sample_rate": 16000,
+          "samples": 384000,
+          "spectral_band_fractions": [
+            0.31230569632879,
+            0.5516441263639289,
+            0.1104920236826982,
+            0.025558153624581866
+          ],
+          "spectral_flatness": 0.13130095254084395
+        },
+        "reference_path": "/data/data/com.termux/files/home/projects/feral/runs/phase2-v1/train.wav",
+        "reference_sha256": "9fa787982de1bf0d8777b5cec7b0246eff2b2d0e07092ae49d7f07221c923d09",
+        "shuffled_signal": {
+          "derivative_rms": 0.3639802691243907,
+          "lag1_uncentered": -0.0036136677085824563,
+          "limiter_hits": 9,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.2568972316976571,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.024608595722508234,
+            0.08877898363994284,
+            0.3804593479177938,
+            0.506153072719755
+          ],
+          "spectral_flatness": 0.9826047030878332
+        },
+        "signal": {
+          "derivative_rms": 0.33073109115214894,
+          "lag1_uncentered": 0.17134118999014658,
+          "limiter_hits": 9,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.25689723169765777,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.07703522231156845,
+            0.15081351346573926,
+            0.3743232397630482,
+            0.3978280244596442
+          ],
+          "spectral_flatness": 0.9227952287326796
+        }
+      },
+      "scores": {
+        "train": {
+          "velocity_mse": 0.329590724592369,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.13381247857346185,
+                "derivative_mse": 0.24410900907754987,
+                "log_spectral_l1": 1.3149566021664882
+              },
+              "zero_audio": {
+                "mse": 0.012774137132390373,
+                "derivative_mse": 0.001204747198996509,
+                "log_spectral_l1": 0.2400753653910547
+              },
+              "noisy_input": {
+                "mse": 0.818280182623858,
+                "derivative_mse": 1.6128039620561094,
+                "log_spectral_l1": 2.0585911116409896
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.030016358246958353,
+                "derivative_mse": 0.035474772492214306,
+                "log_spectral_l1": 0.7591598570383377
+              },
+              "zero_audio": {
+                "mse": 0.012774137132390373,
+                "derivative_mse": 0.001204747198996509,
+                "log_spectral_l1": 0.2400753653910547
+              },
+              "noisy_input": {
+                "mse": 0.2525556248719408,
+                "derivative_mse": 0.4977790262357647,
+                "log_spectral_l1": 1.580373305895227
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.007035064783468237,
+                "derivative_mse": 0.0125732290003082,
+                "log_spectral_l1": 0.4973928547636395
+              },
+              "zero_audio": {
+                "mse": 0.012774137132390373,
+                "derivative_mse": 0.001204747198996509,
+                "log_spectral_l1": 0.2400753653910547
+              },
+              "noisy_input": {
+                "mse": 0.010102229813718246,
+                "derivative_mse": 0.0199111705331656,
+                "log_spectral_l1": 0.5893422291296214
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.3284689067608749,
+            "prefix": 0.32728033228204007,
+            "hole": 0.3333818828531105,
+            "suffix": 0.32923177647345
+          }
+        },
+        "validation": {
+          "velocity_mse": 0.3766701731836531,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.15043005509462554,
+                "derivative_mse": 0.24596903898412986,
+                "log_spectral_l1": 1.1799121042477287
+              },
+              "zero_audio": {
+                "mse": 0.02827702161333921,
+                "derivative_mse": 0.004197728096733099,
+                "log_spectral_l1": 0.39606356504318724
+              },
+              "noisy_input": {
+                "mse": 0.8342066894062485,
+                "derivative_mse": 1.6170199895039652,
+                "log_spectral_l1": 1.9112428233460872
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.039921648512583875,
+                "derivative_mse": 0.03832543847187437,
+                "log_spectral_l1": 0.650818037684085
+              },
+              "zero_audio": {
+                "mse": 0.02827702161333921,
+                "derivative_mse": 0.004197728096733099,
+                "log_spectral_l1": 0.39606356504318724
+              },
+              "noisy_input": {
+                "mse": 0.25747121362802755,
+                "derivative_mse": 0.49908026953608986,
+                "log_spectral_l1": 1.4390967996972466
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.007846081732943535,
+                "derivative_mse": 0.013025177604771879,
+                "log_spectral_l1": 0.4092213388348773
+              },
+              "zero_audio": {
+                "mse": 0.02827702161333921,
+                "derivative_mse": 0.004197728096733099,
+                "log_spectral_l1": 0.39606356504318724
+              },
+              "noisy_input": {
+                "mse": 0.010298853455742801,
+                "derivative_mse": 0.019963220320167202,
+                "log_spectral_l1": 0.488801416516776
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.37579876170910254,
+            "prefix": 0.3973857075976822,
+            "hole": 0.37936343182284044,
+            "suffix": 0.35413279160498695
+          }
+        },
+        "test": {
+          "velocity_mse": 0.33280158718182756,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.13378279378065297,
+                "derivative_mse": 0.24524090869697365,
+                "log_spectral_l1": 1.223882951468625
+              },
+              "zero_audio": {
+                "mse": 0.013095941535998445,
+                "derivative_mse": 0.0026429101013809683,
+                "log_spectral_l1": 0.3310157382451491
+              },
+              "noisy_input": {
+                "mse": 0.8203038561872146,
+                "derivative_mse": 1.6145555228761568,
+                "log_spectral_l1": 1.9680969944357636
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.030361099424846043,
+                "derivative_mse": 0.036909835069571406,
+                "log_spectral_l1": 0.6766175793579168
+              },
+              "zero_audio": {
+                "mse": 0.013095941535998445,
+                "derivative_mse": 0.0026429101013809683,
+                "log_spectral_l1": 0.3310157382451491
+              },
+              "noisy_input": {
+                "mse": 0.2531802156035972,
+                "derivative_mse": 0.4983196315633905,
+                "log_spectral_l1": 1.4900930027026333
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.007117967516509571,
+                "derivative_mse": 0.012751666227381898,
+                "log_spectral_l1": 0.433875552422569
+              },
+              "zero_audio": {
+                "mse": 0.013095941535998445,
+                "derivative_mse": 0.0026429101013809683,
+                "log_spectral_l1": 0.3310157382451491
+              },
+              "noisy_input": {
+                "mse": 0.010127213442615988,
+                "derivative_mse": 0.019932794753319865,
+                "log_spectral_l1": 0.5200945026124455
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.3328665220685636,
+            "prefix": 0.3379901431637623,
+            "hole": 0.33294306332310175,
+            "suffix": 0.3274066201718824
+          }
+        }
+      }
+    },
+    {
+      "network": "baseline",
+      "seed": 44,
+      "metrics": {
+        "final_sampling_ms": 595.023282,
+        "fixed_probe_final_loss": 0.15383519232273102,
+        "fixed_probe_initial_loss": 1.2137576341629028,
+        "generated_rms": 0.2800765633583069,
+        "neural_forward_backward_ms": 19326.99727499999,
+        "optimizer_ms": 411.6138100000004,
+        "other_sampling_ms": 730.457135,
+        "parameters": 57952,
+        "peak_rss_kib": 9764,
+        "preprocessing_ms": 70.980312,
+        "quality_claim": "pipeline verification only; no perceptual quality or generalization established",
+        "same_noise_output_mse_change": 0.3434186279773712,
+        "sampling": {
+          "collar": 128,
+          "noise_scale": 1.0,
+          "perturb": 0.0,
+          "seed": 42,
+          "solver": "heun",
+          "steps": 16
+        },
+        "step_max_ms": 47.421980000000005,
+        "step_mean_ms": 33.18390007666665,
+        "step_median_ms": 31.913281,
+        "steps": 600,
+        "task_counts": {
+          "hole": 146,
+          "prefix": 149,
+          "suffix": 141,
+          "unconditional": 164
+        },
+        "total_steps": 600,
+        "training_wall_ms_with_previews": 20054.797284
+      },
+      "signal": {
+        "copied_reference_control": 0.9999999999999994,
+        "correlation_decimation": 4,
+        "correlation_stride_samples": 256,
+        "input": "/data/data/com.termux/files/home/projects/feral/runs/phase2-v1/baseline-44/generated.wav",
+        "input_sha256": "bd17c4a3cf405505aa92b7c84d2aa834a7cbc2ed4e2cc4cf6c0b007bc8765089",
+        "limits": "correlation is a bounded screen over stride-aligned windows; low scores do not exclude transformed memorization",
+        "nearest_absolute_correlation": 0.08663088244668,
+        "noise": {
+          "derivative_rms": 1.414868283977899,
+          "lag1_uncentered": -0.007604803658742433,
+          "limiter_hits": 2658,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.996648898356088,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.02528589034793353,
+            0.09348772766301837,
+            0.369719301993797,
+            0.5115070799952514
+          ],
+          "spectral_flatness": 0.9842206419832181
+        },
+        "noise_correlation_control": 0.06984649872235171,
+        "reference": {
+          "derivative_rms": 0.04307612809637674,
+          "lag1_uncentered": 0.9186300998042488,
+          "limiter_hits": 0,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.10677982550470438,
+          "sample_rate": 16000,
+          "samples": 384000,
+          "spectral_band_fractions": [
+            0.31230569632879,
+            0.5516441263639289,
+            0.1104920236826982,
+            0.025558153624581866
+          ],
+          "spectral_flatness": 0.13130095254084395
+        },
+        "reference_path": "/data/data/com.termux/files/home/projects/feral/runs/phase2-v1/train.wav",
+        "reference_sha256": "9fa787982de1bf0d8777b5cec7b0246eff2b2d0e07092ae49d7f07221c923d09",
+        "shuffled_signal": {
+          "derivative_rms": 0.3913073033339452,
+          "lag1_uncentered": 0.024065701990529216,
+          "limiter_hits": 17,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.28007668215734316,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.02334508408958327,
+            0.09668624237184154,
+            0.39351534460522525,
+            0.48645332893335
+          ],
+          "spectral_flatness": 0.98243029299679
+        },
+        "signal": {
+          "derivative_rms": 0.34238861207388566,
+          "lag1_uncentered": 0.2528069068197192,
+          "limiter_hits": 17,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.28007668215734377,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.07257976068182234,
+            0.18486723105202493,
+            0.378287433925401,
+            0.3642655743407516
+          ],
+          "spectral_flatness": 0.896671422854674
+        }
+      },
+      "scores": {
+        "train": {
+          "velocity_mse": 0.33804082029433485,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.1352017409357022,
+                "derivative_mse": 0.23455084559775527,
+                "log_spectral_l1": 1.316315829003783
+              },
+              "zero_audio": {
+                "mse": 0.012774137132390373,
+                "derivative_mse": 0.001204747198996509,
+                "log_spectral_l1": 0.2400753653910547
+              },
+              "noisy_input": {
+                "mse": 0.818280182623858,
+                "derivative_mse": 1.6128039620561094,
+                "log_spectral_l1": 2.0585911116409896
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.033695775712939184,
+                "derivative_mse": 0.038876342003234365,
+                "log_spectral_l1": 0.7970023579130633
+              },
+              "zero_audio": {
+                "mse": 0.012774137132390373,
+                "derivative_mse": 0.001204747198996509,
+                "log_spectral_l1": 0.2400753653910547
+              },
+              "noisy_input": {
+                "mse": 0.2525556248719408,
+                "derivative_mse": 0.4977790262357647,
+                "log_spectral_l1": 1.580373305895227
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.0071242396127805235,
+                "derivative_mse": 0.012775067753278939,
+                "log_spectral_l1": 0.5012586545194015
+              },
+              "zero_audio": {
+                "mse": 0.012774137132390373,
+                "derivative_mse": 0.001204747198996509,
+                "log_spectral_l1": 0.2400753653910547
+              },
+              "noisy_input": {
+                "mse": 0.010102229813718246,
+                "derivative_mse": 0.0199111705331656,
+                "log_spectral_l1": 0.5893422291296214
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.3371530802721213,
+            "prefix": 0.33298989234929566,
+            "hole": 0.3409619227830193,
+            "suffix": 0.34105838577290337
+          }
+        },
+        "validation": {
+          "velocity_mse": 0.38134014535486527,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.15202756666071174,
+                "derivative_mse": 0.23666377633511182,
+                "log_spectral_l1": 1.1834105076482702
+              },
+              "zero_audio": {
+                "mse": 0.02827702161333921,
+                "derivative_mse": 0.004197728096733099,
+                "log_spectral_l1": 0.39606356504318724
+              },
+              "noisy_input": {
+                "mse": 0.8342066894062485,
+                "derivative_mse": 1.6170199895039652,
+                "log_spectral_l1": 1.9112428233460872
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.04319245715342177,
+                "derivative_mse": 0.041602204662377434,
+                "log_spectral_l1": 0.6858562608456048
+              },
+              "zero_audio": {
+                "mse": 0.02827702161333921,
+                "derivative_mse": 0.004197728096733099,
+                "log_spectral_l1": 0.39606356504318724
+              },
+              "noisy_input": {
+                "mse": 0.25747121362802755,
+                "derivative_mse": 0.49908026953608986,
+                "log_spectral_l1": 1.4390967996972466
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.007835626180183283,
+                "derivative_mse": 0.01317434502755566,
+                "log_spectral_l1": 0.4114967216636043
+              },
+              "zero_audio": {
+                "mse": 0.02827702161333921,
+                "derivative_mse": 0.004197728096733099,
+                "log_spectral_l1": 0.39606356504318724
+              },
+              "noisy_input": {
+                "mse": 0.010298853455742801,
+                "derivative_mse": 0.019963220320167202,
+                "log_spectral_l1": 0.488801416516776
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.38062599846707745,
+            "prefix": 0.3976384973435154,
+            "hole": 0.383622733373081,
+            "suffix": 0.36347335223578703
+          }
+        },
+        "test": {
+          "velocity_mse": 0.34140388408927214,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.1366856402070792,
+                "derivative_mse": 0.23569394842896757,
+                "log_spectral_l1": 1.2280072372666357
+              },
+              "zero_audio": {
+                "mse": 0.013095941535998445,
+                "derivative_mse": 0.0026429101013809683,
+                "log_spectral_l1": 0.3310157382451491
+              },
+              "noisy_input": {
+                "mse": 0.8203038561872146,
+                "derivative_mse": 1.6145555228761568,
+                "log_spectral_l1": 1.9680969944357636
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.034361156226727,
+                "derivative_mse": 0.03997951043966027,
+                "log_spectral_l1": 0.7133391508598714
+              },
+              "zero_audio": {
+                "mse": 0.013095941535998445,
+                "derivative_mse": 0.0026429101013809683,
+                "log_spectral_l1": 0.3310157382451491
+              },
+              "noisy_input": {
+                "mse": 0.2531802156035972,
+                "derivative_mse": 0.4983196315633905,
+                "log_spectral_l1": 1.4900930027026333
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.007180196577609306,
+                "derivative_mse": 0.012904831116981152,
+                "log_spectral_l1": 0.43639102492640774
+              },
+              "zero_audio": {
+                "mse": 0.013095941535998445,
+                "derivative_mse": 0.0026429101013809683,
+                "log_spectral_l1": 0.3310157382451491
+              },
+              "noisy_input": {
+                "mse": 0.010127213442615988,
+                "derivative_mse": 0.019932794753319865,
+                "log_spectral_l1": 0.5200945026124455
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.34145920833222126,
+            "prefix": 0.3432411867148705,
+            "hole": 0.3412952979429685,
+            "suffix": 0.33961984336702805
+          }
+        }
+      }
+    },
+    {
+      "network": "pyramid",
+      "seed": 44,
+      "metrics": {
+        "final_sampling_ms": 286.6175,
+        "fixed_probe_final_loss": 0.22468240559101105,
+        "fixed_probe_initial_loss": 1.1693236827850342,
+        "generated_rms": 0.3487663269042969,
+        "neural_forward_backward_ms": 8630.361290999983,
+        "optimizer_ms": 412.579275,
+        "other_sampling_ms": 264.979531,
+        "parameters": 57952,
+        "peak_rss_kib": 10072,
+        "preprocessing_ms": 66.76286400000001,
+        "quality_claim": "pipeline verification only; no perceptual quality or generalization established",
+        "same_noise_output_mse_change": 0.249813511967659,
+        "sampling": {
+          "collar": 128,
+          "noise_scale": 1.0,
+          "perturb": 0.0,
+          "seed": 42,
+          "solver": "heun",
+          "steps": 16
+        },
+        "step_max_ms": 22.632967999999998,
+        "step_mean_ms": 15.362676723333323,
+        "step_median_ms": 15.031615,
+        "steps": 600,
+        "task_counts": {
+          "hole": 146,
+          "prefix": 149,
+          "suffix": 141,
+          "unconditional": 164
+        },
+        "total_steps": 600,
+        "training_wall_ms_with_previews": 9361.404059
+      },
+      "signal": {
+        "copied_reference_control": 0.9999999999999994,
+        "correlation_decimation": 4,
+        "correlation_stride_samples": 256,
+        "input": "/data/data/com.termux/files/home/projects/feral/runs/phase2-v1/pyramid-44/generated.wav",
+        "input_sha256": "c6a3d6af7d5ed323f2ffbdaf21a3db7dce2807bb8d5d05cc6b8e45cb4cd3548f",
+        "limits": "correlation is a bounded screen over stride-aligned windows; low scores do not exclude transformed memorization",
+        "nearest_absolute_correlation": 0.07742621852067891,
+        "noise": {
+          "derivative_rms": 1.414868283977899,
+          "lag1_uncentered": -0.007604803658742433,
+          "limiter_hits": 2658,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.996648898356088,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.02528589034793353,
+            0.09348772766301837,
+            0.369719301993797,
+            0.5115070799952514
+          ],
+          "spectral_flatness": 0.9842206419832181
+        },
+        "noise_correlation_control": 0.06984649872235171,
+        "reference": {
+          "derivative_rms": 0.04307612809637674,
+          "lag1_uncentered": 0.9186300998042488,
+          "limiter_hits": 0,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.10677982550470438,
+          "sample_rate": 16000,
+          "samples": 384000,
+          "spectral_band_fractions": [
+            0.31230569632879,
+            0.5516441263639289,
+            0.1104920236826982,
+            0.025558153624581866
+          ],
+          "spectral_flatness": 0.13130095254084395
+        },
+        "reference_path": "/data/data/com.termux/files/home/projects/feral/runs/phase2-v1/train.wav",
+        "reference_sha256": "9fa787982de1bf0d8777b5cec7b0246eff2b2d0e07092ae49d7f07221c923d09",
+        "shuffled_signal": {
+          "derivative_rms": 0.488902322429441,
+          "lag1_uncentered": 0.017592207389925046,
+          "limiter_hits": 59,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.3487670224971325,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.023682879727100543,
+            0.09273042198579763,
+            0.39382104908333176,
+            0.4897656492037698
+          ],
+          "spectral_flatness": 0.9820012941455541
+        },
+        "signal": {
+          "derivative_rms": 0.46005047388671627,
+          "lag1_uncentered": 0.13008369224469465,
+          "limiter_hits": 59,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.34876702249713304,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.05124538078646368,
+            0.1395443481772706,
+            0.37424991087426973,
+            0.4349603601619962
+          ],
+          "spectral_flatness": 0.9454400712634137
+        }
+      },
+      "scores": {
+        "train": {
+          "velocity_mse": 0.37602534130395254,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.12345935972026464,
+                "derivative_mse": 0.205362295751937,
+                "log_spectral_l1": 1.2644042417957284
+              },
+              "zero_audio": {
+                "mse": 0.012774137132390373,
+                "derivative_mse": 0.001204747198996509,
+                "log_spectral_l1": 0.2400753653910547
+              },
+              "noisy_input": {
+                "mse": 0.818280182623858,
+                "derivative_mse": 1.6128039620561094,
+                "log_spectral_l1": 2.0585911116409896
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.05008314207706145,
+                "derivative_mse": 0.07583290431279925,
+                "log_spectral_l1": 0.9575905446975767
+              },
+              "zero_audio": {
+                "mse": 0.012774137132390373,
+                "derivative_mse": 0.001204747198996509,
+                "log_spectral_l1": 0.2400753653910547
+              },
+              "noisy_input": {
+                "mse": 0.2525556248719408,
+                "derivative_mse": 0.4977790262357647,
+                "log_spectral_l1": 1.580373305895227
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.007753248555270077,
+                "derivative_mse": 0.014313180979427442,
+                "log_spectral_l1": 0.5218165375107983
+              },
+              "zero_audio": {
+                "mse": 0.012774137132390373,
+                "derivative_mse": 0.001204747198996509,
+                "log_spectral_l1": 0.2400753653910547
+              },
+              "noisy_input": {
+                "mse": 0.010102229813718246,
+                "derivative_mse": 0.0199111705331656,
+                "log_spectral_l1": 0.5893422291296214
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.375189911593062,
+            "prefix": 0.3708893674535514,
+            "hole": 0.3787806835067571,
+            "suffix": 0.3792414026624397
+          }
+        },
+        "validation": {
+          "velocity_mse": 0.415650027958443,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.13990629114306577,
+                "derivative_mse": 0.20827184286180994,
+                "log_spectral_l1": 1.1343925039954204
+              },
+              "zero_audio": {
+                "mse": 0.02827702161333921,
+                "derivative_mse": 0.004197728096733099,
+                "log_spectral_l1": 0.39606356504318724
+              },
+              "noisy_input": {
+                "mse": 0.8342066894062485,
+                "derivative_mse": 1.6170199895039652,
+                "log_spectral_l1": 1.9112428233460872
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.059165193775378724,
+                "derivative_mse": 0.07821554294339128,
+                "log_spectral_l1": 0.8362275907063146
+              },
+              "zero_audio": {
+                "mse": 0.02827702161333921,
+                "derivative_mse": 0.004197728096733099,
+                "log_spectral_l1": 0.39606356504318724
+              },
+              "noisy_input": {
+                "mse": 0.25747121362802755,
+                "derivative_mse": 0.49908026953608986,
+                "log_spectral_l1": 1.4390967996972466
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.008375658838236813,
+                "derivative_mse": 0.014563248564745192,
+                "log_spectral_l1": 0.4284780689488596
+              },
+              "zero_audio": {
+                "mse": 0.02827702161333921,
+                "derivative_mse": 0.004197728096733099,
+                "log_spectral_l1": 0.39606356504318724
+              },
+              "noisy_input": {
+                "mse": 0.010298853455742801,
+                "derivative_mse": 0.019963220320167202,
+                "log_spectral_l1": 0.488801416516776
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.4147625921876498,
+            "prefix": 0.4291692823584241,
+            "hole": 0.4184872246748712,
+            "suffix": 0.4001810126128272
+          }
+        },
+        "test": {
+          "velocity_mse": 0.37828370110050896,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.1241651634615109,
+                "derivative_mse": 0.205934045455518,
+                "log_spectral_l1": 1.1785437578623774
+              },
+              "zero_audio": {
+                "mse": 0.013095941535998445,
+                "derivative_mse": 0.0026429101013809683,
+                "log_spectral_l1": 0.3310157382451491
+              },
+              "noisy_input": {
+                "mse": 0.8203038561872146,
+                "derivative_mse": 1.6145555228761568,
+                "log_spectral_l1": 1.9680969944357636
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.050512966218291766,
+                "derivative_mse": 0.07648867527088783,
+                "log_spectral_l1": 0.8715386058245848
+              },
+              "zero_audio": {
+                "mse": 0.013095941535998445,
+                "derivative_mse": 0.0026429101013809683,
+                "log_spectral_l1": 0.3310157382451491
+              },
+              "noisy_input": {
+                "mse": 0.2531802156035972,
+                "derivative_mse": 0.4983196315633905,
+                "log_spectral_l1": 1.4900930027026333
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.007795092770069001,
+                "derivative_mse": 0.014394530245514115,
+                "log_spectral_l1": 0.45562988836425533
+              },
+              "zero_audio": {
+                "mse": 0.013095941535998445,
+                "derivative_mse": 0.0026429101013809683,
+                "log_spectral_l1": 0.3310157382451491
+              },
+              "noisy_input": {
+                "mse": 0.010127213442615988,
+                "derivative_mse": 0.019932794753319865,
+                "log_spectral_l1": 0.5200945026124455
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.3785381000958474,
+            "prefix": 0.37859674018316264,
+            "hole": 0.3776370562057969,
+            "suffix": 0.37836290791722915
+          }
+        }
+      }
+    }
+  ],
+  "compute_followup": [
+    {
+      "name": "baseline600",
+      "seed": 42,
+      "scores": {
+        "validation": {
+          "velocity_mse": 0.3975703777583439,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.1659873192663806,
+                "derivative_mse": 0.2522074186587824,
+                "log_spectral_l1": 1.1534107747203033
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.8434071532647733,
+                "derivative_mse": 1.615473503033171,
+                "log_spectral_l1": 1.8641136470565018
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.0437212287833381,
+                "derivative_mse": 0.0315783595610087,
+                "log_spectral_l1": 0.5806814737300335
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.260310862617891,
+                "derivative_mse": 0.49860295798257315,
+                "log_spectral_l1": 1.3939665585479641
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.008129039795757582,
+                "derivative_mse": 0.012844296039909232,
+                "log_spectral_l1": 0.3846410284471359
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.010412439448237401,
+                "derivative_mse": 0.01994412779439013,
+                "log_spectral_l1": 0.4616803989574257
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.40055047064270655,
+            "prefix": 0.4038287945431023,
+            "hole": 0.38880553152295083,
+            "suffix": 0.3970967143246162
+          }
+        },
+        "test": {
+          "velocity_mse": 0.42320340675553597,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.1750503672372253,
+                "derivative_mse": 0.2541374256096264,
+                "log_spectral_l1": 1.080351755622166
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.8501864653589944,
+                "derivative_mse": 1.6157283221801306,
+                "log_spectral_l1": 1.780423171294311
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.04948643330815683,
+                "derivative_mse": 0.033346247589736755,
+                "log_spectral_l1": 0.5308000524382902
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.2624032431055373,
+                "derivative_mse": 0.4986816077543702,
+                "log_spectral_l1": 1.3163156238795235
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.008555533207667792,
+                "derivative_mse": 0.013042749782805637,
+                "log_spectral_l1": 0.3454764774048901
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.010496134714631311,
+                "derivative_mse": 0.019947273769691482,
+                "log_spectral_l1": 0.41478532975222376
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.4245031989835842,
+            "prefix": 0.4396841371538073,
+            "hole": 0.41936342611762223,
+            "suffix": 0.40926286476713075
+          }
+        }
+      },
+      "total_update_seconds": 20.252529321000026
+    },
+    {
+      "name": "pyramid600",
+      "seed": 42,
+      "scores": {
+        "validation": {
+          "velocity_mse": 0.4320014349074613,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.14538960901928133,
+                "derivative_mse": 0.20152733652989005,
+                "log_spectral_l1": 1.0704304776585536
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.8434071532647733,
+                "derivative_mse": 1.615473503033171,
+                "log_spectral_l1": 1.8641136470565018
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.06209399789774795,
+                "derivative_mse": 0.07425369754349695,
+                "log_spectral_l1": 0.7753242967129551
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.260310862617891,
+                "derivative_mse": 0.49860295798257315,
+                "log_spectral_l1": 1.3939665585479641
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.008681353754329598,
+                "derivative_mse": 0.014507020882532317,
+                "log_spectral_l1": 0.404021692853094
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.010412439448237401,
+                "derivative_mse": 0.01994412779439013,
+                "log_spectral_l1": 0.4616803989574257
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.43571248557580144,
+            "prefix": 0.4384200770988085,
+            "hole": 0.42129156730487133,
+            "suffix": 0.432581609650364
+          }
+        },
+        "test": {
+          "velocity_mse": 0.45377884639271066,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.1540767154120287,
+                "derivative_mse": 0.20334242304933345,
+                "log_spectral_l1": 0.9979574878981445
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.8501864653589944,
+                "derivative_mse": 1.6157283221801306,
+                "log_spectral_l1": 1.780423171294311
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.06712316116204434,
+                "derivative_mse": 0.07574778520049115,
+                "log_spectral_l1": 0.7150270091472043
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.2624032431055373,
+                "derivative_mse": 0.4986816077543702,
+                "log_spectral_l1": 1.3163156238795235
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.009026261492049974,
+                "derivative_mse": 0.014641024024193577,
+                "log_spectral_l1": 0.3622990493433409
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.010496134714631311,
+                "derivative_mse": 0.019947273769691482,
+                "log_spectral_l1": 0.41478532975222376
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.4560501846982637,
+            "prefix": 0.47049684728690655,
+            "hole": 0.44730812121823504,
+            "suffix": 0.4412602323674372
+          }
+        }
+      }
+    },
+    {
+      "name": "pyramid1200",
+      "seed": 42,
+      "scores": {
+        "validation": {
+          "velocity_mse": 0.38329056259100364,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.11503052213118971,
+                "derivative_mse": 0.16141285992867638,
+                "log_spectral_l1": 0.9964396478970192
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.8434071532647733,
+                "derivative_mse": 1.615473503033171,
+                "log_spectral_l1": 1.8641136470565018
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.03809602684477494,
+                "derivative_mse": 0.02159484764051111,
+                "log_spectral_l1": 0.4955969899605066
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.260310862617891,
+                "derivative_mse": 0.49860295798257315,
+                "log_spectral_l1": 1.3939665585479641
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.008554749921094352,
+                "derivative_mse": 0.013098978213341439,
+                "log_spectral_l1": 0.3877062569695609
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.010412439448237401,
+                "derivative_mse": 0.01994412779439013,
+                "log_spectral_l1": 0.4616803989574257
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.3870722841504159,
+            "prefix": 0.39366969890759923,
+            "hole": 0.3722656794108407,
+            "suffix": 0.38015458789515844
+          }
+        },
+        "test": {
+          "velocity_mse": 0.41186417477912585,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.12449462835340108,
+                "derivative_mse": 0.16352066851690908,
+                "log_spectral_l1": 0.9345994694919246
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.8501864653589944,
+                "derivative_mse": 1.6157283221801306,
+                "log_spectral_l1": 1.780423171294311
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.044477911761364654,
+                "derivative_mse": 0.023164558611753417,
+                "log_spectral_l1": 0.4590376294897824
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.2624032431055373,
+                "derivative_mse": 0.4986816077543702,
+                "log_spectral_l1": 1.3163156238795235
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.00903984229209681,
+                "derivative_mse": 0.013223439204972364,
+                "log_spectral_l1": 0.3479161643487753
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.010496134714631311,
+                "derivative_mse": 0.019947273769691482,
+                "log_spectral_l1": 0.41478532975222376
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.4133426391931937,
+            "prefix": 0.43261892969698057,
+            "hole": 0.4076223689120438,
+            "suffix": 0.3938727613142856
+          }
+        }
+      },
+      "total_update_seconds": 20.009786610999996,
+      "peak_trainer_rss_kib": 9852,
+      "final_sampling_ms": 337.176719,
+      "signal": {
+        "copied_reference_control": 0.9999999999999994,
+        "correlation_decimation": 4,
+        "correlation_stride_samples": 256,
+        "input": "/data/data/com.termux/files/home/projects/feral/runs/phase2-budget-v1/pyramid-42/generated.wav",
+        "input_sha256": "3bccb1abbab0cba103b82b8fa59c7c971144bc4f1799792f330ffbe20ac1b1a9",
+        "limits": "correlation is a bounded screen over stride-aligned windows; low scores do not exclude transformed memorization",
+        "nearest_absolute_correlation": 0.08881458564358252,
+        "noise": {
+          "derivative_rms": 1.414868283977899,
+          "lag1_uncentered": -0.007604803658742433,
+          "limiter_hits": 2658,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.996648898356088,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.02528589034793353,
+            0.09348772766301837,
+            0.369719301993797,
+            0.5115070799952514
+          ],
+          "spectral_flatness": 0.9842206419832181
+        },
+        "noise_correlation_control": 0.06984649872235171,
+        "reference": {
+          "derivative_rms": 0.04307612809637674,
+          "lag1_uncentered": 0.9186300998042488,
+          "limiter_hits": 0,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.10677982550470438,
+          "sample_rate": 16000,
+          "samples": 384000,
+          "spectral_band_fractions": [
+            0.31230569632879,
+            0.5516441263639289,
+            0.1104920236826982,
+            0.025558153624581866
+          ],
+          "spectral_flatness": 0.13130095254084395
+        },
+        "reference_path": "/data/data/com.termux/files/home/projects/feral/runs/phase2-v1/train.wav",
+        "reference_sha256": "9fa787982de1bf0d8777b5cec7b0246eff2b2d0e07092ae49d7f07221c923d09",
+        "shuffled_signal": {
+          "derivative_rms": 0.2985262846943839,
+          "lag1_uncentered": 0.014678665175596023,
+          "limiter_hits": 1,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.21264466404303,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.02539001687074644,
+            0.0903708208021635,
+            0.394264965357425,
+            0.48997419696966504
+          ],
+          "spectral_flatness": 0.9824439731488619
+        },
+        "signal": {
+          "derivative_rms": 0.28581236865983195,
+          "lag1_uncentered": 0.09675869574236524,
+          "limiter_hits": 1,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.21264466404302992,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.06034982675029585,
+            0.14080770143566915,
+            0.34318701259877077,
+            0.45565545921526424
+          ],
+          "spectral_flatness": 0.9524311725543343
+        }
+      }
+    },
+    {
+      "name": "baseline600",
+      "seed": 43,
+      "scores": {
+        "validation": {
+          "velocity_mse": 0.40912900803394664,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.16111593524873408,
+                "derivative_mse": 0.24604728874550974,
+                "log_spectral_l1": 1.1393645483128974
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.8434071532647733,
+                "derivative_mse": 1.615473503033171,
+                "log_spectral_l1": 1.8641136470565018
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.046921109038143456,
+                "derivative_mse": 0.0386900224019364,
+                "log_spectral_l1": 0.6255455871279909
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.260310862617891,
+                "derivative_mse": 0.49860295798257315,
+                "log_spectral_l1": 1.3939665585479641
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.008407944170016498,
+                "derivative_mse": 0.013110879886613077,
+                "log_spectral_l1": 0.3882936142461682
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.010412439448237401,
+                "derivative_mse": 0.01994412779439013,
+                "log_spectral_l1": 0.4616803989574257
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.41268323915272553,
+            "prefix": 0.42171081610905375,
+            "hole": 0.3990119716713278,
+            "suffix": 0.4031100052026789
+          }
+        },
+        "test": {
+          "velocity_mse": 0.43546221171622657,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.17160416509446205,
+                "derivative_mse": 0.24804232418596595,
+                "log_spectral_l1": 1.0699934415716583
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.8501864653589944,
+                "derivative_mse": 1.6157283221801306,
+                "log_spectral_l1": 1.780423171294311
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.05290347665393934,
+                "derivative_mse": 0.039985670280827855,
+                "log_spectral_l1": 0.5738816222523656
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.2624032431055373,
+                "derivative_mse": 0.4986816077543702,
+                "log_spectral_l1": 1.3163156238795235
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.008829161463903272,
+                "derivative_mse": 0.013208263976966197,
+                "log_spectral_l1": 0.34761954291807806
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.010496134714631311,
+                "derivative_mse": 0.019947273769691482,
+                "log_spectral_l1": 0.41478532975222376
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.4367311060040936,
+            "prefix": 0.4595228460561865,
+            "hole": 0.4320768736968667,
+            "suffix": 0.4135180211077597
+          }
+        }
+      },
+      "total_update_seconds": 18.657693369000025
+    },
+    {
+      "name": "pyramid600",
+      "seed": 43,
+      "scores": {
+        "validation": {
+          "velocity_mse": 0.4372275182759306,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.1503083468476061,
+                "derivative_mse": 0.2184955230970802,
+                "log_spectral_l1": 1.0948865831156283
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.8434071532647733,
+                "derivative_mse": 1.615473503033171,
+                "log_spectral_l1": 1.8641136470565018
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.06289619848575317,
+                "derivative_mse": 0.07678128811494614,
+                "log_spectral_l1": 0.790041209888236
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.260310862617891,
+                "derivative_mse": 0.49860295798257315,
+                "log_spectral_l1": 1.3939665585479641
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.008745323091873545,
+                "derivative_mse": 0.014561596274919025,
+                "log_spectral_l1": 0.4048220845839915
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.010412439448237401,
+                "derivative_mse": 0.01994412779439013,
+                "log_spectral_l1": 0.4616803989574257
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.4403430099404587,
+            "prefix": 0.44540684185028384,
+            "hole": 0.42741051967122934,
+            "suffix": 0.4357497016417509
+          }
+        },
+        "test": {
+          "velocity_mse": 0.45936549959774586,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.16058381112872006,
+                "derivative_mse": 0.2196311244300586,
+                "log_spectral_l1": 1.023531555900446
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.8501864653589944,
+                "derivative_mse": 1.6157283221801306,
+                "log_spectral_l1": 1.780423171294311
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.06812813731175606,
+                "derivative_mse": 0.07773841109315234,
+                "log_spectral_l1": 0.7292049236457595
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.2624032431055373,
+                "derivative_mse": 0.4986816077543702,
+                "log_spectral_l1": 1.3163156238795235
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.009073327542898085,
+                "derivative_mse": 0.014656000206526387,
+                "log_spectral_l1": 0.3627183208198977
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.010496134714631311,
+                "derivative_mse": 0.019947273769691482,
+                "log_spectral_l1": 0.41478532975222376
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.4606048742985423,
+            "prefix": 0.4789821208913788,
+            "hole": 0.4547969659328006,
+            "suffix": 0.443078037268262
+          }
+        }
+      }
+    },
+    {
+      "name": "pyramid1200",
+      "seed": 43,
+      "scores": {
+        "validation": {
+          "velocity_mse": 0.3918461671895553,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.11556640235827674,
+                "derivative_mse": 0.1587992517552764,
+                "log_spectral_l1": 0.9938147777517407
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.8434071532647733,
+                "derivative_mse": 1.615473503033171,
+                "log_spectral_l1": 1.8641136470565018
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.03989198320958738,
+                "derivative_mse": 0.02204275957251691,
+                "log_spectral_l1": 0.49937125404488003
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.260310862617891,
+                "derivative_mse": 0.49860295798257315,
+                "log_spectral_l1": 1.3939665585479641
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.008732964081866551,
+                "derivative_mse": 0.013096352071183391,
+                "log_spectral_l1": 0.3879600480247638
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.010412439448237401,
+                "derivative_mse": 0.01994412779439013,
+                "log_spectral_l1": 0.4616803989574257
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.396219824015431,
+            "prefix": 0.4023663453265158,
+            "hole": 0.37908306723484225,
+            "suffix": 0.3897154321814325
+          }
+        },
+        "test": {
+          "velocity_mse": 0.4216646195165767,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.12474207324832355,
+                "derivative_mse": 0.16088128958794967,
+                "log_spectral_l1": 0.9326009547756718
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.8501864653589944,
+                "derivative_mse": 1.6157283221801306,
+                "log_spectral_l1": 1.780423171294311
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.04648475120745841,
+                "derivative_mse": 0.023678979985891458,
+                "log_spectral_l1": 0.46462592901388583
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.2624032431055373,
+                "derivative_mse": 0.4986816077543702,
+                "log_spectral_l1": 1.3163156238795235
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.00925052728833734,
+                "derivative_mse": 0.013236704543405092,
+                "log_spectral_l1": 0.3483417100821753
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.010496134714631311,
+                "derivative_mse": 0.019947273769691482,
+                "log_spectral_l1": 0.41478532975222376
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.4238362836865897,
+            "prefix": 0.4461421386349071,
+            "hole": 0.41529293538622886,
+            "suffix": 0.4013871203585816
+          }
+        }
+      },
+      "total_update_seconds": 15.359171811000001,
+      "peak_trainer_rss_kib": 9516,
+      "final_sampling_ms": 224.983177,
+      "signal": {
+        "copied_reference_control": 0.9999999999999994,
+        "correlation_decimation": 4,
+        "correlation_stride_samples": 256,
+        "input": "/data/data/com.termux/files/home/projects/feral/runs/phase2-budget-v1/pyramid-43/generated.wav",
+        "input_sha256": "9f4b31e8a5674cb86fd88180750be1e9cf8c9ed2a74dc0cdece578ed995a8200",
+        "limits": "correlation is a bounded screen over stride-aligned windows; low scores do not exclude transformed memorization",
+        "nearest_absolute_correlation": 0.08920119661584638,
+        "noise": {
+          "derivative_rms": 1.414868283977899,
+          "lag1_uncentered": -0.007604803658742433,
+          "limiter_hits": 2658,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.996648898356088,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.02528589034793353,
+            0.09348772766301837,
+            0.369719301993797,
+            0.5115070799952514
+          ],
+          "spectral_flatness": 0.9842206419832181
+        },
+        "noise_correlation_control": 0.06984649872235171,
+        "reference": {
+          "derivative_rms": 0.04307612809637674,
+          "lag1_uncentered": 0.9186300998042488,
+          "limiter_hits": 0,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.10677982550470438,
+          "sample_rate": 16000,
+          "samples": 384000,
+          "spectral_band_fractions": [
+            0.31230569632879,
+            0.5516441263639289,
+            0.1104920236826982,
+            0.025558153624581866
+          ],
+          "spectral_flatness": 0.13130095254084395
+        },
+        "reference_path": "/data/data/com.termux/files/home/projects/feral/runs/phase2-v1/train.wav",
+        "reference_sha256": "9fa787982de1bf0d8777b5cec7b0246eff2b2d0e07092ae49d7f07221c923d09",
+        "shuffled_signal": {
+          "derivative_rms": 0.2969236034915276,
+          "lag1_uncentered": 0.005471353548007253,
+          "limiter_hits": 2,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.2105214739101203,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.025229661766688206,
+            0.09105114775477417,
+            0.38768835733892243,
+            0.4960308331396152
+          ],
+          "spectral_flatness": 0.9831547286099654
+        },
+        "signal": {
+          "derivative_rms": 0.283435703560801,
+          "lag1_uncentered": 0.09371263455079964,
+          "limiter_hits": 2,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.2105214739101201,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.05341471964737669,
+            0.14488958224228943,
+            0.3468308678346624,
+            0.4548648302756715
+          ],
+          "spectral_flatness": 0.9554682964898534
+        }
+      }
+    },
+    {
+      "name": "baseline600",
+      "seed": 44,
+      "scores": {
+        "validation": {
+          "velocity_mse": 0.40967853740617954,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.163288654730196,
+                "derivative_mse": 0.2366023296927119,
+                "log_spectral_l1": 1.1437951818468053
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.8434071532647733,
+                "derivative_mse": 1.615473503033171,
+                "log_spectral_l1": 1.8641136470565018
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.04963086091279787,
+                "derivative_mse": 0.041451453292706684,
+                "log_spectral_l1": 0.6522838887041614
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.260310862617891,
+                "derivative_mse": 0.49860295798257315,
+                "log_spectral_l1": 1.3939665585479641
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.00828921622983136,
+                "derivative_mse": 0.013139495731305692,
+                "log_spectral_l1": 0.3887772946980656
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.010412439448237401,
+                "derivative_mse": 0.01994412779439013,
+                "log_spectral_l1": 0.4616803989574257
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.41278835375950207,
+            "prefix": 0.4195933943447394,
+            "hole": 0.40053922328422054,
+            "suffix": 0.40579317823625644
+          }
+        },
+        "test": {
+          "velocity_mse": 0.4335097458153801,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.17203041161469232,
+                "derivative_mse": 0.23844004445998218,
+                "log_spectral_l1": 1.0723687684264467
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.8501864653589944,
+                "derivative_mse": 1.6157283221801306,
+                "log_spectral_l1": 1.780423171294311
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.05491950691273285,
+                "derivative_mse": 0.043141630878584615,
+                "log_spectral_l1": 0.5986255388767509
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.2624032431055373,
+                "derivative_mse": 0.4986816077543702,
+                "log_spectral_l1": 1.3163156238795235
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.00868468389839567,
+                "derivative_mse": 0.013312098624892054,
+                "log_spectral_l1": 0.34832664963330023
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.010496134714631311,
+                "derivative_mse": 0.019947273769691482,
+                "log_spectral_l1": 0.41478532975222376
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.4341757940674037,
+            "prefix": 0.4529183297513908,
+            "hole": 0.4316056073123987,
+            "suffix": 0.41533925213032713
+          }
+        }
+      },
+      "total_update_seconds": 19.91034004599999
+    },
+    {
+      "name": "pyramid600",
+      "seed": 44,
+      "scores": {
+        "validation": {
+          "velocity_mse": 0.44156572047017023,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.1507772103684224,
+                "derivative_mse": 0.20713295683707006,
+                "log_spectral_l1": 1.0947128162418749
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.8434071532647733,
+                "derivative_mse": 1.615473503033171,
+                "log_spectral_l1": 1.8641136470565018
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.06511820929439817,
+                "derivative_mse": 0.0779403206815294,
+                "log_spectral_l1": 0.7997429030710705
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.260310862617891,
+                "derivative_mse": 0.49860295798257315,
+                "log_spectral_l1": 1.3939665585479641
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.008780800301788624,
+                "derivative_mse": 0.014563819533149471,
+                "log_spectral_l1": 0.40518497329031566
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.010412439448237401,
+                "derivative_mse": 0.01994412779439013,
+                "log_spectral_l1": 0.4616803989574257
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.4447500390689011,
+            "prefix": 0.4491702114059802,
+            "hole": 0.4322265858439968,
+            "suffix": 0.44011604556180345
+          }
+        },
+        "test": {
+          "velocity_mse": 0.4624339588763515,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.15885577805848267,
+                "derivative_mse": 0.20910494682843747,
+                "log_spectral_l1": 1.0233391004447177
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.8501864653589944,
+                "derivative_mse": 1.6157283221801306,
+                "log_spectral_l1": 1.780423171294311
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.06989616635646823,
+                "derivative_mse": 0.07942111917928124,
+                "log_spectral_l1": 0.7389606440501436
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.2624032431055373,
+                "derivative_mse": 0.4986816077543702,
+                "log_spectral_l1": 1.3163156238795235
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.009115993921075117,
+                "derivative_mse": 0.014669733367205026,
+                "log_spectral_l1": 0.3631866402294004
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.010496134714631311,
+                "derivative_mse": 0.019947273769691482,
+                "log_spectral_l1": 0.41478532975222376
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.4641018909703558,
+            "prefix": 0.479846163254815,
+            "hole": 0.4575330689012102,
+            "suffix": 0.4482547123790249
+          }
+        }
+      }
+    },
+    {
+      "name": "pyramid1200",
+      "seed": 44,
+      "scores": {
+        "validation": {
+          "velocity_mse": 0.382217495451987,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.11825972792323614,
+                "derivative_mse": 0.16972106475128074,
+                "log_spectral_l1": 1.0088761262083976
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.8434071532647733,
+                "derivative_mse": 1.615473503033171,
+                "log_spectral_l1": 1.8641136470565018
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.03713017620855941,
+                "derivative_mse": 0.019975425150192433,
+                "log_spectral_l1": 0.4798378353019311
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.260310862617891,
+                "derivative_mse": 0.49860295798257315,
+                "log_spectral_l1": 1.3939665585479641
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.008521325177289957,
+                "derivative_mse": 0.013026934568975997,
+                "log_spectral_l1": 0.3868812286961146
+              },
+              "zero_audio": {
+                "mse": 0.042363703795103284,
+                "derivative_mse": 0.0033055956749762014,
+                "log_spectral_l1": 0.45004440371846777
+              },
+              "noisy_input": {
+                "mse": 0.010412439448237401,
+                "derivative_mse": 0.01994412779439013,
+                "log_spectral_l1": 0.4616803989574257
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.38594978290907206,
+            "prefix": 0.39204282050302897,
+            "hole": 0.3716150876522703,
+            "suffix": 0.3792622907435767
+          }
+        },
+        "test": {
+          "velocity_mse": 0.41062477259565616,
+          "by_time": {
+            "0.1": {
+              "endpoint": {
+                "mse": 0.12817492673919825,
+                "derivative_mse": 0.17168801574741202,
+                "log_spectral_l1": 0.9457122671522677
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.8501864653589944,
+                "derivative_mse": 1.6157283221801306,
+                "log_spectral_l1": 1.780423171294311
+              }
+            },
+            "0.5": {
+              "endpoint": {
+                "mse": 0.043505453755236595,
+                "derivative_mse": 0.0215453682316718,
+                "log_spectral_l1": 0.4445950075928444
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.2624032431055373,
+                "derivative_mse": 0.4986816077543702,
+                "log_spectral_l1": 1.3163156238795235
+              }
+            },
+            "0.9": {
+              "endpoint": {
+                "mse": 0.008996122750866612,
+                "derivative_mse": 0.01315382162709189,
+                "log_spectral_l1": 0.34720916727745343
+              },
+              "zero_audio": {
+                "mse": 0.05174870868591405,
+                "derivative_mse": 0.005026599333482763,
+                "log_spectral_l1": 0.5421262244306225
+              },
+              "noisy_input": {
+                "mse": 0.010496134714631311,
+                "derivative_mse": 0.019947273769691482,
+                "log_spectral_l1": 0.41478532975222376
+              }
+            }
+          },
+          "by_task": {
+            "unconditional": 0.4121434281830494,
+            "prefix": 0.4315495799628708,
+            "hole": 0.4066523376703881,
+            "suffix": 0.392153744566316
+          }
+        }
+      },
+      "total_update_seconds": 19.758346320000005,
+      "peak_trainer_rss_kib": 10072,
+      "final_sampling_ms": 232.32442700000001,
+      "signal": {
+        "copied_reference_control": 0.9999999999999994,
+        "correlation_decimation": 4,
+        "correlation_stride_samples": 256,
+        "input": "/data/data/com.termux/files/home/projects/feral/runs/phase2-budget-v1/pyramid-44/generated.wav",
+        "input_sha256": "3230f6a1d9bbbf1e70eda83e8817bab409ca5e8f2ec98823decbca07a319ed8d",
+        "limits": "correlation is a bounded screen over stride-aligned windows; low scores do not exclude transformed memorization",
+        "nearest_absolute_correlation": 0.08717473462260479,
+        "noise": {
+          "derivative_rms": 1.414868283977899,
+          "lag1_uncentered": -0.007604803658742433,
+          "limiter_hits": 2658,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.996648898356088,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.02528589034793353,
+            0.09348772766301837,
+            0.369719301993797,
+            0.5115070799952514
+          ],
+          "spectral_flatness": 0.9842206419832181
+        },
+        "noise_correlation_control": 0.06984649872235171,
+        "reference": {
+          "derivative_rms": 0.04307612809637674,
+          "lag1_uncentered": 0.9186300998042488,
+          "limiter_hits": 0,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.10677982550470438,
+          "sample_rate": 16000,
+          "samples": 384000,
+          "spectral_band_fractions": [
+            0.31230569632879,
+            0.5516441263639289,
+            0.1104920236826982,
+            0.025558153624581866
+          ],
+          "spectral_flatness": 0.13130095254084395
+        },
+        "reference_path": "/data/data/com.termux/files/home/projects/feral/runs/phase2-v1/train.wav",
+        "reference_sha256": "9fa787982de1bf0d8777b5cec7b0246eff2b2d0e07092ae49d7f07221c923d09",
+        "shuffled_signal": {
+          "derivative_rms": 0.29292879331275595,
+          "lag1_uncentered": 0.008349695143854455,
+          "limiter_hits": 2,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.20798998107514827,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.02495447040770378,
+            0.09193622786564166,
+            0.38681187255821303,
+            0.4962974291684417
+          ],
+          "spectral_flatness": 0.9821637173779386
+        },
+        "signal": {
+          "derivative_rms": 0.2801066922840826,
+          "lag1_uncentered": 0.09320740601523332,
+          "limiter_hits": 2,
+          "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+          "rms": 0.20798998107514846,
+          "sample_rate": 16000,
+          "samples": 8192,
+          "spectral_band_fractions": [
+            0.06088347452600062,
+            0.13702633205586834,
+            0.34663494609652185,
+            0.45545524732160914
+          ],
+          "spectral_flatness": 0.9537074536935113
+        }
+      }
+    }
+  ],
+  "plans": {
+    "equal_steps": {
+      "protocol": "phase2-pyramid-v1",
+      "source": "/storage/emulated/0/Download/AROUND (The Absence of Ladder)v2.wav",
+      "source_sha256": "cad6b5725121914b6f0f1e932e14d6c394b68e2df9d2f472b6f0675a3e92e026",
+      "binary_sha256": "5dd21e0939c19f599c852042896c6801bc87d7d3070e8e33bcca2a090da68bb2",
+      "script_sha256": "6566231d39684d5a3c0017450246eef58eecd9f1ab7c2d44a1b1d87de8f9db50",
+      "commit": "21083f47ab18cd571f5b3fc11f8320d3f0c473ed",
+      "seeds": [
+        42,
+        43,
+        44
+      ],
+      "steps_per_model": 600,
+      "split_seconds": {
+        "train": [
+          0,
+          24
+        ],
+        "validation": [
+          32,
+          40
+        ],
+        "test": [
+          48,
+          56
+        ]
+      },
+      "normalization": "none, same raw gain for train and held-out audio",
+      "crop_seconds": 0.512,
+      "learning_rate": 0.0003,
+      "evaluation_seed": 7001,
+      "evaluation_crops": 4,
+      "selection": "fixed plan before training, no checkpoint/seed selection",
+      "limits": "one recording; no cross-recording generalization or listening claim"
+    },
+    "followup": {
+      "protocol": "phase2-budget-v1",
+      "base": "/data/data/com.termux/files/home/projects/feral/runs/phase2-v1",
+      "base_plan_sha256": "9cb19178c76a402cab621d85c839c1b862c693f7714a7159e376f1fb36352812",
+      "additional_pyramid_steps": 600,
+      "baseline_total_steps": 600,
+      "pyramid_total_steps": 1200,
+      "seeds": [
+        42,
+        43,
+        44
+      ],
+      "new_split_seconds": {
+        "validation": [
+          64,
+          72
+        ],
+        "test": [
+          80,
+          88
+        ]
+      },
+      "source_sha256": "cad6b5725121914b6f0f1e932e14d6c394b68e2df9d2f472b6f0675a3e92e026",
+      "binary_sha256": "5dd21e0939c19f599c852042896c6801bc87d7d3070e8e33bcca2a090da68bb2",
+      "script_sha256": "d49842ff74de1e43ebcc37d5fc50c04d3a9d02ebfe55fc5123f1af7f62e63bcc",
+      "commit": "e0fdcdab73f9f24028b3c73cfadb11601b6db475",
+      "reason": "equal-step pyramid was worse; test whether cheaper updates improve the practical compute tradeoff",
+      "limits": "new held-out sections; baseline saw fewer updates/crops; not evidence that long context caused any advantage"
+    }
+  },
+  "paired_rng_traces_equal": true,
+  "source_unchanged": true,
+  "means": {
+    "equal_step_test": {
+      "baseline": 0.3348517347323745,
+      "pyramid": 0.37439879269376547
+    },
+    "fresh_test": {
+      "baseline600": 0.43072512142904756,
+      "pyramid600": 0.45852610162226937,
+      "pyramid1200": 0.4147178556304529
+    }
+  },
+  "limits": "three model seeds, one song; follow-up has twice the pooled updates; descriptors and denoising probes do not establish perceptual quality or rule out transformed memorization"
+}

@@ -1,0 +1,78 @@
+{
+  "inpaint_derivative_changes": [
+    0.0,
+    7.450580596923828e-09
+  ],
+  "before": {
+    "audio": [
+      {
+        "path": "runs/phase2-budget-v1/pyramid-42/one-second.wav",
+        "sample_rate": 16000,
+        "samples": 16000,
+        "seconds": 1.0,
+        "peak": 0.9800000190734863,
+        "rms": 0.21049504267126637,
+        "samples_at_safety_limit": 1,
+        "max_adjacent_difference": 1.432935655117035,
+        "sha256": "46674527b8ae3369a778f44e9fec7d380a817ab8368012404752d2a4d2ece7e0"
+      },
+      {
+        "path": "runs/phase2-budget-v1/pyramid-42/weird.wav",
+        "sample_rate": 16000,
+        "samples": 16000,
+        "seconds": 1.0,
+        "peak": 0.9800000190734863,
+        "rms": 0.36285347943290835,
+        "samples_at_safety_limit": 209,
+        "max_adjacent_difference": 1.9600000381469727,
+        "sha256": "bd5b340d89d4c1648d580b9d2d76de21114859240afe91ad64eb93f005a9985c"
+      }
+    ],
+    "continuation": {
+      "exact_prefix": true,
+      "new_samples": 8192,
+      "boundary_jump": 0.04999999701976776,
+      "boundary_derivative_change": 0.10695407539606094
+    },
+    "inpainting": {
+      "exact_outside": true,
+      "changed_interval": true,
+      "boundary_jumps": [
+        0.050000011920928955,
+        0.014410391449928284
+      ]
+    }
+  },
+  "after": {
+    "audio": [
+      {
+        "path": "runs/phase2-budget-v1/pyramid-42/one-second.wav",
+        "sample_rate": 16000,
+        "samples": 16000,
+        "seconds": 1.0,
+        "peak": 0.9800000190734863,
+        "rms": 0.21049504267126637,
+        "samples_at_safety_limit": 1,
+        "max_adjacent_difference": 1.432935655117035,
+        "sha256": "46674527b8ae3369a778f44e9fec7d380a817ab8368012404752d2a4d2ece7e0"
+      }
+    ],
+    "continuation": {
+      "exact_prefix": true,
+      "new_samples": 8192,
+      "boundary_jump": 0.1569540947675705,
+      "boundary_derivative_change": 2.2351741790771484e-08
+    },
+    "inpainting": {
+      "exact_outside": true,
+      "changed_interval": true,
+      "boundary_jumps": [
+        0.07445883750915527,
+        0.014410391449928284
+      ]
+    }
+  },
+  "perturbation_same_noise_mse": 0.00024694240347507924,
+  "checkpoint_sha256": "0a0d31dc0bac3f3d5f89ba7f64cb79d8e0db4cce2ea012cf36fcea3e949e7808",
+  "new_render_git_commit": "d8c5b35c6712028a3d2b8787edb48fd09c607620"
+}

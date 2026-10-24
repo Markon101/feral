@@ -53,3 +53,17 @@ training is self-supervised on acoustic samples; no labels or transcription.
 
 Recurrence, attractors, soft invariants, multiscale time and latent interpolation
 are research directions, not implemented baseline claims.
+
+## Phase 2: controlled pooled-context experiment
+
+See [the frozen protocol](reports/PHASE2_PROTOCOL.md) and
+[the complete outcome](reports/PHASE2.md). `scripts/phase2.py` trains three paired
+baseline/pyramid seeds on a fixed source interval and evaluates disjoint sections.
+`scripts/phase2_budget.py` is a separately frozen follow-up with twice the pooled
+updates and new held-out sections. `scripts/summarize_phase2.py` aggregates model
+seeds without treating crop probes as independent models.
+
+The equal-step result is negative; the approximate compute-budget result has a
+modest denoising gain and no established generation-quality gain. All results and
+controls remain. The next experiment should challenge noise/path scaling and
+actual generated spectra rather than enlarging the architecture reflexively.

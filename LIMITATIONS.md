@@ -13,7 +13,8 @@ beat alignment, long-range musical structure, or quality after repeated transfor
 Do not mistake decoder success, finite loss, lower training probes, or changed
 output for any of those results. No subjective listening evaluation is claimed.
 
-* The CNN sees 62 ms at 16 kHz. It cannot plan musical form. Outputs after very
+* The default CNN sees 62 ms at 16 kHz; optional pyramid support spans up to
+  468 ms, shortened by crop edges. Neither can plan musical form. Outputs after very
   short training can be noisy, clipped, strange or unrecognizable. Unknown-region
   hard clipping can introduce distortion; counts are a future diagnostic.
 * Training is currently single-threaded batch one. The 3 GB working ceiling is
@@ -37,7 +38,7 @@ output for any of those results. No subjective listening evaluation is claimed.
 * Variation's repeated mask anchors are experimental and outside the contiguous
   mask patterns used in training. No scalar audio-to-audio strength control.
 * No public backward outpaint command, latent interpolation, recurrent latent
-  dynamics, multiscale model, learned codec, diffusion, acoustic invariant engine,
+  dynamics, learned codec, diffusion, acoustic invariant engine,
   evolutionary search or automated OOD selection. No pretrained models or services.
 * Checkpoint format v1 is readable JSON and includes weights, Adam and RNG. CPU
   deterministic resume is tested on this compiler/architecture; cross-platform
@@ -52,3 +53,18 @@ output for any of those results. No subjective listening evaluation is claimed.
 * GPU/OpenCL training is not implemented. Existing OpenCL work was inspected
   read-only. See reports/OPENCL.md for runtime discovery, reusable patterns and a
   concrete acceleration gate. There is no hidden CPU/GPU switch.
+
+Phase 2 adds longer pooled context and reproducible held-out diagnostics, not a
+perceptual quality solution. The equal-step pooled candidate underperformed. Its
+compute-budget denoising gain does not prove that coarse context was useful: it
+received twice as many optimizer updates/crops. Generated spectral structure is
+still far from the source. One song and three model seeds do not establish general
+acoustic competence. The correlation screen misses shifted/transformed copies.
+Evaluation endpoints use noisy target audio and must not be called unconditional
+generation. Silence can beat the model in highly ambiguous high-noise probes.
+
+`evaluate`/`analyze` use at most the first 60 seconds of their input; use explicit
+split files as the recorded protocols do. Pooling is aligned to crop frame zero,
+so shift/block sensitivity remains a concern. The refined collar can retain valid
+transient slopes, but cannot simultaneously match an impossible slope and enforce
+the generated-sample amplitude ceiling. No click-free listening claim is made.

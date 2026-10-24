@@ -132,3 +132,35 @@ Read [ARCHITECTURE.md](ARCHITECTURE.md), [LIMITATIONS.md](LIMITATIONS.md),
 [EXPERIMENTS.md](EXPERIMENTS.md), [ROADMAP.md](ROADMAP.md) and
 [reports/VALIDATION.md](reports/VALIDATION.md) for implementation contracts,
 measured evidence and the OpenCL decision.
+
+## Phase 2: longer context and held-out diagnostics
+
+The original network remains the default. `--network pyramid` selects an optional
+57,952-parameter pooled residual CNN with a 468 ms structural context span instead
+of 62 ms. The waveform representation, flow loss and mask tasks stay the same.
+Pooling is differentiable; the full-resolution skip path retains sample detail.
+Old checkpoints still load, and an old unconditional render was reproduced exactly.
+
+```sh
+./target/release/feral train --input recording.wav --run runs/pyramid \
+  --network pyramid --steps 600 --no-normalize
+./target/release/feral evaluate --checkpoint runs/pyramid/checkpoint.json \
+  --input heldout.wav --output runs/pyramid/heldout.json
+./target/release/feral analyze --input runs/pyramid/generated.wav \
+  --reference recording.wav --output runs/pyramid/signal.json
+```
+
+`evaluate` records fixed crops, all four mask tasks at three times, waveform and
+multiresolution spectral endpoint diagnostics, and zero-audio/noisy-input controls.
+`analyze` records signal descriptors, shuffled/noise controls and a bounded aligned
+copying screen. Both use unnormalized 16 kHz mono audio (evaluation uses checkpoint
+sample rate), capped at the first 60 seconds; explicitly split longer inputs.
+These are numerical checks, not listening scores. Do not train on held-out files.
+
+The three-seed test found the pyramid **worse at equal updates**. At twice the
+updates and similar observed CPU update time it modestly improved fresh held-out
+denoising, while generated spectra remained overly noise-like. It stays opt-in.
+The continuity collar now retains feasible source slopes on transients, with
+headroom-aware decay; protected canonical samples remain exact. Amplitude limits
+can make exact slope matching impossible. See [Phase 2 results](reports/PHASE2.md)
+and the frozen [protocol](reports/PHASE2_PROTOCOL.md).

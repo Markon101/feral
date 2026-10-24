@@ -182,3 +182,7 @@ creation), decode, train, full resume, generate, continue, inpaint, variation,
 smoke, command help; Euler, Heun, noise scaling and bounded perturbation. Full resume and an explicit one-step weights-only warm start on a new synthetic
 manifest were both exercised. The warm start retained the initial model weights,
 reset Adam/RNG, changed dataset, and completed step 1. See LIMITATIONS.md and ROADMAP.md for what remains.
+
+Phase 2 follow-up: the historical results above remain unchanged. The current
+19-test suite, pooled network, held-out experiments, negative controls and transient
+continuity fix are documented in [PHASE2.md](PHASE2.md).

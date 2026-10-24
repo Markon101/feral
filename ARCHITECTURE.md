@@ -29,7 +29,7 @@ Numerical finite-difference tests check weights and biases in every layer.
 
 ## Exact current network
 
-Default phone profile: **57,952 trainable f32 parameters**, batch size one.
+Default baseline phone profile: **57,952 trainable f32 parameters**, batch size one.
 For each frame, concatenate 32 current samples, 32 protected context samples
 (context times mask), 32 per-sample mask values, and four time features:
 `t`, `1-t`, `sin(2*pi*t)`, `cos(2*pi*t)`. This gives 100 input channels.
@@ -104,4 +104,38 @@ explicit encode/decode contract and conservation tests, while waveform-domain
 projection remains the last authority on protected samples. Hybrid waveform/latent
 models can retain a sample correction head. Multiscale encoders and recurrent
 latent context could add longer receptive fields without replacing decoder,
-manifest, provenance or mask contracts. None of those future models exists here.
+manifest, provenance or mask contracts. Learned codecs, recurrence and hybrid latent models remain future work. The pooled
+waveform variant below is the first implemented multirate experiment.
+
+## Optional pooled residual network (Phase 2)
+
+`Architecture::pyramid()` keeps the same projections, widths, kernel sizes and
+57,952 parameters, but uses residual branch pooling scales 1/4/16/64 and dilation
+1 throughout. The branch is `.5*repeat(tanh(Conv3(avg_pool(h,s))),s)`, added to the
+full-resolution `h`. Backpropagation sums through repeat and divides through average
+pooling using actual group lengths; parameter derivatives merge into the same Adam
+contract. All four branches participate in one differentiable forward/backward
+pass. This is not hidden state or gradient accumulation.
+
+For an interior frame, tracing aligned pooling groups and kernel neighbors gives a
+maximum support span of 234 frames, 7,488 samples (468 ms at 16 kHz). Zero padding
+and finite crops can shorten it. Pooling loses fine ordering in the residual branch;
+the skip preserves fine-resolution activations but does not guarantee fine audio.
+Alignment introduces shift sensitivity. Network and sampler remain separate.
+
+An empty `scales` vector is omitted from model JSON and means all scales are one.
+This preserves v1 baseline model hashes/checkpoints. New checkpoints with explicit
+scales require Phase 2 code; old code rejects their hash instead of silently running
+a different network. Full resume requires the same architecture (`--network`).
+
+The `evaluate` module adds forward-only held-out probes, paired endpoint waveform,
+derivative/coarse/STFT metrics, unpaired signal descriptors and a bounded correlation
+screen. RustFFT (eight cached additional Cargo packages) is used only for diagnostics,
+not to replace the waveform generator or add a new training objective. Research
+basis and metric differences are explicit in reports/PHASE2_PROTOCOL.md.
+
+The final waveform continuity operator uses uncapped source edge differences and
+headroom-adapted tangent decay. It retains the first unknown step's feasible slope;
+the .98 safety limiter still wins when a slope cannot fit. Raised-cosine blending
+changes only unknown samples. Signal continuity, perceptual continuity and musical
+structure continue to require different evidence.
