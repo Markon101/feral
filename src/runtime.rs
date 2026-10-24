@@ -149,13 +149,13 @@ impl Checkpoint {
         );
         let c: Self = serde_json::from_reader(std::io::BufReader::new(fs::File::open(path)?))?;
         ensure!(
-            [1, 2].contains(&c.format_version),
+            [1, 2, 3].contains(&c.format_version),
             "unsupported checkpoint version"
         );
         c.flow.validate()?;
         ensure!(
-            c.format_version != 1 || c.flow.is_legacy(),
-            "nonlegacy flow requires format version 2"
+            c.format_version == c.flow.format_version(),
+            "checkpoint format/flow configuration mismatch"
         );
         c.model.validate()?;
         let n = c.model.count();
@@ -212,7 +212,7 @@ fn evaluation(model: &Model, flow: &FlowConfig, dataset: &Dataset, n: usize) -> 
             return f32::NAN;
         }
         let (mask, _) = conditioning::training_mask(n, &mut rng);
-        let noise: Vec<f32> = (0..n).map(|_| rng.normal()).collect();
+        let noise: Vec<f32> = (0..n).map(|_| rng.normal() * flow.prior_std()).collect();
         sum += parameterization::loss_gradient(model, flow, &clean, &mask, &noise, 0.5).0;
     }
     sum / 4.
@@ -278,7 +278,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         let model = Model::new(c.architecture.clone(), c.seed);
         let adam = Adam::new(model.count(), c.lr);
         Checkpoint {
-            format_version: if c.flow.is_legacy() { 1 } else { 2 },
+            format_version: c.flow.format_version(),
             flow: c.flow.clone(),
             model,
             adam,
@@ -294,7 +294,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
             objective: if c.flow.is_legacy() {
                 "conditional rectified flow, unknown-sample MSE, uniform t, N(0,1) noise".into()
             } else {
-                "conditional rectified flow, Gaussian residual preconditioning, residual MSE (=velocity MSE/out^2), uniform t, N(0,1) noise".into()
+                "conditional rectified flow, Gaussian residual preconditioning, residual MSE (=velocity MSE/out^2), uniform t, checkpointed Gaussian prior".into()
             },
             representation: "f32 mono waveform; lossless time-major blocks".into(),
             model_hash: String::new(),
@@ -358,7 +358,9 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         );
         let (mask, task) = conditioning::training_mask(n, &mut ck.rng);
         *task_counts.entry(task).or_insert(0usize) += 1;
-        let noise: Vec<f32> = (0..n).map(|_| ck.rng.normal()).collect();
+        let noise: Vec<f32> = (0..n)
+            .map(|_| ck.rng.normal() * ck.flow.prior_std())
+            .collect();
         let t = ck.rng.uniform();
         let op = Instant::now();
         let (loss, grad) =

@@ -31,7 +31,10 @@ fn tiny() -> Architecture {
 }
 #[test]
 fn preconditioned_coefficients_and_gradients_are_finite_at_both_endpoints() {
-    let cfg = FlowConfig::Preconditioned { data_scale: 0.1 };
+    let cfg = FlowConfig::Preconditioned {
+        data_scale: 0.1,
+        prior_std: 1.,
+    };
     cfg.validate().unwrap();
     let mut m = Model::new(tiny(), 7);
     let p = m.parameters();
@@ -143,9 +146,12 @@ fn legacy_adapter_is_bit_exact_and_invalid_config_rejected() {
         flow::sample(&adapted, &x, &x, &c).unwrap()
     );
     for s in [0., f32::NAN, 3.] {
-        assert!(FlowConfig::Preconditioned { data_scale: s }
-            .validate()
-            .is_err());
+        assert!(FlowConfig::Preconditioned {
+            data_scale: s,
+            prior_std: 1.
+        }
+        .validate()
+        .is_err());
     }
 }
 fn config(root: &Path, name: &str, steps: usize, resume: Option<PathBuf>) -> TrainConfig {
@@ -162,7 +168,10 @@ fn config(root: &Path, name: &str, steps: usize, resume: Option<PathBuf>) -> Tra
         resume,
         weights_only: false,
         architecture: tiny(),
-        flow: FlowConfig::Preconditioned { data_scale: 0.1 },
+        flow: FlowConfig::Preconditioned {
+            data_scale: 0.1,
+            prior_std: 1.,
+        },
     }
 }
 #[test]
@@ -186,4 +195,88 @@ fn versioned_full_resume_and_config_mismatch_gate() {
     runtime::write_json(&root.join("wrong.json"), &wrong).unwrap();
     assert!(Checkpoint::load(&root.join("wrong.json")).is_err());
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn calibrated_prior_sampling_matches_training_scale_and_format_gate() {
+    let cfg = FlowConfig::Preconditioned {
+        data_scale: 0.1,
+        prior_std: 0.1,
+    };
+    cfg.validate().unwrap();
+    assert_eq!(cfg.format_version(), 3);
+    let mut model = Model::new(tiny(), 5);
+    model.set_parameters(&vec![0.; model.count()]);
+    let adapter = ConfiguredVelocity {
+        model: &model,
+        config: &cfg,
+    };
+    let z = vec![0.; 64];
+    let c = Sampling {
+        steps: 256,
+        collar: 0,
+        ..Default::default()
+    };
+    let x = flow::sample(&adapter, &z, &z, &c).unwrap();
+    let mut rng = Rng::new(c.seed);
+    for v in x {
+        assert!((v - 0.1 * rng.normal()).abs() < 0.00001);
+    }
+    let root = temp();
+    audio::synthetic(&root.join("corpus"), 16000).unwrap();
+    let mut c = config(&root, "cal", 2, None);
+    c.flow = cfg.clone();
+    let path = runtime::train(c).unwrap();
+    let loaded = Checkpoint::load(&path).unwrap();
+    assert_eq!(loaded.format_version, 3);
+    assert_eq!(loaded.flow, cfg);
+    let mut bad = serde_json::to_value(&loaded).unwrap();
+    bad["format_version"] = 2.into();
+    runtime::write_json(&root.join("wrong-v2.json"), &bad).unwrap();
+    assert!(Checkpoint::load(&root.join("wrong-v2.json")).is_err());
+    let wrong = config(&root, "wrong-resume", 1, Some(path));
+    assert!(runtime::train(wrong).is_err());
+    fs::remove_dir_all(root).unwrap();
+}
+#[test]
+fn calibrated_prior_gradient_and_known_sample_projection() {
+    let cfg = FlowConfig::Preconditioned {
+        data_scale: 0.1,
+        prior_std: 0.1,
+    };
+    let mut m = Model::new(tiny(), 7);
+    let p = m.parameters();
+    let mut rng = Rng::new(17);
+    let y: Vec<f32> = (0..68).map(|i| 0.1 * (i as f32 * 0.2).sin()).collect();
+    let z: Vec<f32> = (0..68).map(|_| 0.1 * rng.normal()).collect();
+    let mut mask = vec![0.; 68];
+    mask[..16].fill(1.);
+    let (_, g) = parameterization::loss_gradient(&m, &cfg, &y, &mask, &z, 0.6);
+    for i in [0, 10, 100, p.len() - 1] {
+        let mut q = p.clone();
+        q[i] += 0.002;
+        m.set_parameters(&q);
+        let hi = parameterization::loss_gradient(&m, &cfg, &y, &mask, &z, 0.6).0;
+        q[i] -= 0.004;
+        m.set_parameters(&q);
+        let lo = parameterization::loss_gradient(&m, &cfg, &y, &mask, &z, 0.6).0;
+        let fd = (hi - lo) / 0.004;
+        assert!((fd - g[i]).abs() < 0.001 + 0.03 * fd.abs());
+    }
+    m.set_parameters(&p);
+    let adapter = ConfiguredVelocity {
+        model: &m,
+        config: &cfg,
+    };
+    let x = flow::sample(
+        &adapter,
+        &y,
+        &mask,
+        &Sampling {
+            steps: 8,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(&x[..16], &y[..16]);
 }

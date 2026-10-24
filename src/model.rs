@@ -124,6 +124,9 @@ pub struct Model {
 }
 /// CPU-independent boundary for flow and conditioning; another backend can own buffers.
 pub trait Velocity {
+    fn prior_std(&self) -> f32 {
+        1.
+    }
     fn block(&self) -> usize;
     fn velocity(&self, x: &[f32], known: &[f32], mask: &[f32], t: f32) -> Vec<f32>;
 }

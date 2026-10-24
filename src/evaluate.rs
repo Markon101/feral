@@ -222,7 +222,9 @@ pub fn evaluate(
         let a = &dataset.audio[source];
         let at = rng.index(a.len() - ck.crop_samples + 1);
         let clean = &a[at..at + ck.crop_samples];
-        let noise: Vec<f32> = (0..clean.len()).map(|_| rng.normal()).collect();
+        let noise: Vec<f32> = (0..clean.len())
+            .map(|_| rng.normal() * ck.flow.prior_std())
+            .collect();
         for task in 0..4 {
             for t in [0.1, 0.5, 0.9] {
                 let mut row = probe(&ck.velocity(), clean, &noise, task, t);

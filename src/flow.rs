@@ -104,6 +104,10 @@ pub fn sample<M: Velocity + ?Sized>(
 ) -> Result<Vec<f32>> {
     c.validate()?;
     ensure!(
+        model.prior_std().is_finite() && model.prior_std() > 0.,
+        "invalid backend prior standard deviation"
+    );
+    ensure!(
         !known.is_empty()
             && known.len() == mask.len()
             && known.len().is_multiple_of(model.block())
@@ -115,7 +119,10 @@ pub fn sample<M: Velocity + ?Sized>(
         "invalid conditioning"
     );
     let mut rng = Rng::new(c.seed);
-    let mut x: Vec<f32> = known.iter().map(|_| rng.normal() * c.noise_scale).collect();
+    let mut x: Vec<f32> = known
+        .iter()
+        .map(|_| rng.normal() * c.noise_scale * model.prior_std())
+        .collect();
     let texture: Vec<f32> = known.iter().map(|_| rng.normal()).collect();
     conditioning::project(&mut x, known, mask);
     let dt = 1. / c.steps as f32;

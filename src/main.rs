@@ -111,6 +111,9 @@ struct TrainArgs {
     /// Fixed dataset amplitude scale for the preconditioned network.
     #[arg(long, default_value_t = 0.1)]
     data_scale: f32,
+    /// Training AND sampling prior standard deviation; checkpointed, not an OOD knob.
+    #[arg(long, default_value_t = 1.)]
+    prior_std: f32,
     /// baseline preserves v1; pyramid pools residual branches at scales 1/4/16/64.
     #[arg(long, default_value="baseline", value_parser=["baseline", "pyramid"])]
     network: String,
@@ -265,10 +268,15 @@ fn main() -> Result<()> {
         }
         Commands::Train(a) => {
             ensure!(a.profile == "phone", "only --profile phone is implemented");
+            ensure!(
+                a.parameterization != "velocity" || a.prior_std == 1.,
+                "velocity reference fixes prior std=1; use preconditioned for a calibrated prior"
+            );
             runtime::train(TrainConfig {
                 flow: if a.parameterization == "preconditioned" {
                     FlowConfig::Preconditioned {
                         data_scale: a.data_scale,
+                        prior_std: a.prior_std,
                     }
                 } else {
                     FlowConfig::Velocity
