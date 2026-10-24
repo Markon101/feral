@@ -1,0 +1,107 @@
+# Architecture
+
+FERAL models acoustic samples directly. An f32 mono waveform is losslessly packed
+into consecutive blocks of 32 samples. This is a layout, not a learned codec or
+magnitude spectrogram: phase and sample identities remain present. A complex STFT
+would add consistency/windowing/reconstruction requirements; direct waveform is
+the smaller reliable first implementation on this CPU. Candle is used by existing
+projects but was absent from the local registry cache. FERAL needs only dense and
+short convolution derivatives, so a specialized network with explicit reverse-mode
+backpropagation avoids framework downloads and a general-purpose tensor engine.
+Numerical finite-difference tests check weights and biases in every layer.
+
+## Modules and contracts
+
+* `audio`: FFmpeg adapter, bounded decoding/resampling/channel selection, optional
+  peak normalization, finite mono f32 PCM, exclusive float WAV output.
+* `data`: file/directory/manifest selection, streaming SHA-256, decoded RAM cache,
+  deterministic crops and silence rejection. No genre/text/score annotations.
+* `model`: time-major `[frame, channel]` neural operations and parameter state.
+  `Velocity` is the backend boundary used by the solver. No device types escape.
+* `conditioning`: sample masks, exact projection and unknown-side boundary collar.
+* `flow`: conditional path, unknown-sample MSE, Euler/Heun and bounded perturbation.
+* `runtime`: Adam, gradient clipping, full-state checkpoints, run metadata,
+  evaluation probes, training loop and rendering. CPU is the only implemented
+  training backend. Backend-specific training state would enter here, not audio.
+* `rng`: versioned SplitMix64 + Box-Muller normal stream; checkpointed training
+  state and separate seeded preview/sampling streams.
+* `main`: clap CLI and configuration. Research definitions live in EXPERIMENTS.md.
+
+## Exact current network
+
+Default phone profile: **57,952 trainable f32 parameters**, batch size one.
+For each frame, concatenate 32 current samples, 32 protected context samples
+(context times mask), 32 per-sample mask values, and four time features:
+`t`, `1-t`, `sin(2*pi*t)`, `cos(2*pi*t)`. This gives 100 input channels.
+
+1. Pointwise convolution 100→64, bias, tanh: 6,464 parameters.
+2. Four residual blocks: `h + 0.5*tanh(Conv1d(h))`, each 64→64,
+   kernel 3, zero same padding, dilations 1, 2, 4, 8. Each: 12,352 parameters.
+3. Pointwise linear output 64→32 with bias: 2,080 parameters.
+
+Total: 6,464 + 4×12,352 + 2,080 = 57,952. Receptive field: 31 blocks,
+992 samples, 62 ms at 16 kHz. The default 8,192-sample crop lasts 0.512 s,
+but local receptive field limits modeling of global structure. The network is
+noncausal: it may use known content on both sides for inpainting. Initialization
+is seeded normal with fan-in scaling; biases start at zero. No oscillator bank or
+nonlearned synthesis participates in generation. Synthetic signals only test it.
+
+## Conditional rectified flow
+
+For binary known mask m (1=protected), clean waveform y, z~N(0,I), t~U(0,1):
+
+```
+x_t = m*y + (1-m)*((1-t)*z + t*y)
+u_t = (1-m)*(y-z)
+L = sum((1-m)*(v_theta(x_t, m*y, m, t) - (y-z))^2) / sum(1-m)
+```
+
+The context input never exposes unknown clean samples. The network's known-region
+velocity outputs are unused. Each update randomly selects unconditional, prefix,
+interior-hole or suffix masks. Adam uses beta1=.9, beta2=.999, eps=1e-8,
+lr=3e-4 by default, global gradient norm clipped to 1. Full reverse-mode derivatives
+propagate through every convolution, tanh and residual branch.
+
+Sampling draws z, replaces known positions with y, and integrates v from t=0 to
+1 using positive dt. Every Euler stage, Heun predictor and corrector projects known
+samples. The optional fixed seeded texture perturbation is
+`p*sin(pi*t)*tanh(texture)` and has absolute magnitude <=p. It has no optimizer
+role; p=0 yields the baseline. Noise scaling deliberately changes the initial
+sampling distribution; it is an OOD control, not a temperature theorem.
+
+## Continuity contract
+
+Exact waveform retention means canonical known f32 samples are copied exactly.
+It does not mean matching compressed file bytes, stereo samples, or another sample
+rate. FFmpeg preprocessing defines the reference. Unknown-side collars blend
+network samples toward short, decaying local tangent estimates at boundaries.
+Known audio is never crossfaded. Boundary absolute differences are measured.
+Limiter/NaN checks are separate numerical safeguards. Float WAV avoids quantizing
+protected samples. Smooth joins do not prove phase/signal fidelity, timbral
+continuity, or long-range musical continuity. Those require separate evidence.
+
+Continuation uses the last half-training-crop as protected context and generates
+a suffix; the untouched earlier prefix is reattached. Inpainting sends a bounded
+local window with a quarter-crop context on each side and reattaches outside
+samples unchanged. Model context and generated window are explicit, not hidden
+recurrent state. Suffix masks also train the primitive needed for future public
+outpainting commands; there is no public bidirectional outpaint command yet.
+
+## Backend and evolution boundary
+
+The CPU implementation is single-threaded and uses no custom general-purpose
+tensor engine. Its explicit convolution forward and input/weight/bias derivatives
+are the numerical oracle. Flow only needs `Velocity`, flat waveform/mask buffers
+and a block size; a device backend can batch/retain buffers internally. The model
+serialization and CPU training orchestration currently use `Model`; adding a
+trainable device implementation will require a small runtime adapter, parameter
+synchronization and separate optimizer-state checks. This is readiness, not an
+implemented generic GPU trainer. No CPU fallback is disguised as acceleration.
+
+Alternative velocity networks can implement `Velocity`; objectives and samplers
+can change within `flow`. A complex STFT or learned codec should introduce an
+explicit encode/decode contract and conservation tests, while waveform-domain
+projection remains the last authority on protected samples. Hybrid waveform/latent
+models can retain a sample correction head. Multiscale encoders and recurrent
+latent context could add longer receptive fields without replacing decoder,
+manifest, provenance or mask contracts. None of those future models exists here.
