@@ -67,3 +67,9 @@ The equal-step result is negative; the approximate compute-budget result has a
 modest denoising gain and no established generation-quality gain. All results and
 controls remain. The next experiment should challenge noise/path scaling and
 actual generated spectra rather than enlarging the architecture reflexively.
+
+## 6,000-step continuation
+
+The owner-requested fivefold continuation, fixed held-out comparison and exported
+10-second A/B pack are recorded in [TRAINING_6000.md](reports/TRAINING_6000.md).
+The 1,200-step control, optimizer/RNG state and prior listening pack are preserved.

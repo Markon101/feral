@@ -1,0 +1,208 @@
+{
+  "resume_from": "runs/phase2-budget-v1/pyramid-42/checkpoint.json",
+  "checkpoint": "runs/phase2-long-6000/checkpoint.json",
+  "checkpoint_sha256": "5f840c48d1928a13a536163ab05ca8608d8fd926c18203498390397ba89ae90e",
+  "metrics": {
+    "final_sampling_ms": 125.690469,
+    "fixed_probe_final_loss": 0.08929681777954102,
+    "fixed_probe_initial_loss": 0.10400331020355225,
+    "generated_rms": 0.14429572224617004,
+    "neural_forward_backward_ms": 46749.88754699988,
+    "optimizer_ms": 2274.7865129999977,
+    "other_sampling_ms": 900.0103649999999,
+    "parameters": 57952,
+    "peak_rss_kib": 9784,
+    "preprocessing_ms": 134.669531,
+    "quality_claim": "pipeline verification only; no perceptual quality or generalization established",
+    "same_noise_output_mse_change": 0.008257342502474785,
+    "sampling": {
+      "collar": 128,
+      "noise_scale": 1.0,
+      "perturb": 0.0,
+      "seed": 42,
+      "solver": "heun",
+      "steps": 16
+    },
+    "step_max_ms": 24.203281,
+    "step_mean_ms": 10.420938077291689,
+    "step_median_ms": 6.2482809999999995,
+    "steps": 4800,
+    "task_counts": {
+      "hole": 1172,
+      "prefix": 1147,
+      "suffix": 1229,
+      "unconditional": 1252
+    },
+    "total_steps": 6000,
+    "training_wall_ms_with_previews": 51484.371022
+  },
+  "evaluation": {
+    "validation": {
+      "before_1200": 0.38329056259100364,
+      "after_6000": 0.29987343853089204,
+      "relative_reduction": 0.21763417157005027
+    },
+    "test": {
+      "before_1200": 0.41186417477912585,
+      "after_6000": 0.3346910964277588,
+      "relative_reduction": 0.18737506944553595
+    }
+  },
+  "signal_before": {
+    "copied_reference_control": 0.9999999999999994,
+    "correlation_decimation": 4,
+    "correlation_stride_samples": 256,
+    "input": "/data/data/com.termux/files/home/projects/feral/runs/phase2-budget-v1/pyramid-42/generated.wav",
+    "input_sha256": "3bccb1abbab0cba103b82b8fa59c7c971144bc4f1799792f330ffbe20ac1b1a9",
+    "limits": "correlation is a bounded screen over stride-aligned windows; low scores do not exclude transformed memorization",
+    "nearest_absolute_correlation": 0.08881458564358252,
+    "noise": {
+      "derivative_rms": 1.414868283977899,
+      "lag1_uncentered": -0.007604803658742433,
+      "limiter_hits": 2658,
+      "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+      "rms": 0.996648898356088,
+      "sample_rate": 16000,
+      "samples": 8192,
+      "spectral_band_fractions": [
+        0.02528589034793353,
+        0.09348772766301837,
+        0.369719301993797,
+        0.5115070799952514
+      ],
+      "spectral_flatness": 0.9842206419832181
+    },
+    "noise_correlation_control": 0.06984649872235171,
+    "reference": {
+      "derivative_rms": 0.04307612809637674,
+      "lag1_uncentered": 0.9186300998042488,
+      "limiter_hits": 0,
+      "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+      "rms": 0.10677982550470438,
+      "sample_rate": 16000,
+      "samples": 384000,
+      "spectral_band_fractions": [
+        0.31230569632879,
+        0.5516441263639289,
+        0.1104920236826982,
+        0.025558153624581866
+      ],
+      "spectral_flatness": 0.13130095254084395
+    },
+    "reference_path": "/data/data/com.termux/files/home/projects/feral/runs/phase2-v1/train.wav",
+    "reference_sha256": "9fa787982de1bf0d8777b5cec7b0246eff2b2d0e07092ae49d7f07221c923d09",
+    "shuffled_signal": {
+      "derivative_rms": 0.2985262846943839,
+      "lag1_uncentered": 0.014678665175596023,
+      "limiter_hits": 1,
+      "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+      "rms": 0.21264466404303,
+      "sample_rate": 16000,
+      "samples": 8192,
+      "spectral_band_fractions": [
+        0.02539001687074644,
+        0.0903708208021635,
+        0.394264965357425,
+        0.48997419696966504
+      ],
+      "spectral_flatness": 0.9824439731488619
+    },
+    "signal": {
+      "derivative_rms": 0.28581236865983195,
+      "lag1_uncentered": 0.09675869574236524,
+      "limiter_hits": 1,
+      "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+      "rms": 0.21264466404302992,
+      "sample_rate": 16000,
+      "samples": 8192,
+      "spectral_band_fractions": [
+        0.06034982675029585,
+        0.14080770143566915,
+        0.34318701259877077,
+        0.45565545921526424
+      ],
+      "spectral_flatness": 0.9524311725543343
+    }
+  },
+  "signal_after": {
+    "copied_reference_control": 0.9999999999999994,
+    "correlation_decimation": 4,
+    "correlation_stride_samples": 256,
+    "input": "runs/phase2-long-6000/generated.wav",
+    "input_sha256": "76b4c238820910460e2bb3e37a1345b846b884280a7454d18ab22ddeca26e782",
+    "limits": "correlation is a bounded screen over stride-aligned windows; low scores do not exclude transformed memorization",
+    "nearest_absolute_correlation": 0.10641290704670522,
+    "noise": {
+      "derivative_rms": 1.414868283977899,
+      "lag1_uncentered": -0.007604803658742433,
+      "limiter_hits": 2658,
+      "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+      "rms": 0.996648898356088,
+      "sample_rate": 16000,
+      "samples": 8192,
+      "spectral_band_fractions": [
+        0.02528589034793353,
+        0.09348772766301837,
+        0.369719301993797,
+        0.5115070799952514
+      ],
+      "spectral_flatness": 0.9842206419832181
+    },
+    "noise_correlation_control": 0.06984649872235171,
+    "reference": {
+      "derivative_rms": 0.04307612809637674,
+      "lag1_uncentered": 0.9186300998042488,
+      "limiter_hits": 0,
+      "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+      "rms": 0.10677982550470438,
+      "sample_rate": 16000,
+      "samples": 384000,
+      "spectral_band_fractions": [
+        0.31230569632879,
+        0.5516441263639289,
+        0.1104920236826982,
+        0.025558153624581866
+      ],
+      "spectral_flatness": 0.13130095254084395
+    },
+    "reference_path": "runs/phase2-v1/train.wav",
+    "reference_sha256": "9fa787982de1bf0d8777b5cec7b0246eff2b2d0e07092ae49d7f07221c923d09",
+    "shuffled_signal": {
+      "derivative_rms": 0.20300356191031585,
+      "lag1_uncentered": 0.010480646471534747,
+      "limiter_hits": 0,
+      "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+      "rms": 0.14429588775220148,
+      "sample_rate": 16000,
+      "samples": 8192,
+      "spectral_band_fractions": [
+        0.025545422466766027,
+        0.09133590640967491,
+        0.3907260930200999,
+        0.4923925781034592
+      ],
+      "spectral_flatness": 0.9820403243560268
+    },
+    "signal": {
+      "derivative_rms": 0.1602391637621297,
+      "lag1_uncentered": 0.3834615776784728,
+      "limiter_hits": 0,
+      "note": "FFT512 Hann power; bands <250,250-1000,1000-4000,>=4000Hz; descriptors are not perceptual quality scores",
+      "rms": 0.1442958877522008,
+      "sample_rate": 16000,
+      "samples": 8192,
+      "spectral_band_fractions": [
+        0.1205486427080624,
+        0.3070390248927066,
+        0.2667438129826428,
+        0.30566851941658824
+      ],
+      "spectral_flatness": 0.7672039810409451
+    }
+  },
+  "export": "/sdcard/FERAL_6000steps_20261024",
+  "export_files": 36,
+  "export_wavs": 14,
+  "all_export_files_hash_verified": true,
+  "copy_mode": "normal sandboxed executor, no escalation"
+}
