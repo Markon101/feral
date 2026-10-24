@@ -22,7 +22,11 @@ def read_float_wav(path):
         tag, size = struct.unpack_from('<4sI', raw, offset)
         payload = raw[offset + 8:offset + 8 + size]
         if tag == b'fmt ':
-            fmt = struct.unpack_from('<HHIIHH', payload)
+            fmt = list(struct.unpack_from('<HHIIHH', payload))
+            if fmt[0] == 0xfffe and len(payload) >= 40:
+                float_guid = bytes.fromhex('0300000000001000800000aa00389b71')
+                if payload[24:40] == float_guid:
+                    fmt[0] = 3
         if tag == b'data':
             data = payload
         offset += 8 + size + size % 2

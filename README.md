@@ -121,8 +121,9 @@ scale and may be poor even if finite.
 Full resume restores weights, Adam moments/step and the training RNG, requires the
 same dataset/preprocessing/crop/learning rate, and writes a fresh run. `--weights-only`
 explicitly resets optimizer/RNG and permits another dataset. `--steps` always means
-additional steps. Tests compare uninterrupted and resumed parameters exactly on
-CPU. Checkpoints are versioned, portable JSON, hash checked, and capped at 64 MB.
+additional steps. Full resume restores the original RNG stream, so `--seed`
+only selects a new stream for fresh or weights-only training. Tests compare
+uninterrupted and resumed parameters exactly on CPU. Checkpoints are versioned, portable JSON, hash checked, and capped at 64 MB.
 Run metadata includes architecture, parameter count, source/Git identity, data
 hash, objective, preprocessing, optimizer and seed. `losses.jsonl` records every
 step, task, loss, gradient norm, time and RNG state. Previews use a fixed seed.
