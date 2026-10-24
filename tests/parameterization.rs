@@ -156,6 +156,7 @@ fn legacy_adapter_is_bit_exact_and_invalid_config_rejected() {
 }
 fn config(root: &Path, name: &str, steps: usize, resume: Option<PathBuf>) -> TrainConfig {
     TrainConfig {
+        backend: "cpu".into(),
         input: root.join("corpus"),
         run: root.join(name),
         steps,

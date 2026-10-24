@@ -21,8 +21,8 @@ Numerical finite-difference tests check weights and biases in every layer.
 * `conditioning`: sample masks, exact projection and unknown-side boundary collar.
 * `flow`: conditional path, unknown-sample MSE, Euler/Heun and bounded perturbation.
 * `runtime`: Adam, gradient clipping, full-state checkpoints, run metadata,
-  evaluation probes, training loop and rendering. CPU is the only implemented
-  training backend. Backend-specific training state would enter here, not audio.
+  evaluation probes, training loop and rendering. `backend::Trainer` explicitly
+  selects CPU or optional resident FP32 OpenCL training; audio stays independent.
 * `rng`: versioned SplitMix64 + Box-Muller normal stream; checkpointed training
   state and separate seeded preview/sampling streams.
 * `main`: clap CLI and configuration. Research definitions live in EXPERIMENTS.md.
@@ -93,10 +93,13 @@ The CPU implementation is single-threaded and uses no custom general-purpose
 tensor engine. Its explicit convolution forward and input/weight/bias derivatives
 are the numerical oracle. Flow only needs `Velocity`, flat waveform/mask buffers
 and a block size; a device backend can batch/retain buffers internally. The model
-serialization and CPU training orchestration currently use `Model`; adding a
-trainable device implementation will require a small runtime adapter, parameter
-synchronization and separate optimizer-state checks. This is readiness, not an
-implemented generic GPU trainer. No CPU fallback is disguised as acceleration.
+serialization uses portable `Model` and Adam state. `backend::Trainer` selects
+CPU or optional `gpu::OpenClTrainer`; the latter retains packed parameters,
+moments, activations and derivatives, synchronizing before previews/checkpoints.
+Loss, reverse-mode gradients, clipping and Adam are GPU operations. Seeded input
+construction, decoding, diagnostics and inference remain CPU operations. Device
+initialization errors do not silently fall back. The CPU finite-difference tests,
+GPU parity audit and exact GPU resume tests guard this boundary.
 
 Alternative velocity networks can implement `Velocity`; objectives and samplers
 can change within `flow`. A complex STFT or learned codec should introduce an

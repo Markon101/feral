@@ -51,7 +51,16 @@ pub fn decoder_command(tool: &str) -> Command {
     let mut c = Command::new(tool);
     let cpp = Path::new("/data/data/com.termux/files/usr/lib/libc++_shared.so");
     if cpp.exists() {
-        let current = std::env::var("LD_PRELOAD").unwrap_or_default();
+        let current = std::env::var("FERAL_DECODER_LD_PRELOAD")
+            .or_else(|_| std::env::var("LD_PRELOAD"))
+            .unwrap_or_default();
+        if let Ok(path) = std::env::var("FERAL_DECODER_LD_LIBRARY_PATH") {
+            if path.is_empty() {
+                c.env_remove("LD_LIBRARY_PATH");
+            } else {
+                c.env("LD_LIBRARY_PATH", path);
+            }
+        }
         c.env(
             "LD_PRELOAD",
             format!(

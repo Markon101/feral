@@ -7,3 +7,8 @@ pub mod model;
 pub mod parameterization;
 pub mod rng;
 pub mod runtime;
+
+#[cfg(feature = "opencl")]
+pub mod gpu;
+
+pub mod backend;

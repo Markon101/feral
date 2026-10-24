@@ -1,5 +1,6 @@
 use crate::{
     audio::{self, Preprocess},
+    backend::{Batch, Trainer},
     conditioning,
     data::{self, Dataset, DatasetIdentity},
     flow::{self, Sampling},
@@ -115,14 +116,20 @@ pub struct Checkpoint {
 pub fn source_hash() -> Result<String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut paths = vec![PathBuf::from("Cargo.toml"), PathBuf::from("Cargo.lock")];
-    if root.join("src").exists() {
-        for e in fs::read_dir(root.join("src"))? {
-            let p = e?.path();
-            if p.is_file() {
+    fn sources(root: &Path, dir: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let p = entry.path();
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                sources(root, &p, paths)?;
+            } else if kind.is_file() {
                 paths.push(p.strip_prefix(root)?.to_path_buf());
             }
         }
+        Ok(())
     }
+    sources(root, &root.join("src"), &mut paths)?;
     paths.sort();
     let mut h = Sha256::new();
     for p in paths {
@@ -191,6 +198,7 @@ impl Checkpoint {
 pub struct TrainConfig {
     pub input: PathBuf,
     pub run: PathBuf,
+    pub backend: String,
     pub steps: usize,
     pub seed: u64,
     pub crop_seconds: f32,
@@ -301,6 +309,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
             unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         }
     };
+    let mut trainer = Trainer::new(&c.backend, &ck.model, &ck.adam, n, &ck.flow)?;
     if let Some(parent) = c.run.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -313,7 +322,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     let current_source = source_hash()?;
     write_json(
         &c.run.join("run.json"),
-        &serde_json::json!({"git_commit":git(&["rev-parse","HEAD"]),"git_dirty":!git(&["status","--porcelain"]).is_empty(),"source_hash":current_source,"dataset":dataset.identity,"parameters":ck.model.count(),"architecture":ck.model.architecture,"crop_samples":n,"sample_rate":ck.sample_rate,"additional_steps":c.steps,"seed":c.seed,"lr":ck.adam.lr,"optimizer":"Adam beta1=.9 beta2=.999 eps=1e-8 global gradient clip=1","resume":c.resume,"weights_only":c.weights_only,"backend":"cpu-f32","objective":ck.objective,"representation":ck.representation,"flow":ck.flow}),
+        &serde_json::json!({"git_commit":git(&["rev-parse","HEAD"]),"git_dirty":!git(&["status","--porcelain"]).is_empty(),"source_hash":current_source,"dataset":dataset.identity,"parameters":ck.model.count(),"architecture":ck.model.architecture,"crop_samples":n,"sample_rate":ck.sample_rate,"additional_steps":c.steps,"seed":c.seed,"lr":ck.adam.lr,"optimizer":"Adam beta1=.9 beta2=.999 eps=1e-8 global gradient clip=1","resume":c.resume,"weights_only":c.weights_only,"backend":trainer.name(),"backend_info":trainer.info(),"objective":ck.objective,"representation":ck.representation,"flow":ck.flow}),
     )?;
     ck.save(&c.run.join("initial.json"))?;
     let sample_config = Sampling {
@@ -343,7 +352,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     let mut task_counts = std::collections::BTreeMap::new();
     let training_start = Instant::now();
     eprintln!(
-        "FERAL CPU: {} parameters, {} samples/crop, {} files, preprocessing {:.1} ms",
+        "FERAL training: {} parameters, {} samples/crop, {} files, preprocessing {:.1} ms",
         ck.model.count(),
         n,
         dataset.audio.len(),
@@ -362,14 +371,22 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
             .map(|_| ck.rng.normal() * ck.flow.prior_std())
             .collect();
         let t = ck.rng.uniform();
-        let op = Instant::now();
-        let (loss, grad) =
-            parameterization::loss_gradient(&ck.model, &ck.flow, &clean, &mask, &noise, t);
-        neural_ms += op.elapsed().as_secs_f64() * 1000.;
+        let result = trainer.step(
+            &mut ck.model,
+            &mut ck.adam,
+            &ck.flow,
+            Batch {
+                clean: &clean,
+                mask: &mask,
+                noise: &noise,
+                t,
+            },
+        )?;
+        let loss = result.loss;
+        let norm = result.norm;
+        neural_ms += result.neural_ms;
+        optimizer_ms += result.optimizer_ms;
         ensure!(loss.is_finite(), "nonfinite loss");
-        let op = Instant::now();
-        let norm = ck.adam.update(&mut ck.model, &grad)?;
-        optimizer_ms += op.elapsed().as_secs_f64() * 1000.;
         ck.completed_steps += 1;
         let ms = start.elapsed().as_secs_f64() * 1000.;
         step_ms.push(ms);
@@ -384,6 +401,9 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
                 ck.completed_steps, loss, norm, ms
             );
             log.flush()?;
+        }
+        if local % c.preview_every == 0 || local % c.checkpoint_every == 0 {
+            trainer.sync(&mut ck.model, &mut ck.adam)?;
         }
         if local % c.preview_every == 0 {
             let now = Instant::now();
@@ -403,6 +423,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         }
     }
     let training_wall_ms = training_start.elapsed().as_secs_f64() * 1000.;
+    trainer.sync(&mut ck.model, &mut ck.adam)?;
     let final_eval = evaluation(&ck.model, &ck.flow, &dataset, n);
     let now = Instant::now();
     let final_audio = flow::sample(&ck.velocity(), &zeros, &zeros, &sample_config)?;
@@ -419,7 +440,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     step_ms.sort_by(|a, b| a.total_cmp(b));
     write_json(
         &c.run.join("metrics.json"),
-        &serde_json::json!({"flow":ck.flow,"loss_units":if ck.flow.is_legacy(){"waveform velocity MSE"}else{"normalized Gaussian-residual MSE"},"parameters":ck.model.count(),"steps":c.steps,"total_steps":ck.completed_steps,"preprocessing_ms":preprocessing_ms,"neural_forward_backward_ms":neural_ms,"optimizer_ms":optimizer_ms,"training_wall_ms_with_previews":training_wall_ms,"step_mean_ms":step_ms.iter().sum::<f64>()/step_ms.len() as f64,"step_median_ms":step_ms[step_ms.len()/2],"step_max_ms":step_ms.last(),"final_sampling_ms":final_sampling_ms,"other_sampling_ms":sampling_ms,"sampling":sample_config,"peak_rss_kib":peak_rss_kib(),"fixed_probe_initial_loss":initial_eval,"fixed_probe_final_loss":final_eval,"same_noise_output_mse_change":delta,"generated_rms":audio::rms(&final_audio),"task_counts":task_counts,"quality_claim":"pipeline verification only; no perceptual quality or generalization established"}),
+        &serde_json::json!({"backend":trainer.name(),"backend_info":trainer.info(),"timing_scope":if c.backend=="cpu" {"CPU wall operations"}else{"GPU event operation totals; step wall includes transfers, enqueue and sync"},"flow":ck.flow,"loss_units":if ck.flow.is_legacy(){"waveform velocity MSE"}else{"normalized Gaussian-residual MSE"},"parameters":ck.model.count(),"steps":c.steps,"total_steps":ck.completed_steps,"preprocessing_ms":preprocessing_ms,"neural_forward_backward_ms":neural_ms,"optimizer_ms":optimizer_ms,"training_wall_ms_with_previews":training_wall_ms,"step_mean_ms":step_ms.iter().sum::<f64>()/step_ms.len() as f64,"step_median_ms":step_ms[step_ms.len()/2],"step_max_ms":step_ms.last(),"final_sampling_ms":final_sampling_ms,"other_sampling_ms":sampling_ms,"sampling":sample_config,"peak_rss_kib":peak_rss_kib(),"fixed_probe_initial_loss":initial_eval,"fixed_probe_final_loss":final_eval,"same_noise_output_mse_change":delta,"generated_rms":audio::rms(&final_audio),"task_counts":task_counts,"quality_claim":"pipeline verification only; no perceptual quality or generalization established"}),
     )?;
     eprintln!(
         "checkpoint {} | probe {:.6} -> {:.6} | output delta MSE {:.6}",

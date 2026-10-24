@@ -77,3 +77,15 @@ are essential. Data scale and training prior are explicit fixed values, not
 automatically estimated per recording. Configuration changes require fresh
 training and new-version checkpoints; velocity losses across different priors are
 not directly comparable. The old raw-velocity default remains available.
+
+## Optional OpenCL training update
+
+Complete FP32 GPU training now exists behind `--features opencl` and explicit
+`train --backend opencl`. Historical OpenCL deferral statements describe the old
+launch context; see reports/OPENCL_TRAINING_PROTOCOL.md. CPU remains default and
+supports GPU checkpoints. Decoding, evaluation, previews and generation are still
+CPU operations. Only the Adreno 830 runtime has been verified. There is no fp16,
+automatic fallback, recorded queue optimization or claim of maximum hardware
+performance. The short paired benchmark was foreground but thermally uncontrolled.
+The long-run supervisor reads temperatures before/after chunks, not continuously;
+its cooling settings are operator thresholds, not manufacturer safety ratings.

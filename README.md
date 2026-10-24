@@ -10,8 +10,9 @@ evidence, not evidence of realistic music quality.
 
 ## Build and check
 
-Rust and FFmpeg/FFprobe must already be installed. There are 48 locked Cargo
-packages; no ML framework, Python runtime, GPU SDK, or model download is required.
+Rust and FFmpeg/FFprobe must already be installed. There are 60 locked Cargo
+packages including optional OpenCL bindings; CPU builds need no ML framework,
+Python runtime, GPU SDK, or model download.
 
 ```sh
 cargo build --locked --offline --release -j 8
@@ -191,3 +192,25 @@ velocity losses. Lower regression loss and darker spectra are separate outcomes.
 See [PHASE3.md](reports/PHASE3.md) for the three-seed results, failed/plateaued
 follow-up, and level-matched listening pack at `/sdcard/FERAL_Phase3_20261024/`.
 The raw-velocity default remains intact.
+
+## Optional resident OpenCL training
+
+The CPU remains the default numerical reference. GPU training is explicit:
+
+```sh
+cargo build --locked --offline --release --features opencl -j 8
+scripts/feral-opencl.sh gpu-audit --checkpoint runs/preconditioned/checkpoint.json \
+  --output runs/new-gpu-audit/report.json --steps 30
+scripts/feral-opencl.sh train --backend opencl --input recording.wav \
+  --network pyramid --parameterization preconditioned --data-scale 0.1 \
+  --prior-std 0.1 --no-normalize --steps 2000 --run runs/new-gpu
+```
+
+The Android launcher selects an existing vendor runtime without installation or
+system edits. Other platforms can run the feature-enabled binary with their
+normal OpenCL runtime. Forward/backward, clipping and Adam execute on GPU with
+resident buffers; decoding, previews and generation remain CPU work. Discovery
+failure is an error, never silent CPU fallback. `gpu-audit` requires a checkpoint
+whose dataset is still available. Hardware tests are explicit and ignored in
+ordinary test runs. Read the [protocol](reports/OPENCL_TRAINING_PROTOCOL.md) for
+parity gates, measured warm-phone timings and the checkpointed cooling supervisor.

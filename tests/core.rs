@@ -249,6 +249,7 @@ fn decoder_supported_formats_and_corrupt_file() {
 fn config(root: &Path, run: &str, steps: usize, resume: Option<PathBuf>) -> TrainConfig {
     TrainConfig {
         flow: feral::parameterization::FlowConfig::Velocity,
+        backend: "cpu".into(),
         input: root.join("corpus"),
         run: root.join(run),
         steps,

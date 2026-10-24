@@ -70,6 +70,15 @@ enum Commands {
         #[arg(long)]
         output: PathBuf,
     },
+    /// CPU/GPU forward, gradient, Adam and resume checks plus a short benchmark.
+    GpuAudit {
+        #[arg(long)]
+        checkpoint: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 20)]
+        steps: usize,
+    },
     /// Tiny actual training + sampling on deterministic diagnostic audio.
     Smoke {
         #[arg(long)]
@@ -105,6 +114,9 @@ impl AudioArgs {
 }
 #[derive(Args)]
 struct TrainArgs {
+    /// Explicit backend; opencl requires --features opencl and a working runtime.
+    #[arg(long, default_value="cpu", value_parser=["cpu","opencl"])]
+    backend: String,
     /// Checkpointed velocity parameterization; changing it requires fresh training.
     #[arg(long, default_value="velocity", value_parser=["velocity", "preconditioned"])]
     parameterization: String,
@@ -243,7 +255,7 @@ fn main() -> Result<()> {
                 Err(e) => println!("OpenCL discovery unavailable: {e}"),
             }
             println!(
-                "Training backend: CPU f32 only. No silent GPU fallback. No pretrained models."
+                "CPU reference available. OpenCL training is optional (--features opencl, --backend opencl). No silent GPU fallback or pretrained models."
             );
         }
         Commands::Corpus {
@@ -281,6 +293,7 @@ fn main() -> Result<()> {
                 } else {
                     FlowConfig::Velocity
                 },
+                backend: a.backend,
                 input: a.input,
                 run: a.run,
                 steps: a.steps,
@@ -319,6 +332,19 @@ fn main() -> Result<()> {
         } => {
             feral::evaluate::analyze(&input, &reference, &output)?;
         }
+        Commands::GpuAudit {
+            checkpoint,
+            output,
+            steps,
+        } => {
+            #[cfg(feature = "opencl")]
+            feral::gpu::audit(&checkpoint, &output, steps)?;
+            #[cfg(not(feature = "opencl"))]
+            {
+                let _ = (checkpoint, output, steps);
+                anyhow::bail!("gpu-audit requires a build with --features opencl");
+            }
+        }
         Commands::Smoke { run, steps } => {
             if let Some(parent) = run.parent() {
                 fs::create_dir_all(parent)?;
@@ -328,6 +354,7 @@ fn main() -> Result<()> {
             audio::synthetic(&corpus, 16000)?;
             runtime::train(TrainConfig {
                 flow: FlowConfig::Velocity,
+                backend: "cpu".into(),
                 input: corpus,
                 run: run.join("training"),
                 steps,
