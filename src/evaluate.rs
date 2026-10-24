@@ -225,7 +225,7 @@ pub fn evaluate(
         let noise: Vec<f32> = (0..clean.len()).map(|_| rng.normal()).collect();
         for task in 0..4 {
             for t in [0.1, 0.5, 0.9] {
-                let mut row = probe(&ck.model, clean, &noise, task, t);
+                let mut row = probe(&ck.velocity(), clean, &noise, task, t);
                 row.source_index = source;
                 row.crop_start = at;
                 ensure!(row.velocity_mse.is_finite(), "nonfinite evaluation");
@@ -239,7 +239,7 @@ pub fn evaluate(
     }
     runtime::write_json(
         output,
-        &serde_json::json!({"checkpoint":checkpoint,"checkpoint_sha256":data::hash_file(checkpoint)?,"dataset":dataset.identity,"seed":seed,"crops":crops,"crop_samples":ck.crop_samples,"training_steps":ck.completed_steps,"parameters":ck.model.count(),"architecture":ck.model.architecture,"context_samples":ck.model.architecture.context_samples(),"mean_velocity_mse":mean,"rows":rows,"elapsed_ms":start.elapsed().as_secs_f64()*1000.,"note":"same-recording held-out probes are not cross-recording or perceptual quality evidence; endpoint estimates are paired denoising, not generated samples"}),
+        &serde_json::json!({"checkpoint":checkpoint,"checkpoint_sha256":data::hash_file(checkpoint)?,"dataset":dataset.identity,"seed":seed,"crops":crops,"crop_samples":ck.crop_samples,"training_steps":ck.completed_steps,"flow":ck.flow,"parameters":ck.model.count(),"architecture":ck.model.architecture,"context_samples":ck.model.architecture.context_samples(),"mean_velocity_mse":mean,"rows":rows,"elapsed_ms":start.elapsed().as_secs_f64()*1000.,"note":"same-recording held-out probes are not cross-recording or perceptual quality evidence; endpoint estimates are paired denoising, not generated samples"}),
     )?;
     eprintln!(
         "evaluation {} | {} probes | mean velocity MSE {:.6}",

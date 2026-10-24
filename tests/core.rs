@@ -248,6 +248,7 @@ fn decoder_supported_formats_and_corrupt_file() {
 }
 fn config(root: &Path, run: &str, steps: usize, resume: Option<PathBuf>) -> TrainConfig {
     TrainConfig {
+        flow: feral::parameterization::FlowConfig::Velocity,
         input: root.join("corpus"),
         run: root.join(run),
         steps,
@@ -337,7 +338,7 @@ fn actual_training_checkpoint_reload_full_resume_and_determinism() {
     );
     assert!(a.clone().save(&all).is_err());
     let mut bad = serde_json::to_value(&a).unwrap();
-    bad["format_version"] = 2.into();
+    bad["format_version"] = 99.into();
     runtime::write_json(&dir.join("bad.json"), &bad).unwrap();
     assert!(Checkpoint::load(&dir.join("bad.json")).is_err());
     fs::remove_dir_all(dir).unwrap();

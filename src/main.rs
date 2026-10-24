@@ -4,6 +4,7 @@ use feral::{
     audio::{self, Preprocess},
     flow::Sampling,
     model::Architecture,
+    parameterization::FlowConfig,
     runtime::{self, Mode, RenderConfig, TrainConfig},
 };
 use std::{fs, path::PathBuf};
@@ -104,6 +105,12 @@ impl AudioArgs {
 }
 #[derive(Args)]
 struct TrainArgs {
+    /// Checkpointed velocity parameterization; changing it requires fresh training.
+    #[arg(long, default_value="velocity", value_parser=["velocity", "preconditioned"])]
+    parameterization: String,
+    /// Fixed dataset amplitude scale for the preconditioned network.
+    #[arg(long, default_value_t = 0.1)]
+    data_scale: f32,
     /// baseline preserves v1; pyramid pools residual branches at scales 1/4/16/64.
     #[arg(long, default_value="baseline", value_parser=["baseline", "pyramid"])]
     network: String,
@@ -259,6 +266,13 @@ fn main() -> Result<()> {
         Commands::Train(a) => {
             ensure!(a.profile == "phone", "only --profile phone is implemented");
             runtime::train(TrainConfig {
+                flow: if a.parameterization == "preconditioned" {
+                    FlowConfig::Preconditioned {
+                        data_scale: a.data_scale,
+                    }
+                } else {
+                    FlowConfig::Velocity
+                },
                 input: a.input,
                 run: a.run,
                 steps: a.steps,
@@ -305,6 +319,7 @@ fn main() -> Result<()> {
             let corpus = run.join("corpus");
             audio::synthetic(&corpus, 16000)?;
             runtime::train(TrainConfig {
+                flow: FlowConfig::Velocity,
                 input: corpus,
                 run: run.join("training"),
                 steps,

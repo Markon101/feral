@@ -4,6 +4,7 @@ use crate::{
     data::{self, Dataset, DatasetIdentity},
     flow::{self, Sampling},
     model::{Architecture, Model},
+    parameterization::{self, ConfiguredVelocity, FlowConfig},
     rng::Rng,
 };
 use anyhow::{ensure, Context, Result};
@@ -93,6 +94,8 @@ impl Adam {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub format_version: u32,
+    #[serde(default, skip_serializing_if = "FlowConfig::is_legacy")]
+    pub flow: FlowConfig,
     pub model: Model,
     pub adam: Adam,
     pub rng: Rng,
@@ -129,6 +132,12 @@ pub fn source_hash() -> Result<String> {
     Ok(format!("{:x}", h.finalize()))
 }
 impl Checkpoint {
+    pub fn velocity(&self) -> ConfiguredVelocity<'_> {
+        ConfiguredVelocity {
+            model: &self.model,
+            config: &self.flow,
+        }
+    }
     pub fn save(&mut self, path: &Path) -> Result<()> {
         self.model_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&self.model)?));
         write_json(path, self)
@@ -139,7 +148,15 @@ impl Checkpoint {
             "checkpoint exceeds 64 MB"
         );
         let c: Self = serde_json::from_reader(std::io::BufReader::new(fs::File::open(path)?))?;
-        ensure!(c.format_version == 1, "unsupported checkpoint version");
+        ensure!(
+            [1, 2].contains(&c.format_version),
+            "unsupported checkpoint version"
+        );
+        c.flow.validate()?;
+        ensure!(
+            c.format_version != 1 || c.flow.is_legacy(),
+            "nonlegacy flow requires format version 2"
+        );
         c.model.validate()?;
         let n = c.model.count();
         ensure!(
@@ -184,8 +201,9 @@ pub struct TrainConfig {
     pub resume: Option<PathBuf>,
     pub weights_only: bool,
     pub architecture: Architecture,
+    pub flow: FlowConfig,
 }
-fn evaluation(model: &Model, dataset: &Dataset, n: usize) -> f32 {
+fn evaluation(model: &Model, flow: &FlowConfig, dataset: &Dataset, n: usize) -> f32 {
     let mut rng = Rng::new(901);
     let mut sum = 0.;
     for _ in 0..4 {
@@ -195,7 +213,7 @@ fn evaluation(model: &Model, dataset: &Dataset, n: usize) -> f32 {
         }
         let (mask, _) = conditioning::training_mask(n, &mut rng);
         let noise: Vec<f32> = (0..n).map(|_| rng.normal()).collect();
-        sum += flow::loss_gradient(model, &clean, &mask, &noise, 0.5).0;
+        sum += parameterization::loss_gradient(model, flow, &clean, &mask, &noise, 0.5).0;
     }
     sum / 4.
 }
@@ -213,6 +231,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         "learning rate must be >0 and <=0.01"
     );
     c.architecture.validate()?;
+    c.flow.validate()?;
     c.preprocess.validate()?;
     ensure!(
         c.preview_every > 0 && c.checkpoint_every > 0,
@@ -225,6 +244,10 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     let preprocessing_ms = pre_start.elapsed().as_secs_f64() * 1000.;
     let mut ck = if let Some(path) = &c.resume {
         let mut ck = Checkpoint::load(path)?;
+        ensure!(
+            ck.flow == c.flow,
+            "resume parameterization mismatch; train a fresh model for a different flow"
+        );
         ensure!(
             ck.crop_samples == n && ck.sample_rate == c.preprocess.sample_rate,
             "resume crop/sample-rate mismatch"
@@ -255,7 +278,8 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         let model = Model::new(c.architecture.clone(), c.seed);
         let adam = Adam::new(model.count(), c.lr);
         Checkpoint {
-            format_version: 1,
+            format_version: if c.flow.is_legacy() { 1 } else { 2 },
+            flow: c.flow.clone(),
             model,
             adam,
             rng: Rng::new(c.seed ^ 0x464552414c),
@@ -267,8 +291,11 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
             git_commit: git(&["rev-parse", "HEAD"]),
             git_dirty: !git(&["status", "--porcelain"]).is_empty(),
             source_hash: source_hash()?,
-            objective: "conditional rectified flow, unknown-sample MSE, uniform t, N(0,1) noise"
-                .into(),
+            objective: if c.flow.is_legacy() {
+                "conditional rectified flow, unknown-sample MSE, uniform t, N(0,1) noise".into()
+            } else {
+                "conditional rectified flow, Gaussian residual preconditioning, residual MSE (=velocity MSE/out^2), uniform t, N(0,1) noise".into()
+            },
             representation: "f32 mono waveform; lossless time-major blocks".into(),
             model_hash: String::new(),
             unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
@@ -286,7 +313,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     let current_source = source_hash()?;
     write_json(
         &c.run.join("run.json"),
-        &serde_json::json!({"git_commit":git(&["rev-parse","HEAD"]),"git_dirty":!git(&["status","--porcelain"]).is_empty(),"source_hash":current_source,"dataset":dataset.identity,"parameters":ck.model.count(),"architecture":ck.model.architecture,"crop_samples":n,"sample_rate":ck.sample_rate,"additional_steps":c.steps,"seed":c.seed,"lr":ck.adam.lr,"optimizer":"Adam beta1=.9 beta2=.999 eps=1e-8 global gradient clip=1","resume":c.resume,"weights_only":c.weights_only,"backend":"cpu-f32","objective":ck.objective,"representation":ck.representation}),
+        &serde_json::json!({"git_commit":git(&["rev-parse","HEAD"]),"git_dirty":!git(&["status","--porcelain"]).is_empty(),"source_hash":current_source,"dataset":dataset.identity,"parameters":ck.model.count(),"architecture":ck.model.architecture,"crop_samples":n,"sample_rate":ck.sample_rate,"additional_steps":c.steps,"seed":c.seed,"lr":ck.adam.lr,"optimizer":"Adam beta1=.9 beta2=.999 eps=1e-8 global gradient clip=1","resume":c.resume,"weights_only":c.weights_only,"backend":"cpu-f32","objective":ck.objective,"representation":ck.representation,"flow":ck.flow}),
     )?;
     ck.save(&c.run.join("initial.json"))?;
     let sample_config = Sampling {
@@ -296,7 +323,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     let zeros = vec![0.; n];
     let mut sampling_ms = 0.;
     let start = Instant::now();
-    let initial_audio = flow::sample(&ck.model, &zeros, &zeros, &sample_config)?;
+    let initial_audio = flow::sample(&ck.velocity(), &zeros, &zeros, &sample_config)?;
     sampling_ms += start.elapsed().as_secs_f64() * 1000.;
     audio::write_wav(
         &c.run.join("untrained-or-resumed-initial.wav"),
@@ -304,7 +331,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         ck.sample_rate,
     )?;
     write_json(&c.run.join("preview-config.json"), &sample_config)?;
-    let initial_eval = evaluation(&ck.model, &dataset, n);
+    let initial_eval = evaluation(&ck.model, &ck.flow, &dataset, n);
     ensure!(initial_eval.is_finite(), "invalid initial evaluation");
     let mut log = OpenOptions::new()
         .write(true)
@@ -334,7 +361,8 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         let noise: Vec<f32> = (0..n).map(|_| ck.rng.normal()).collect();
         let t = ck.rng.uniform();
         let op = Instant::now();
-        let (loss, grad) = flow::loss_gradient(&ck.model, &clean, &mask, &noise, t);
+        let (loss, grad) =
+            parameterization::loss_gradient(&ck.model, &ck.flow, &clean, &mask, &noise, t);
         neural_ms += op.elapsed().as_secs_f64() * 1000.;
         ensure!(loss.is_finite(), "nonfinite loss");
         let op = Instant::now();
@@ -357,7 +385,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         }
         if local % c.preview_every == 0 {
             let now = Instant::now();
-            let x = flow::sample(&ck.model, &zeros, &zeros, &sample_config)?;
+            let x = flow::sample(&ck.velocity(), &zeros, &zeros, &sample_config)?;
             sampling_ms += now.elapsed().as_secs_f64() * 1000.;
             audio::write_wav(
                 &c.run.join(format!("preview-{:06}.wav", ck.completed_steps)),
@@ -373,9 +401,9 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         }
     }
     let training_wall_ms = training_start.elapsed().as_secs_f64() * 1000.;
-    let final_eval = evaluation(&ck.model, &dataset, n);
+    let final_eval = evaluation(&ck.model, &ck.flow, &dataset, n);
     let now = Instant::now();
-    let final_audio = flow::sample(&ck.model, &zeros, &zeros, &sample_config)?;
+    let final_audio = flow::sample(&ck.velocity(), &zeros, &zeros, &sample_config)?;
     let final_sampling_ms = now.elapsed().as_secs_f64() * 1000.;
     audio::write_wav(&c.run.join("generated.wav"), &final_audio, ck.sample_rate)?;
     let delta = initial_audio
@@ -389,7 +417,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     step_ms.sort_by(|a, b| a.total_cmp(b));
     write_json(
         &c.run.join("metrics.json"),
-        &serde_json::json!({"parameters":ck.model.count(),"steps":c.steps,"total_steps":ck.completed_steps,"preprocessing_ms":preprocessing_ms,"neural_forward_backward_ms":neural_ms,"optimizer_ms":optimizer_ms,"training_wall_ms_with_previews":training_wall_ms,"step_mean_ms":step_ms.iter().sum::<f64>()/step_ms.len() as f64,"step_median_ms":step_ms[step_ms.len()/2],"step_max_ms":step_ms.last(),"final_sampling_ms":final_sampling_ms,"other_sampling_ms":sampling_ms,"sampling":sample_config,"peak_rss_kib":peak_rss_kib(),"fixed_probe_initial_loss":initial_eval,"fixed_probe_final_loss":final_eval,"same_noise_output_mse_change":delta,"generated_rms":audio::rms(&final_audio),"task_counts":task_counts,"quality_claim":"pipeline verification only; no perceptual quality or generalization established"}),
+        &serde_json::json!({"flow":ck.flow,"loss_units":if ck.flow.is_legacy(){"waveform velocity MSE"}else{"normalized Gaussian-residual MSE"},"parameters":ck.model.count(),"steps":c.steps,"total_steps":ck.completed_steps,"preprocessing_ms":preprocessing_ms,"neural_forward_backward_ms":neural_ms,"optimizer_ms":optimizer_ms,"training_wall_ms_with_previews":training_wall_ms,"step_mean_ms":step_ms.iter().sum::<f64>()/step_ms.len() as f64,"step_median_ms":step_ms[step_ms.len()/2],"step_max_ms":step_ms.last(),"final_sampling_ms":final_sampling_ms,"other_sampling_ms":sampling_ms,"sampling":sample_config,"peak_rss_kib":peak_rss_kib(),"fixed_probe_initial_loss":initial_eval,"fixed_probe_final_loss":final_eval,"same_noise_output_mse_change":delta,"generated_rms":audio::rms(&final_audio),"task_counts":task_counts,"quality_claim":"pipeline verification only; no perceptual quality or generalization established"}),
     )?;
     eprintln!(
         "checkpoint {} | probe {:.6} -> {:.6} | output delta MSE {:.6}",
@@ -521,9 +549,9 @@ pub fn render(c: RenderConfig) -> Result<()> {
                 *m = 1.;
             }
         }
-        flow::sample(&ck.model, &known, &mask, &c.sampling)?
+        flow::sample(&ck.velocity(), &known, &mask, &c.sampling)?
     } else {
-        flow::sample(&ck.model, &known, &mask, &c.sampling)?
+        flow::sample(&ck.velocity(), &known, &mask, &c.sampling)?
     };
     let sampling_ms = now.elapsed().as_secs_f64() * 1000.;
     let jumps = conditioning::boundary_jumps(&output[..output_len], &mask[..output_len]);
@@ -539,7 +567,7 @@ pub fn render(c: RenderConfig) -> Result<()> {
     audio::write_wav(&c.output, &all, sr)?;
     write_json(
         &c.output.with_extension("json"),
-        &serde_json::json!({"project":"FERAL","mode":match c.mode{Mode::Generate=>"generate",Mode::Continue=>"continue",Mode::Inpaint=>"inpaint",Mode::Variation=>"variation-masked-anchors"},"checkpoint":c.checkpoint,"checkpoint_sha256":data::hash_file(&c.checkpoint)?,"model_hash":ck.model_hash,"training_steps":ck.completed_steps,"git_commit":git(&["rev-parse","HEAD"]),"input":c.input,"input_sha256":input_hash,"preprocess":p,"sampling":c.sampling,"sample_rate":sr,"output_samples":all.len(),"window_offset_samples":offset,"inpaint_start":c.start,"inpaint_end":c.end,"preprocessing_ms":preprocess_ms,"sampling_ms":sampling_ms,"peak_rss_kib":peak_rss_kib(),"protected_samples_exact":preserved,"boundary_jumps":jumps,"rms":audio::rms(&all),"output_sha256":data::hash_file(&c.output)?}),
+        &serde_json::json!({"project":"FERAL","mode":match c.mode{Mode::Generate=>"generate",Mode::Continue=>"continue",Mode::Inpaint=>"inpaint",Mode::Variation=>"variation-masked-anchors"},"checkpoint":c.checkpoint,"checkpoint_sha256":data::hash_file(&c.checkpoint)?,"model_hash":ck.model_hash,"flow":ck.flow,"training_steps":ck.completed_steps,"git_commit":git(&["rev-parse","HEAD"]),"input":c.input,"input_sha256":input_hash,"preprocess":p,"sampling":c.sampling,"sample_rate":sr,"output_samples":all.len(),"window_offset_samples":offset,"inpaint_start":c.start,"inpaint_end":c.end,"preprocessing_ms":preprocess_ms,"sampling_ms":sampling_ms,"peak_rss_kib":peak_rss_kib(),"protected_samples_exact":preserved,"boundary_jumps":jumps,"rms":audio::rms(&all),"output_sha256":data::hash_file(&c.output)?}),
     )?;
     eprintln!(
         "wrote {} | {:.1} ms sampling | protected exact={}",
