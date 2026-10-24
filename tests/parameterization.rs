@@ -230,6 +230,18 @@ fn calibrated_prior_sampling_matches_training_scale_and_format_gate() {
     let loaded = Checkpoint::load(&path).unwrap();
     assert_eq!(loaded.format_version, 3);
     assert_eq!(loaded.flow, cfg);
+    let mut resume = config(&root, "cal-resume", 2, Some(path.clone()));
+    resume.flow = cfg.clone();
+    let resumed_path = runtime::train(resume).unwrap();
+    let mut uninterrupted = config(&root, "cal-all", 4, None);
+    uninterrupted.flow = cfg.clone();
+    let all_path = runtime::train(uninterrupted).unwrap();
+    let resumed = Checkpoint::load(&resumed_path).unwrap();
+    let all = Checkpoint::load(&all_path).unwrap();
+    assert_eq!(resumed.model.parameters(), all.model.parameters());
+    assert_eq!(resumed.adam.m, all.adam.m);
+    assert_eq!(resumed.rng.state, all.rng.state);
+
     let mut bad = serde_json::to_value(&loaded).unwrap();
     bad["format_version"] = 2.into();
     runtime::write_json(&root.join("wrong-v2.json"), &bad).unwrap();

@@ -139,3 +139,24 @@ headroom-adapted tangent decay. It retains the first unknown step's feasible slo
 the .98 safety limiter still wins when a slope cannot fit. Raised-cosine blending
 changes only unknown samples. Signal continuity, perceptual continuity and musical
 structure continue to require different evidence.
+
+## Checkpointed flow parameterization and prior (Phase 3)
+
+`parameterization::FlowConfig` separates the neural output from physical velocity.
+With data variance A and prior variance B, D=t²A+(1-t)²B:
+`c_in=1/sqrt(D)`, `c_skip=(t*A-(1-t)*B)/D`, `c_out=sqrt(A*B/D)`.
+The CNN learns a normalized residual and physical velocity is `c_skip*x+c_out*f`.
+Known context uses data-scale normalization. The target is
+`(clean-noise-c_skip*x)/c_out` on unknown positions; its MSE equals physical
+velocity MSE/c_out². All coefficients remain finite at both endpoints. This is an
+engineering adaptation of preconditioning ideas; research scope is in the Phase 3
+protocols, not a reproduction claim.
+
+`Velocity::prior_std` has a legacy default of 1. `Checkpoint::velocity()` supplies
+the saved configuration for solver initialization and field evaluation. Runtime
+training, previews, evaluation and rendering all use that configuration; passing
+`checkpoint.model` directly is only correct for raw neural output experiments.
+V1 means raw velocity; v2 means unit-prior preconditioning; v3 permits non-unit
+priors. Loading and resume validate the version/configuration contract. Missing
+legacy fields retain their original semantics and outputs. GaussianReference and
+AR(1) examples are non-neural falsification controls, not the primary generator.

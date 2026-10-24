@@ -73,3 +73,10 @@ actual generated spectra rather than enlarging the architecture reflexively.
 The owner-requested fivefold continuation, fixed held-out comparison and exported
 10-second A/B pack are recorded in [TRAINING_6000.md](reports/TRAINING_6000.md).
 The 1,200-step control, optimizer/RNG state and prior listening pack are preserved.
+
+## Phase 3: preconditioning and calibrated prior
+
+See [PHASE3.md](reports/PHASE3.md), the frozen protocols, `scripts/phase3.py` and
+`scripts/phase3_calibrated.py`. Nine paired-model runs plus the unit-prior follow-up
+preserve regression gains, reconstruction losses and generated audio separately.
+Audio/control examples at common RMS are exported to `/sdcard/FERAL_Phase3_20261024/`.

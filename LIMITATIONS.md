@@ -40,7 +40,7 @@ output for any of those results. No subjective listening evaluation is claimed.
 * No public backward outpaint command, latent interpolation, recurrent latent
   dynamics, learned codec, diffusion, acoustic invariant engine,
   evolutionary search or automated OOD selection. No pretrained models or services.
-* Checkpoint format v1 is readable JSON and includes weights, Adam and RNG. CPU
+* Checkpoint formats v1-v3 are readable JSON and includes weights, Adam and RNG. CPU
   deterministic resume is tested on this compiler/architecture; cross-platform
   floating-point bit parity is not promised. Hashes detect model payload changes,
   not malicious edits with recomputed hashes. Only load trusted local artifacts.
@@ -68,3 +68,12 @@ split files as the recorded protocols do. Pooling is aligned to crop frame zero,
 so shift/block sensitivity remains a concern. The refined collar can retain valid
 transient slopes, but cannot simultaneously match an impossible slope and enforce
 the generated-sample amplitude ceiling. No click-free listening claim is made.
+
+Phase 3 improves some generated spectral descriptors, but the calibrated model loses
+on the average common-corruption reconstruction comparison. No universal quality
+win, broad generalization or musical competence is established. Simple AR(1) noise
+matches some global spectral statistics better. Level-matched listening controls
+are essential. Data scale and training prior are explicit fixed values, not
+automatically estimated per recording. Configuration changes require fresh
+training and new-version checkpoints; velocity losses across different priors are
+not directly comparable. The old raw-velocity default remains available.

@@ -186,3 +186,6 @@ reset Adam/RNG, changed dataset, and completed step 1. See LIMITATIONS.md and RO
 Phase 2 follow-up: the historical results above remain unchanged. The current
 19-test suite, pooled network, held-out experiments, negative controls and transient
 continuity fix are documented in [PHASE2.md](PHASE2.md).
+
+Phase 3: the current 25-test suite, versioned scale-aware flow, replicated comparisons
+and level-matched audio/control export are documented in [PHASE3.md](PHASE3.md).

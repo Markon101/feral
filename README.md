@@ -10,7 +10,7 @@ evidence, not evidence of realistic music quality.
 
 ## Build and check
 
-Rust and FFmpeg/FFprobe must already be installed. There are 40 locked Cargo
+Rust and FFmpeg/FFprobe must already be installed. There are 48 locked Cargo
 packages; no ML framework, Python runtime, GPU SDK, or model download is required.
 
 ```sh
@@ -107,7 +107,8 @@ experimental: that disconnected mask pattern is not separately trained.
   --resume runs/first/checkpoint.json --steps 50 --run runs/resumed
 ```
 
-`--noise-scale` is initial noise amplitude (0–4), not a calibrated temperature.
+`--noise-scale` multiplies the checkpoint prior amplitude (0–4); it is not a
+calibrated temperature. Legacy checkpoints use prior std 1.
 `--perturb` adds a seeded bounded velocity term with a sine time envelope (0–0.5).
 Zero perturbation restores the baseline exactly. Euler and Heun both integrate
 from noise at t=0 to audio at t=1. Trajectories reject nonfinite or extreme values;
@@ -164,3 +165,29 @@ The continuity collar now retains feasible source slopes on transients, with
 headroom-aware decay; protected canonical samples remain exact. Amplitude limits
 can make exact slope matching impossible. See [Phase 2 results](reports/PHASE2.md)
 and the frozen [protocol](reports/PHASE2_PROTOCOL.md).
+
+## Phase 3: scale-aware flow
+
+Optional preconditioning and a checkpointed prior are implemented and tested:
+
+```sh
+./target/release/feral train --input runs/phase2-v1/train.wav \
+  --run runs/preconditioned --network pyramid --parameterization preconditioned \
+  --data-scale 0.1 --prior-std 0.1 --no-normalize --steps 3000
+./target/release/feral generate --checkpoint runs/preconditioned/checkpoint.json \
+  --seconds 1 --output runs/preconditioned/generated-new.wav
+```
+
+These scales were chosen from the current training section (RMS .1068); calibrate
+only from training audio for other datasets. Generation automatically uses the
+saved prior. `--noise-scale 1.4` means 1.4 times that prior (.14 for prior std .1).
+Resume requires the same parameterization/data scale/prior flags. Switching them
+requires fresh training; weights are never silently reinterpreted.
+
+V1 legacy and v2 unit-prior checkpoints still load. Non-unit priors use v3, rejected
+by older binaries. `evaluate` follows the checkpoint path; across priors compare
+common-corruption endpoint metrics via `examples/phase3_snr_eval.rs`, not fixed-time
+velocity losses. Lower regression loss and darker spectra are separate outcomes.
+See [PHASE3.md](reports/PHASE3.md) for the three-seed results, failed/plateaued
+follow-up, and level-matched listening pack at `/sdcard/FERAL_Phase3_20261024/`.
+The raw-velocity default remains intact.

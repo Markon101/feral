@@ -1,8 +1,9 @@
 # Priorities after Phase 2
 
-1. **Improve generated audio, not just denoising probes.** Test data-calibrated
-   noise/path schedules and late-time coverage with consistent train/sample
-   conventions. Keep the same network, three model seeds, matched compute,
+1. **Improve generated audio, not just denoising probes.** Phase 3 implemented
+   preconditioning and a consistent calibrated prior with measured tradeoffs. Next
+   test phase-preserving multiresolution representations/objectives and richer
+   local acoustic structure, alongside late-time coverage. Keep the same network, three model seeds, matched compute,
    amplitude-matched listening, linear-filter controls and new held-out recordings.
    Generated spectra remain overly white despite a modest pooled denoising gain.
 2. **Test useful context and stronger acoustic objectives.** Compare coarse-context
