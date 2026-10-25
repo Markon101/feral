@@ -44,6 +44,7 @@ def main():
     p.add_argument('--baseline',type=Path,default=Path('runs/phase2-v1/train.wav'))
     p.add_argument('--steps',type=int,default=20000)
     p.add_argument('--resume-sweep',action='store_true')
+    p.add_argument('--only-width',type=int,choices=[64,128],help='run a subset without claiming the full sweep completed')
     a=p.parse_args()
     if not 10000<=a.steps<=100000 or a.steps%2000:
         p.error('--steps must be a multiple of2000 in10000..100000')
@@ -74,6 +75,8 @@ def main():
         if seed==43:
             axes.reverse()
         for width,data in axes:
+            if a.only_width is not None and width != a.only_width:
+                continue
             key=f'w{width}-{data}-s{seed}'
             arm=state['arms'].setdefault(key,{'width':width,'data':data,'seed':seed,'completed':0,'chunks':[],'milestones':{}})
             while arm['completed']<a.steps:
@@ -138,8 +141,10 @@ def main():
                 event({'event':'end_chunk','arm':key,**record})
                 write_progress(root,state)
                 print(f"{key} {expected}/{a.steps} | step{metrics['step_mean_ms']:.3f}ms | probe{metrics['fixed_probe_final_loss']:.5f} | {budget['scheduling_state']}",flush=True)
-    state['finished_utc']=utc();write_progress(root,state)
-    print('COMPLETE',root/'progress.json',flush=True)
+    expected=[f'w{w}-{d}-s{s}' for s in [42,43] for w in [64,128] for d in ['old24','expanded200']]
+    complete=all(state['arms'].get(k,{}).get('completed',0)==a.steps for k in expected)
+    state['finished_utc' if complete else 'last_partial_utc']=utc();write_progress(root,state)
+    print('COMPLETE' if complete else 'PARTIAL_SELECTION',root/'progress.json',flush=True)
     return 0
 
 

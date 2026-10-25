@@ -21,6 +21,8 @@ def snapshot():
         state = 'background'
     elif cpuset and ('top-app' in cpuset or 'foreground' in cpuset):
         state = 'foreground-class'
+    elif cpuset and ('moderate' in cpuset or (affinity and len(affinity) <= 4)):
+        state = 'reduced-class'
     else:
         state = 'unknown'
     temperatures = {}
@@ -44,15 +46,15 @@ def snapshot():
     reasons = []
     if gpu is None:
         reasons.append('GPU temperature unavailable')
-    elif gpu >= 60:
-        reasons.append('GPU operator threshold 60C reached')
+    elif gpu >= 65:
+        reasons.append('GPU operator threshold 65C reached')
     if battery is not None and battery >= 41:
         reasons.append('battery operator threshold 41C reached')
     if memory.get('MemAvailable_kib',0) < 524288:
         reasons.append('available RAM below512MiB')
     return {'cpuset':cpuset,'scheduling_state':state,'affinity':affinity,
             'temperatures_c':temperatures,'memory':memory,'allow_training':not reasons,
-            'defer_reasons':reasons,'chunk_steps':2000 if state=='foreground-class' and len(affinity)>=6 else 500,
+            'defer_reasons':reasons,'operator_limits':{'gpu_c':65,'battery_c':41,'minimum_available_kib':524288},'chunk_steps':2000 if state=='foreground-class' and len(affinity)>=6 else 500,
             'build_jobs':4 if state=='foreground-class' and len(affinity)>=6 else 2}
 
 

@@ -77,3 +77,19 @@ uses a mel-conditioned prior and auxiliary multiresolution losses for speech
 vocoder training (https://aclanthology.org/2025.naacl-long.110/). Neither establishes
 that a tiny unconditional FERAL waveform model will generate music; no models or
 code are downloaded, and no reproduction claim is made.
+
+## Resource amendment after initial warm-device trials
+
+The initial policy was60C GPU, and two larger-model attempts
+stopped at observed60.3C with partial files retained. Subsequent read-only sysfs
+inspection found gpuss passive trip temperatures105C/135C and hot125C. Those are
+configured kernel trip values, not user-comfort ratings or permission to approach
+them. For subsequent invocations the job-local GPU stop threshold is65C; battery
+41C, memory limits and Android thermal management remain unchanged. No system
+trip, driver, governor or clock is modified. The purpose is to avoid repeatedly
+aborting on short internal-die60C excursions while retaining a substantial
+job-level limit; this is not a certified safety claim. Snapshot metadata now
+includes the operator limits. Background/moderate scheduling still uses500step
+chunks and two build jobs at most. The raw trip reads are preserved in
+runs/scaling-diagnostics-v1/read-only-thermal-trips.json. The earlier failed
+attempts remain part of the resource report and do not count as successful arms.

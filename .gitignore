@@ -3,6 +3,7 @@
 /datasets/
 /cache/
 /runs/
+*-worktree/
 *.wav
 *.flac
 *.mp3
