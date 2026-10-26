@@ -327,8 +327,13 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     let n = ((c.crop_seconds * c.preprocess.sample_rate as f32).round() as usize).div_ceil(b) * b;
     let pre_start = Instant::now();
     let dataset = Dataset::load(&c.input, c.preprocess.clone(), n)?;
+    // Fixed probes and validation always use at most a 4 s window, whatever the training crop is.
+    // Two reasons: the CPU reference evaluation costs parameters x window, which at a 16 s crop is
+    // minutes per probe, and a constant window keeps `validation_loss` comparable across runs that
+    // train at different crop lengths.
+    let eval_n = n.min(64_000);
     let validation = match &c.validation {
-        Some(path) => Some(Dataset::load(path, c.preprocess.clone(), n)?),
+        Some(path) => Some(Dataset::load(path, c.preprocess.clone(), eval_n)?),
         None => None,
     };
     let preprocessing_ms = pre_start.elapsed().as_secs_f64() * 1000.;
@@ -421,14 +426,14 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         ck.sample_rate,
     )?;
     write_json(&c.run.join("preview-config.json"), &sample_config)?;
-    let initial_eval = evaluation(&ck.model, &ck.flow, &dataset, n);
+    let initial_eval = evaluation(&ck.model, &ck.flow, &dataset, eval_n);
     ensure!(initial_eval.is_finite(), "invalid initial evaluation");
     // Validation uses the held-out corpus when supplied; the probe seed and t are fixed so
     // successive readings are comparable and are not drawn from the training crop stream.
     let val_loss = |model: &Model, flow: &FlowConfig| -> f32 {
         match &validation {
-            Some(v) => evaluation(model, flow, v, n),
-            None => evaluation(model, flow, &dataset, n),
+            Some(v) => evaluation(model, flow, v, eval_n),
+            None => evaluation(model, flow, &dataset, eval_n),
         }
     };
     let initial_val = val_loss(&ck.model, &ck.flow);
@@ -585,7 +590,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     }
     let training_wall_ms = training_start.elapsed().as_secs_f64() * 1000.;
     trainer.sync(&mut ck.model, &mut ck.adam)?;
-    let final_eval = evaluation(&ck.model, &ck.flow, &dataset, n);
+    let final_eval = evaluation(&ck.model, &ck.flow, &dataset, eval_n);
     let final_val = val_loss(&ck.model, &ck.flow);
     ensure!(final_val.is_finite(), "nonfinite final validation loss");
     let final_entry = serde_json::json!({
