@@ -175,6 +175,10 @@ struct TrainArgs {
     /// With --resume, reset Adam and RNG (explicit weights-only warm start).
     #[arg(long, requires = "resume")]
     weights_only: bool,
+    /// With --resume, continue at a different --crop-seconds (curriculum). The weights, optimizer
+    /// and RNG carry over; the data stream does not continue bit-exactly.
+    #[arg(long, requires = "resume")]
+    grow_crop: bool,
     #[command(flatten)]
     audio: AudioArgs,
 }
@@ -355,6 +359,7 @@ fn main() -> Result<()> {
                 checkpoint_every: a.checkpoint_every,
                 resume: a.resume,
                 weights_only: a.weights_only,
+                grow_crop: a.grow_crop,
                 batch: a.batch,
                 validation: a.validation,
                 validation_every: a.validation_every,
@@ -468,6 +473,7 @@ fn main() -> Result<()> {
                 checkpoint_every: 10,
                 resume: None,
                 weights_only: false,
+                grow_crop: false,
                 batch: 1,
                 validation: None,
                 validation_every: 10,

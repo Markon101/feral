@@ -261,6 +261,7 @@ fn config(root: &Path, run: &str, steps: usize, resume: Option<PathBuf>) -> Trai
         checkpoint_every: 100,
         resume,
         weights_only: false,
+        grow_crop: false,
         batch: 1,
         validation: None,
         validation_every: 10,

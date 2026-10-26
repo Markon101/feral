@@ -114,6 +114,46 @@ fn baseline_cuda_update_matches_cpu() {
 }
 
 #[test]
+fn device_evaluation_loss_matches_cpu() {
+    // `parameterization::loss` is what validation reports. It must give the same number through a
+    // device-backed Velocity as through the CPU reference, for both parameterizations.
+    use feral::model::Velocity as _;
+    let n = 64usize;
+    let model = tiny();
+    let adam = Adam::new(model.count(), 0.0003);
+    let known: Vec<f32> = (0..n).map(|i| 0.2 * (i as f32 * 0.11).cos()).collect();
+    let mut mask = vec![0f32; n];
+    mask[..n / 4].fill(1.);
+    let noise: Vec<f32> = (0..n).map(|i| 0.1 * ((i * 7 % 11) as f32 - 5.)).collect();
+
+    for flow in [
+        FlowConfig::Velocity,
+        FlowConfig::Preconditioned {
+            data_scale: 0.1,
+            prior_std: 1.,
+        },
+    ] {
+        let trainer = feral::cuda::CudaTrainer::new(&model, &adam, n, 1, flow.clone())
+            .expect("CUDA device unavailable; this test only runs on a CUDA machine");
+        let device =
+            feral::sampler::DeviceVelocity::new(Box::new(trainer), &flow, n, model.block())
+                .expect("device sampler");
+        let cpu = feral::parameterization::ConfiguredVelocity {
+            model: &model,
+            config: &flow,
+        };
+        for t in [0., 0.5, 1.] {
+            let a = feral::parameterization::loss(&cpu, &flow, &known, &mask, &noise, t);
+            let b = feral::parameterization::loss(&device, &flow, &known, &mask, &noise, t);
+            assert!(
+                (a - b).abs() <= 1e-5 + 1e-3 * a.abs(),
+                "evaluation loss parity for {flow:?} at t={t}: cpu {a} device {b}"
+            );
+        }
+    }
+}
+
+#[test]
 fn large_frame_and_wide_dilation_parity() {
     use feral::model::Velocity as _;
     // The context plan raises block to 128 (388 feature channels per frame) and dilations to 128.

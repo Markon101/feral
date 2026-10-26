@@ -148,6 +148,36 @@ pub fn loss_gradient(
         .collect();
     (loss, model.backward(&tape, &dy))
 }
+/// Forward-only loss with exactly the algebra of `loss_gradient`, for evaluation.
+///
+/// The configured velocity is `skip*x + out*f` for the preconditioned flow, so
+/// `(v - (y - z)) / out` is the residual `f - target` that training minimises. That makes one
+/// expression serve both parameterizations, and lets a device-backed `Velocity` report the same
+/// number without building a tape on the host.
+pub fn loss<M: Velocity + ?Sized>(
+    model: &M,
+    config: &FlowConfig,
+    clean: &[f32],
+    mask: &[f32],
+    noise: &[f32],
+    t: f32,
+) -> f32 {
+    let x: Vec<f32> = clean
+        .iter()
+        .zip(noise)
+        .zip(mask)
+        .map(|((&y, &z), &m)| if m == 1. { y } else { (1. - t) * z + t * y })
+        .collect();
+    let v = model.velocity(&x, clean, mask, t);
+    let (_, out, _) = config.coefficients(t);
+    let count = mask.iter().filter(|&&m| m == 0.).count().max(1) as f32;
+    let mut loss = 0.;
+    for (((&vi, &y), &z), &m) in v.iter().zip(clean).zip(noise).zip(mask) {
+        let d = (vi - (y - z)) * (1. - m) / out;
+        loss += d * d / count;
+    }
+    loss
+}
 /// Linear Gaussian reference with zero learned correction, for scientific controls.
 pub struct GaussianReference {
     pub block: usize,

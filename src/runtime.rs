@@ -230,6 +230,9 @@ pub struct TrainConfig {
     pub checkpoint_every: usize,
     pub resume: Option<PathBuf>,
     pub weights_only: bool,
+    /// Allow a full resume at a different crop length. The network is fully convolutional, so the
+    /// weights transfer; the data stream and the RNG trajectory do not continue bit-exactly.
+    pub grow_crop: bool,
     pub architecture: Architecture,
     pub flow: FlowConfig,
     /// Crops per optimizer step. The loss and gradients are averaged over the batch.
@@ -239,7 +242,12 @@ pub struct TrainConfig {
     /// Validation interval in steps; every interval also writes a validation.jsonl row.
     pub validation_every: usize,
 }
-fn evaluation(model: &Model, flow: &FlowConfig, dataset: &Dataset, n: usize) -> f32 {
+fn evaluation(
+    field: &dyn crate::model::Velocity,
+    flow: &FlowConfig,
+    dataset: &Dataset,
+    n: usize,
+) -> f32 {
     let mut rng = Rng::new(901);
     let mut sum = 0.;
     for _ in 0..4 {
@@ -249,9 +257,42 @@ fn evaluation(model: &Model, flow: &FlowConfig, dataset: &Dataset, n: usize) -> 
         }
         let (mask, _) = conditioning::training_mask(n, &mut rng);
         let noise: Vec<f32> = (0..n).map(|_| rng.normal() * flow.prior_std()).collect();
-        sum += parameterization::loss_gradient(model, flow, &clean, &mask, &noise, 0.5).0;
+        sum += parameterization::loss(field, flow, &clean, &mask, &noise, 0.5);
     }
     sum / 4.
+}
+/// Evaluates the fixed probes against the checkpoint's *current* weights.
+///
+/// On CUDA this builds a fresh resident trainer for the probe window (a few MB, ~0.1 s) instead of
+/// running the CPU reference, which costs parameters x window - minutes per pass for a 6.5 M
+/// model. The arithmetic is `parameterization::loss`, the same expression training minimises, and
+/// the device field is verified against the CPU one to ~1e-7.
+fn evaluate_checkpoint(ck: &Checkpoint, backend: &str, dataset: &Dataset, n: usize) -> Result<f32> {
+    match backend {
+        "cuda" => {
+            #[cfg(feature = "cuda")]
+            {
+                let adam = Adam::new(ck.model.count(), ck.adam.lr);
+                let trainer =
+                    crate::cuda::CudaTrainer::new(&ck.model, &adam, n, 1, ck.flow.clone())?;
+                let field = crate::sampler::DeviceVelocity::new(
+                    Box::new(trainer),
+                    &ck.flow,
+                    n,
+                    ck.model.architecture.block,
+                )?;
+                Ok(evaluation(&field, &ck.flow, dataset, n))
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = (dataset, n);
+                anyhow::bail!(
+                    "CUDA evaluation was requested but not compiled; cargo build --locked --offline --release --features cuda -j 8"
+                )
+            }
+        }
+        _ => Ok(evaluation(&ck.velocity(), &ck.flow, dataset, n)),
+    }
 }
 /// Previews and the final take use the same backend as training. On an accelerator this builds a
 /// second resident trainer instead of reusing the training one: reusing it would leave the
@@ -344,9 +385,22 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
             "resume parameterization mismatch; train a fresh model for a different flow"
         );
         ensure!(
-            ck.crop_samples == n && ck.sample_rate == c.preprocess.sample_rate,
-            "resume crop/sample-rate mismatch"
+            ck.sample_rate == c.preprocess.sample_rate,
+            "resume sample-rate mismatch"
         );
+        if c.grow_crop {
+            // Curriculum step: the same weights continue at a longer (or shorter) crop. The
+            // optimizer, step counter and RNG state carry over, but the data stream does not
+            // continue bit-exactly because crop offsets change with the window length.
+            ck.crop_samples = n;
+        } else {
+            ensure!(
+                ck.crop_samples == n,
+                "resume crop mismatch ({} vs {} samples); pass --grow-crop to continue at a new crop length",
+                ck.crop_samples,
+                n
+            );
+        }
         ensure!(
             serde_json::to_string(&ck.model.architecture)?
                 == serde_json::to_string(&c.architecture)?,
@@ -426,17 +480,17 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         ck.sample_rate,
     )?;
     write_json(&c.run.join("preview-config.json"), &sample_config)?;
-    let initial_eval = evaluation(&ck.model, &ck.flow, &dataset, eval_n);
+    let initial_eval = evaluate_checkpoint(&ck, &c.backend, &dataset, eval_n)?;
     ensure!(initial_eval.is_finite(), "invalid initial evaluation");
     // Validation uses the held-out corpus when supplied; the probe seed and t are fixed so
     // successive readings are comparable and are not drawn from the training crop stream.
-    let val_loss = |model: &Model, flow: &FlowConfig| -> f32 {
+    let val_loss = |ck: &Checkpoint| -> Result<f32> {
         match &validation {
-            Some(v) => evaluation(model, flow, v, eval_n),
-            None => evaluation(model, flow, &dataset, eval_n),
+            Some(v) => evaluate_checkpoint(ck, &c.backend, v, eval_n),
+            None => evaluate_checkpoint(ck, &c.backend, &dataset, eval_n),
         }
     };
-    let initial_val = val_loss(&ck.model, &ck.flow);
+    let initial_val = val_loss(&ck)?;
     ensure!(initial_val.is_finite(), "invalid initial validation loss");
     let mut log = OpenOptions::new()
         .write(true)
@@ -553,7 +607,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         }
         if local % c.validation_every == 0 {
             trainer.sync(&mut ck.model, &mut ck.adam)?;
-            let v = val_loss(&ck.model, &ck.flow);
+            let v = val_loss(&ck)?;
             ensure!(v.is_finite(), "nonfinite validation loss");
             let entry = serde_json::json!({
                 "step": ck.completed_steps,
@@ -590,8 +644,8 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     }
     let training_wall_ms = training_start.elapsed().as_secs_f64() * 1000.;
     trainer.sync(&mut ck.model, &mut ck.adam)?;
-    let final_eval = evaluation(&ck.model, &ck.flow, &dataset, eval_n);
-    let final_val = val_loss(&ck.model, &ck.flow);
+    let final_eval = evaluate_checkpoint(&ck, &c.backend, &dataset, eval_n)?;
+    let final_val = val_loss(&ck)?;
     ensure!(final_val.is_finite(), "nonfinite final validation loss");
     let final_entry = serde_json::json!({
         "step": ck.completed_steps,

@@ -168,6 +168,7 @@ fn config(root: &Path, name: &str, steps: usize, resume: Option<PathBuf>) -> Tra
         checkpoint_every: 100,
         resume,
         weights_only: false,
+        grow_crop: false,
         batch: 1,
         validation: None,
         validation_every: 10,
