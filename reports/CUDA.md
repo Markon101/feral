@@ -421,6 +421,52 @@ both forms parse identically, so every checkpoint written before this change sti
 Measured on this machine with a throwaway test that saved both forms of the 50k checkpoint and
 reloaded them: identical `model_hash`, identical `completed_steps`.
 
+## Generation test at 50,000 steps (29 takes)
+
+The weights are worth listening to now, and a take costs 0.3 s on the device, so the test is a
+matrix rather than one sample: 29 takes, every one a real CLI invocation, with the per-take
+descriptors in `reports/generation-test-01.json` and the audio in
+`experiments/big-1m4-c4000/generation-test-01/takes/`. Groups: three training states on the same
+four seeds, eight seeds at 50 k, solver and step counts, prior amplitude, duration, and conditioning
+on both held-out files plus one training file.
+
+| group | RMS | flatness | lag-1 | limiter hits | bands <250 / 250-1k / 1k-4k / >4k |
+| --- | --- | --- | --- | --- | --- |
+| untrained (step 0), 4 seeds | 0.760 | 0.988 | 0.017 | 108,774 | 0.03 / 0.09 / 0.38 / 0.50 |
+| 10 k, 4 seeds | 0.162 | 0.217 | 0.879 | 4 | 0.55 / 0.24 / 0.17 / 0.04 |
+| 50 k, 8 seeds | 0.152 | 0.305 | 0.828 | 3 | 0.53 / 0.19 / 0.23 / 0.06 |
+| corpus reference | 0.301 | 0.105 | 0.930 | — | 0.68 / 0.14 / 0.16 / 0.02 |
+
+What the numbers support:
+
+* **Training turned noise into audio-shaped output.** Untrained takes are near-white (flatness
+  0.988), sit on the 0.98 limiter (27,000 hits per take) and have no temporal correlation (lag-1
+  0.017). Both trained checkpoints have lag-1 0.83–0.88, flatness 0.22–0.31 and essentially no
+  limiter activity.
+* **It has not learned the corpus's spectral tilt.** Flatness is 3× the reference and energy sits
+  higher: 23 % in 1–4 kHz against 16 %, 6 % above 4 kHz against 2 %. Broadband texture and level
+  are learned; the tilt is not. That is the concrete gap, and it is measurable.
+* **Seeds are independent.** Mean pairwise correlation across eight seeds is −0.008 (−0.034 to
+  +0.034), so there is no mode collapse. The same seed at 10 k and 50 k correlates +0.85: the 50 k
+  model is a continuation, slightly brighter (flatness 0.217 → 0.305) at the same level.
+* **Solver and prior amplitude are load-bearing.** Heun converges by 8 steps (RMS 0.137 at 8, 0.132
+  at 64); Euler is under-integrated at 8 (RMS 0.073) and still short at 32 (0.111). `--noise-scale`
+  moves output level almost linearly (0.5 → RMS 0.013, 1.5 → 0.500 with 4,134 limiter hits), so it
+  is an amplitude control, not a creativity knob. Duration 1/2/4/5 s gives RMS 0.118/0.137/0.15/0.136.
+* **Conditioning holds.** `protected_samples_exact` is true in all four conditioned takes, with
+  boundary jumps 0.0 (Clubhouse Antics), 0.0083 (FISREAL), 0.0 (training file) and 0.247/0.025 at
+  the two inpaint joins.
+* **The copying screen behaves.** Generated takes score 0.068–0.124 nearest absolute correlation
+  against a 0.032 noise control, and the continue take built on a training recording scores 1.0000 —
+  a positive control the screen passes.
+* **Peaks above full scale (1.30, 1.40)** appear only in continue takes and come from the protected
+  prefix, which is preserved bit-exactly by contract; generated samples are clamped to 0.98. A float
+  WAV carries it, a playback chain with a hard limiter would clip the prefix.
+
+What this does not say: descriptors are not perceptual quality, and the screen is bounded. The
+evidence supports "the model learned audio structure, is seed-diverse, conditions correctly and is
+too bright", not "it sounds good". Listening is still the only test for the latter.
+
 ## Status at pause (2026-10-25)
 
 `experiments/audio-1m-cuda-02/run-80k-c4000-b8` is the first run on the full corpus: 62 recordings
