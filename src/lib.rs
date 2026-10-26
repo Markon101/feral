@@ -7,6 +7,7 @@ pub mod model;
 pub mod parameterization;
 pub mod rng;
 pub mod runtime;
+pub mod sampler;
 
 #[cfg(feature = "opencl")]
 pub mod gpu;

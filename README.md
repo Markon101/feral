@@ -108,6 +108,12 @@ experimental: that disconnected mask pattern is not separately trained.
   --resume runs/first/checkpoint.json --steps 50 --run runs/resumed
 ```
 
+`--backend` selects where the velocity field is evaluated: `cpu` (the default
+reference) or `cuda`, which runs the same network and the same solver on the
+device. The two agree to fp32 summation order — measured max |Δ| 1.8e-7–3.0e-7,
+correlation 1.00000000, identical protected samples and identical boundary
+jumps — while a 4 s take at 32 Heun steps drops from 144.6 s to 0.58 s.
+
 `--noise-scale` multiplies the checkpoint prior amplitude (0–4); it is not a
 calibrated temperature. Legacy checkpoints use prior std 1.
 `--perturb` adds a seeded bounded velocity term with a sine time envelope (0–0.5).

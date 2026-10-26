@@ -297,6 +297,48 @@ Artifacts: `experiments/big-1m4-c4000/run-10k-b8-c4000/` plus
 `experiments/big-1m4-c4000/takes/`. A copy for listening, with the metrics that
 belong to it, is in `~/Downloads/feral-big-1m-20261025-1841/`.
 
+## Sampling on the device (250x faster, same trajectory)
+
+The run above spent 508 s of its 1,016 s wall clock in the CPU sampler, so the next
+piece of work was to evaluate the velocity field where the weights already live.
+`flow::sample` is generic over `Velocity`, so the change is one `Velocity`
+implementation backed by a resident trainer (`src/sampler.rs`) plus a
+`--backend cpu|cuda` switch on `generate`, `continue`, `inpaint` and `variation`.
+
+Two things made it small instead of invasive:
+
+* `feral_features` already builds `x_t` and applies the parameterization scaling on
+  the device (`pre ? (m == 1 ? y/scale : xt*cin) : xt`), and `read_prediction`
+  already returns the network output — the audit has used both for forward parity
+  since it existed.
+* The solver, the conditioning projection, the collar and the safety limiter stay in
+  `flow`. Only the field evaluation moves.
+
+| mode | window | CPU | CUDA | speedup | max abs delta | correlation |
+| --- | --- | --- | --- | --- | --- | --- |
+| generate 4 s, 32 Heun steps | 64,000 | 144.6 s | 0.583 s | 248x | 2.4e-7 | 1.00000000 |
+| continue, 2 s protected + 4 s | 96,000 | 221.1 s | 0.778 s | 284x | 3.0e-7 | 1.00000000 |
+| inpaint, 1 s hole in a 3 s window | 48,000 | 107.3 s | 0.462 s | 232x | 1.8e-7 | 1.00000000 |
+
+The deltas are fp32 summation order, not a different computation: 15,551 of the
+64,000 samples in the generate take are bit-identical, and the whole CLI command
+(checkpoint load included) takes 1.3 s. `protected_samples_exact` stays true in
+every mode, and the continue take's boundary jump matches the CPU value exactly
+(2.3018195e-8). `tests/cuda.rs::device_sampler_field_matches_cpu` pins the field
+itself — both parameterizations, t in {0, 0.37, 1} — against `ConfiguredVelocity`.
+
+How the field is fed without a kernel change: passing the same buffer as `clean`
+and `noise` makes `x_t = x` at every position, and the known-side feature comes out
+as `x*mask`, which equals `known*mask` because the solver keeps `x` equal to the
+known samples wherever the mask is set. That invariant is now checked on every
+evaluation rather than assumed.
+
+A trap worth recording: the kernels apply the parameterization themselves, so
+pre-scaling the inputs on the host — the obvious reading of `ConfiguredVelocity` —
+double-scales the preconditioned variant. It fails at t = 0 with 0.18 error while
+the legacy parameterization still matches, which is how the mistake was found.
+The host feeds raw `x`; the device does the rest.
+
 ## Status at pause (2026-10-25)
 
 `experiments/audio-1m-cuda-02/run-80k-c4000-b8` is the first run on the full corpus: 62 recordings
@@ -318,11 +360,16 @@ deleting a directory while the previous process is still alive.
 
 Open items, in the order the measurements point at them:
 
-* **The CPU sampler is now the bottleneck for anything interactive**: 72 s to produce a 4 s take at
-  16 flow steps, 145 s at 32, 221 s for a protected-prefix continuation — all while the GPU idles.
-  The training step itself costs 52 ms. A device-resident sampler (the trainer already holds every
-  weight and the flow's velocity evaluation is the same kernel set) is the obvious next piece of
-  work, and it would also make the in-training previews nearly free instead of half the wall clock.
+* **In-training previews still sample on the CPU.** `generate`/`continue`/`inpaint`/`variation` now
+  run the field on the device (below), but `train` still calls `flow::sample` with the CPU field, so
+  508 s of the 1,016 s run above was previews. Note that this must be a *second* resident trainer
+  with its weights uploaded per preview, not the training trainer: reusing it would leave the
+  sampler's statistics in the deferred readback, and the next step would report the sampler's loss —
+  the same failure class as the step-2 bug fixed above.
+* A device field evaluation currently pays for a backward pass it does not need
+  (`step(update = false)`): 7.6 ms per evaluation against roughly 2.5 ms for a forward-only entry.
+  At 64 evaluations per take that is 0.58 s versus about 0.2 s — worth doing only once previews
+  move to the device, where it would matter 5 times per run rather than once per command.
 * The residual error sits at t ≈ 0.9 (0.285 MSE versus 0.040 at t = 0.1); if that matters, it is a
   loss-weighting question rather than a capacity one, since validation stopped improving after
   1,000 steps at both 1.018 M and 1.215 M parameters.

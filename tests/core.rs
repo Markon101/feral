@@ -306,6 +306,7 @@ fn actual_training_checkpoint_reload_full_resume_and_determinism() {
                 ..Default::default()
             },
             mode,
+            backend: "cpu".into(),
             max_input_seconds: 600.,
         })
         .unwrap();

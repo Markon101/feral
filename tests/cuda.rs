@@ -114,6 +114,58 @@ fn baseline_cuda_update_matches_cpu() {
 }
 
 #[test]
+fn device_sampler_field_matches_cpu() {
+    // The device sampler evaluates the same field by feeding x as both clean and noise, which the
+    // trainer turns into x_t = x for every position. That is only exact when the solver's x already
+    // equals the known samples wherever the mask is set, which conditioning::project guarantees.
+    use feral::model::Velocity as _;
+    let n = 68usize;
+    let model = tiny();
+    let adam = Adam::new(model.count(), 0.0003);
+    let known: Vec<f32> = (0..n).map(|i| 0.2 * (i as f32 * 0.11).cos()).collect();
+    let free: Vec<f32> = (0..n).map(|i| 0.3 * (i as f32 * 0.05).sin()).collect();
+    let mut mask = vec![0f32; n];
+    mask[..n / 4].fill(1.);
+    let x: Vec<f32> = (0..n)
+        .map(|i| if mask[i] == 1. { known[i] } else { free[i] })
+        .collect();
+
+    for flow in [
+        FlowConfig::Velocity,
+        FlowConfig::Preconditioned {
+            data_scale: 0.1,
+            prior_std: 1.,
+        },
+    ] {
+        let trainer = feral::cuda::CudaTrainer::new(&model, &adam, n, 1, flow.clone())
+            .expect("CUDA device unavailable; this test only runs on a CUDA machine");
+        let device =
+            feral::sampler::DeviceVelocity::new(Box::new(trainer), &flow, n, model.block())
+                .expect("device sampler");
+        let cpu = feral::parameterization::ConfiguredVelocity {
+            model: &model,
+            config: &flow,
+        };
+        for t in [0., 0.37, 1.] {
+            let expected = cpu.velocity(&x, &known, &mask, t);
+            let actual = device
+                .try_velocity(&x, &known, &mask, t)
+                .expect("device field");
+            let scale = expected.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let max = expected
+                .iter()
+                .zip(&actual)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                max <= 1e-4 + 1e-3 * scale,
+                "field parity for {flow:?} at t={t}: max abs delta {max}"
+            );
+        }
+    }
+}
+
+#[test]
 fn reported_loss_lags_one_step_and_is_never_zero() {
     // The resident backend defers its statistics readback so a step boundary never drains the
     // device, which makes the reported loss belong to the previous step. It must still be a real

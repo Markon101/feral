@@ -206,6 +206,9 @@ struct RenderArgs {
     /// Unknown-side smoothing in samples; 0 disables it.
     #[arg(long, default_value_t = 128)]
     collar: usize,
+    /// Velocity-field backend for sampling: cpu (reference) or cuda (same field on device).
+    #[arg(long, default_value = "cpu")]
+    backend: String,
 }
 impl RenderArgs {
     fn config(self, mode: Mode) -> RenderConfig {
@@ -217,6 +220,7 @@ impl RenderArgs {
             seconds: self.seconds,
             start: self.start,
             end: self.end,
+            backend: self.backend,
             sampling: Sampling {
                 seed: self.seed,
                 steps: self.flow_steps,

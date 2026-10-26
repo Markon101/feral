@@ -155,6 +155,11 @@ pub trait Velocity {
     }
     fn block(&self) -> usize;
     fn velocity(&self, x: &[f32], known: &[f32], mask: &[f32], t: f32) -> Vec<f32>;
+    /// Fallible field evaluation. The CPU reference cannot fail, but an accelerator can (driver
+    /// error, window mismatch); a sampler must report that instead of panicking or continuing.
+    fn try_velocity(&self, x: &[f32], known: &[f32], mask: &[f32], t: f32) -> Result<Vec<f32>> {
+        Ok(self.velocity(x, known, mask, t))
+    }
 }
 pub struct Tape {
     features: Vec<f32>,

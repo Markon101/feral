@@ -586,10 +586,18 @@ pub struct RenderConfig {
     pub end: f32,
     pub sampling: Sampling,
     pub mode: Mode,
+    /// Velocity-field backend for sampling: `cpu` is the reference, `cuda` evaluates the same
+    /// field on the device. Never a silent fallback - an unavailable backend is a hard error.
+    pub backend: String,
 }
 pub fn render(c: RenderConfig) -> Result<()> {
     let ck = Checkpoint::load(&c.checkpoint)?;
     c.sampling.validate()?;
+    ensure!(
+        ["cpu", "cuda"].contains(&c.backend.as_str()),
+        "sampling backend must be cpu or cuda, got {}",
+        c.backend
+    );
     ensure!(
         !c.output.exists() && !c.output.with_extension("json").exists(),
         "output or metadata already exists; choose a new name"
@@ -682,7 +690,7 @@ pub fn render(c: RenderConfig) -> Result<()> {
     mask.resize(n, 0.);
     // Variation uses explicit protected anchors and the same masked flow path.
     let now = Instant::now();
-    let mut output = if matches!(c.mode, Mode::Variation) {
+    if matches!(c.mode, Mode::Variation) {
         // Experimental disconnected anchors; training uses contiguous mask patterns.
         let stride = (sr as usize / 32).max(block);
         for (i, m) in mask.iter_mut().take(output_len).enumerate() {
@@ -690,9 +698,34 @@ pub fn render(c: RenderConfig) -> Result<()> {
                 *m = 1.;
             }
         }
-        flow::sample(&ck.velocity(), &known, &mask, &c.sampling)?
-    } else {
-        flow::sample(&ck.velocity(), &known, &mask, &c.sampling)?
+    }
+    let mut output = match c.backend.as_str() {
+        "cpu" => flow::sample(&ck.velocity(), &known, &mask, &c.sampling)?,
+        "cuda" => {
+            #[cfg(feature = "cuda")]
+            {
+                // One resident trainer for the whole trajectory: the weights upload once, and each
+                // field evaluation is a forward pass on the device.
+                let placeholder_adam = Adam::new(ck.model.count(), ck.adam.lr);
+                let trainer = crate::cuda::CudaTrainer::new(
+                    &ck.model,
+                    &placeholder_adam,
+                    n,
+                    1,
+                    ck.flow.clone(),
+                )?;
+                let field =
+                    crate::sampler::DeviceVelocity::new(Box::new(trainer), &ck.flow, n, block)?;
+                flow::sample(&field, &known, &mask, &c.sampling)?
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                anyhow::bail!(
+                    "CUDA sampling was requested but not compiled; cargo build --locked --offline --release --features cuda -j 8"
+                )
+            }
+        }
+        other => anyhow::bail!("sampling backend must be cpu or cuda, got {other}"),
     };
     let sampling_ms = now.elapsed().as_secs_f64() * 1000.;
     let jumps = conditioning::boundary_jumps(&output[..output_len], &mask[..output_len]);
@@ -708,7 +741,7 @@ pub fn render(c: RenderConfig) -> Result<()> {
     audio::write_wav(&c.output, &all, sr)?;
     write_json(
         &c.output.with_extension("json"),
-        &serde_json::json!({"project":"FERAL","mode":match c.mode{Mode::Generate=>"generate",Mode::Continue=>"continue",Mode::Inpaint=>"inpaint",Mode::Variation=>"variation-masked-anchors"},"checkpoint":c.checkpoint,"checkpoint_sha256":data::hash_file(&c.checkpoint)?,"model_hash":ck.model_hash,"flow":ck.flow,"training_steps":ck.completed_steps,"git_commit":git(&["rev-parse","HEAD"]),"input":c.input,"input_sha256":input_hash,"preprocess":p,"sampling":c.sampling,"sample_rate":sr,"output_samples":all.len(),"window_offset_samples":offset,"inpaint_start":c.start,"inpaint_end":c.end,"preprocessing_ms":preprocess_ms,"sampling_ms":sampling_ms,"peak_rss_kib":peak_rss_kib(),"protected_samples_exact":preserved,"boundary_jumps":jumps,"rms":audio::rms(&all),"output_sha256":data::hash_file(&c.output)?}),
+        &serde_json::json!({"project":"FERAL","mode":match c.mode{Mode::Generate=>"generate",Mode::Continue=>"continue",Mode::Inpaint=>"inpaint",Mode::Variation=>"variation-masked-anchors"},"checkpoint":c.checkpoint,"checkpoint_sha256":data::hash_file(&c.checkpoint)?,"model_hash":ck.model_hash,"flow":ck.flow,"training_steps":ck.completed_steps,"git_commit":git(&["rev-parse","HEAD"]),"input":c.input,"input_sha256":input_hash,"preprocess":p,"sampling":c.sampling,"sampling_backend":c.backend,"sample_rate":sr,"output_samples":all.len(),"window_offset_samples":offset,"inpaint_start":c.start,"inpaint_end":c.end,"preprocessing_ms":preprocess_ms,"sampling_ms":sampling_ms,"peak_rss_kib":peak_rss_kib(),"protected_samples_exact":preserved,"boundary_jumps":jumps,"rms":audio::rms(&all),"output_sha256":data::hash_file(&c.output)?}),
     )?;
     eprintln!(
         "wrote {} | {:.1} ms sampling | protected exact={}",

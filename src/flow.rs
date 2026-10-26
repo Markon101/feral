@@ -84,7 +84,7 @@ fn field<M: Velocity + ?Sized>(
     c: &Sampling,
     texture: &[f32],
 ) -> Result<Vec<f32>> {
-    let mut v = model.velocity(x, known, mask, t);
+    let mut v = model.try_velocity(x, known, mask, t)?;
     ensure!(v.len() == x.len(), "backend output shape mismatch");
     for (i, y) in v.iter_mut().enumerate() {
         *y = (*y + c.perturb * (std::f32::consts::PI * t).sin() * texture[i].tanh())
