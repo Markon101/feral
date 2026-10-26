@@ -316,6 +316,14 @@ the number that moved. `audit.json` in that run directory passes every gate agai
 reference (386.6x, 6.3e-6 aligned loss difference, 1.8e-7 parameter drift, exact device resume and
 CPU continuation), which also covers the forward/backward refactor below.
 
+Held-out evaluation on the same 384 probes improves from 0.1277 at 10 k to 0.1050 at 50 k (-18 %).
+
+Four 4 s takes and one continue take from this checkpoint (seeds 101–104 and 201, 32 Heun steps)
+are the `take50k-*`/`continue50k-*` files in `experiments/big-1m4-c4000/takes/`, produced in
+0.29–0.39 s each. The copying screen is unchanged from the 10 k takes — nearest absolute
+correlation 0.059–0.123 against a noise control of 0.032 — so 40,000 more steps did not make the
+model more likely to reproduce the corpus by this measure.
+
 ## Sampling on the device (250x faster, same trajectory)
 
 The run above spent 508 s of its 1,016 s wall clock in the CPU sampler, so the next
