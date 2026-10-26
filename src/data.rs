@@ -89,6 +89,8 @@ pub fn select(input: &Path) -> Result<Vec<PathBuf>> {
     );
     Ok(paths)
 }
+/// Largest decoded corpus held in host memory, in samples.
+pub const MAX_DATASET_SAMPLES: usize = 256_000_000;
 impl Dataset {
     pub fn load(input: &Path, p: Preprocess, crop: usize) -> Result<Self> {
         let mut audio = vec![];
@@ -111,7 +113,15 @@ impl Dataset {
             match result {
                 Ok((x, s)) => {
                     total += x.len();
-                    ensure!(total<=32_000_000,"decoded dataset exceeds 128 MB; reduce --max-file-seconds or file selection");
+                    // 256 M samples is 1 GB of f32 at 16 kHz (about 4.4 hours): enough for the whole
+                    // local corpus inside the 3 GB host ceiling, while still refusing a decode that
+                    // would blow it. Long corpora are a desktop configuration; a phone run should
+                    // select fewer files or a shorter --max-file-seconds.
+                    ensure!(
+                        total <= MAX_DATASET_SAMPLES,
+                        "decoded dataset exceeds {} MB; reduce --max-file-seconds or file selection",
+                        MAX_DATASET_SAMPLES * 4 / 1_000_000
+                    );
                     audio.push(x);
                     sources.push(s);
                 }

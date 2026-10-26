@@ -123,9 +123,13 @@ struct TrainArgs {
     /// Crops per optimizer step; loss and gradients are averaged over the batch.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(usize))]
     batch: usize,
-    /// Residual branch count for --network baseline (dilations 1,2,4,8,16,...; max 7).
+    /// Residual branch count for --network baseline (dilations 1,2,4,...; max 10).
     #[arg(long, default_value_t = 4, value_parser = parse_blocks)]
     blocks: usize,
+    /// Samples per frame before the first convolution (16/32/64/128). Larger frames are cheaper
+    /// per sample and multiply the receptive field by the same factor.
+    #[arg(long, default_value_t = 32, value_parser = parse_frame_samples)]
+    block: usize,
     /// Optional held-out corpus for periodic validation (never overlapping train crops).
     #[arg(long)]
     validation: Option<PathBuf>,
@@ -235,10 +239,18 @@ impl RenderArgs {
 }
 fn parse_blocks(value: &str) -> std::result::Result<usize, String> {
     let blocks = value.parse::<usize>().map_err(|e| e.to_string())?;
-    if (1..=7).contains(&blocks) {
+    if (1..=10).contains(&blocks) {
         Ok(blocks)
     } else {
-        Err("blocks must be 1..7 (dilations 1,2,4,8,16,32,64)".into())
+        Err("blocks must be 1..10 (dilations 1..512)".into())
+    }
+}
+fn parse_frame_samples(value: &str) -> std::result::Result<usize, String> {
+    let block = value.parse::<usize>().map_err(|e| e.to_string())?;
+    if [16, 32, 64, 128].contains(&block) {
+        Ok(block)
+    } else {
+        Err("block must be 16, 32, 64 or 128 samples per frame".into())
     }
 }
 
@@ -355,7 +367,8 @@ fn main() -> Result<()> {
                 } else {
                     Architecture::default().with_blocks(a.blocks)?
                 })
-                .with_width(a.width)?,
+                .with_width(a.width)?
+                .with_frame_samples(a.block)?,
             })?;
         }
         Commands::Generate(a) => runtime::render(a.config(Mode::Generate))?,

@@ -205,7 +205,7 @@ impl Checkpoint {
         ensure!(
             (8000..=48000).contains(&c.sample_rate)
                 && c.crop_samples >= 32
-                && c.crop_samples <= 160000
+                && c.crop_samples <= crate::model::MAX_WINDOW_SAMPLES
                 && c.crop_samples.is_multiple_of(c.model.architecture.block),
             "invalid checkpoint audio configuration"
         );
@@ -305,8 +305,11 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     // bound is a memory/context guard rather than a speed limit: 4 s at 16 kHz is 64k samples per
     // crop, which still fits the phone and desktop resident budgets at the documented batch sizes.
     ensure!(
-        c.crop_seconds.is_finite() && (0.032..=4.).contains(&c.crop_seconds),
-        "crop seconds must be 0.032..4"
+        c.crop_seconds.is_finite()
+            && (0.032..=32.).contains(&c.crop_seconds)
+            && (c.crop_seconds * c.preprocess.sample_rate as f32) as usize
+                <= crate::model::MAX_WINDOW_SAMPLES,
+        "crop seconds must be 0.032..32 and fit the maximum window"
     );
     ensure!(
         c.lr.is_finite() && c.lr > 0. && c.lr <= 0.01,
@@ -694,8 +697,8 @@ pub fn render(c: RenderConfig) -> Result<()> {
         Mode::Variation => {
             let x = input.context("variation needs --input")?;
             ensure!(
-                x.len() <= 160000,
-                "variation limited to 160000 samples; crop source first"
+                x.len() <= crate::model::MAX_WINDOW_SAMPLES,
+                "variation limited to the maximum window; crop source first"
             );
             let n = x.len();
             (x, vec![0.; n], n, 0)
@@ -740,8 +743,8 @@ pub fn render(c: RenderConfig) -> Result<()> {
     let preprocess_ms = start_time.elapsed().as_secs_f64() * 1000.;
     let n = known.len().div_ceil(block) * block;
     ensure!(
-        n <= 160000,
-        "conditioned window exceeds 160000 samples; request a shorter interval"
+        n <= crate::model::MAX_WINDOW_SAMPLES,
+        "conditioned window exceeds the maximum window; request a shorter interval"
     );
     known.resize(n, 0.);
     mask.resize(n, 0.);

@@ -250,8 +250,20 @@ feral train --backend cuda --batch 4 --width 256 --blocks 5 \
 
 Forward/backward, clipping and Adam stay resident on the device in fp32 with `fmad` disabled;
 `--batch` and `--validation` are backend-neutral runtime features. Discovery, kernel-load or
-launch failure is an error, never silent CPU fallback. `--blocks` selects 1..7 power-of-two
+launch failure is an error, never silent CPU fallback. `--blocks` selects 1..10 power-of-two
 dilations for the baseline stack (5 at width 256 is 1,018,400 parameters).
+
+`--block` sets samples per frame (16/32/64/128) and `--crop-seconds` accepts up to 32; together they
+decide the receptive field as `block * (1 + 2 * sum(dilations))`. The default 32 with four blocks is
+0.254 s at 16 kHz; `--block 128 --blocks 8` is 4.09 s and `--block 128 --blocks 10` is 16.4 s. Larger
+frames are cheaper per sample (convolution cost scales with frames), which is what makes a wider,
+longer-context model affordable.
+
+Long-context configurations are checked the same way as any other: `--block 128` changes the feature
+layout and exercises 128-frame dilations, so `tests/cuda.rs::large_frame_and_wide_dilation_parity`
+pins loss, gradient and prediction parity there, and `gpu-audit` passes on a checkpoint built at the
+new shapes.
+
 Sampling runs on the device as well: `generate`, `continue`, `inpaint` and `variation` accept
 `--backend cuda`, and training previews follow the training backend. On the 1,215,264-parameter run a
 4 s take at 32 Heun steps drops from 144.6 s to 0.30 s with max |delta| 2.4e-7 against the CPU
@@ -263,7 +275,7 @@ run (GTX 1080 Ti: 51.1 steps/s at batch 4, held-out validation 1.1958 -> 0.0439)
 ## Controlled scaling experiments
 
 `train --width 128` selects 214,176 parameters (the default 64 stays 57,952). CLI
-widths 32..256 in multiples of 16 are supported; resume must repeat the checkpoint width.
+widths 32..512 in multiples of 16 are supported; resume must repeat the checkpoint width.
 This is a capacity control, not a claim that a bigger model makes music.
 
 `scripts/prepare_scaling_data.py` creates sample-exact audio-window manifests with

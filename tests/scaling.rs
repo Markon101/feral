@@ -102,7 +102,7 @@ fn scaled_networks_have_correct_shapes_gradients_and_updates() {
 
 #[test]
 fn training_width_rejects_unsupported_sizes_before_input_io() {
-    for width in ["0", "16", "33", "127", "257", "512", "NaN"] {
+    for width in ["0", "16", "33", "127", "257", "528", "NaN"] {
         let output = Command::new(env!("CARGO_BIN_EXE_feral"))
             .args([
                 "train",
@@ -118,13 +118,49 @@ fn training_width_rejects_unsupported_sizes_before_input_io() {
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("--width"));
     }
-    for width in [32, 48, 64, 128, 256] {
+    for width in [32, 48, 64, 128, 256, 512] {
         assert!(Architecture::default().with_width(width).is_ok());
     }
+    // `validate` bounds the size (1..=512) and stays permissive for the tiny architectures the
+    // numerical tests use; the multiple-of-16 training rule lives in `with_width`, which the CLI
+    // parsing above exercises.
+    for width in [513, 1024] {
+        assert!(Architecture {
+            width,
+            ..Architecture::default()
+        }
+        .validate()
+        .is_err());
+    }
+}
+
+#[test]
+fn frame_samples_and_dilations_cover_the_long_context_range() {
+    // Frames trade time resolution for context: convolution cost scales with frames, so a larger
+    // block is cheaper per sample and multiplies the receptive field by the same factor.
+    assert!(Architecture::default().with_frame_samples(16).is_ok());
+    assert!(Architecture::default().with_frame_samples(128).is_ok());
+    for block in [8, 256] {
+        assert!(Architecture::default().with_frame_samples(block).is_err());
+    }
+    for blocks in [1usize, 7, 8, 10] {
+        assert!(Architecture::default().with_blocks(blocks).is_ok());
+    }
+    assert!(Architecture::default().with_blocks(11).is_err());
     assert!(Architecture {
-        width: 257,
+        dilations: vec![1, 1024],
         ..Architecture::default()
     }
     .validate()
     .is_err());
+
+    // The receptive field the context plan is built on.
+    let baseline = Architecture::default().with_blocks(6).unwrap();
+    assert_eq!(baseline.context_samples(), 4064); // 0.254 s
+    let long = Architecture::default()
+        .with_frame_samples(128)
+        .unwrap()
+        .with_blocks(8)
+        .unwrap();
+    assert_eq!(long.context_samples(), 65_408); // 4.088 s
 }

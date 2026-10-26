@@ -467,6 +467,49 @@ What this does not say: descriptors are not perceptual quality, and the screen i
 evidence supports "the model learned audio structure, is seed-diverse, conditions correctly and is
 too bright", not "it sounds good". Listening is still the only test for the latter.
 
+## The receptive field was the ceiling (0.254 s)
+
+The 29-take test above showed audio-shaped output that is too bright and has no long-range
+structure. The reason is structural, not an optimisation shortfall: `Architecture::context_samples`
+for the trained stack is 4,064 samples, i.e. **0.254 s at 16 kHz**. Whatever the crop length, an
+output sample cannot depend on anything further away than that.
+
+| architecture | receptive field |
+| --- | --- |
+| baseline 6 blocks, block 32 (everything trained so far) | 4,064 samples / 0.254 s |
+| baseline 7 blocks, block 32 (previous CLI maximum) | 8,160 / 0.510 s |
+| pyramid as shipped (scales 1/4/16/64) | 7,488 / 0.468 s |
+| block 128, 8 dilations (probe below) | 65,408 / 4.088 s |
+| block 128, 10 dilations (new maximum) | 262,016 / 16.376 s |
+
+So the caps had to move before any of "more capacity" or "longer crops" could mean anything:
+`--block` now sets 16..128 samples per frame, widths run to 512, dilations to 512 across up to 10
+layers, and crops to 32 s through one shared constant (`MAX_WINDOW_SAMPLES = 512_000`) used by
+checkpoint validation, crop validation, previews and render windows alike.
+
+Larger frames are also how this is paid for. Convolution cost scales with *frames*, so block 128
+gives 4x fewer frames per sample; that is what makes width 512 affordable instead of four times
+slower.
+
+Probe at the intended shape — block 128, 8 dilations, width 512, 16 s crops x batch 2 (512 k
+samples/step, the same sample budget as today):
+
+| quantity | value |
+| --- | --- |
+| parameters | 6,560,384 (5.4x the trained model) |
+| step time | mean 125.2 ms, median 130.7 ms |
+| device memory | 420 MB resident of an 8 GiB budget |
+| host peak RSS | 538 MB |
+| loss, 20 steps from scratch | 1.312 → 0.640 |
+
+Correctness at the new shapes was checked twice, because block 128 changes the feature layout to
+388 channels per frame and exercises a 128-frame dilation in the kernels:
+
+* `tests/cuda.rs::large_frame_and_wide_dilation_parity` — loss, gradient and prediction parity
+  against the CPU reference at block 128 with dilations 1..128;
+* a full `gpu-audit` on a small checkpoint built at the new shapes: every gate passes, gradients and
+  Adam match, device resume is exact, 16.74x on that reference workload.
+
 ## Status at pause (2026-10-25)
 
 `experiments/audio-1m-cuda-02/run-80k-c4000-b8` is the first run on the full corpus: 62 recordings

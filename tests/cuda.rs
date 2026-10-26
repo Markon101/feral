@@ -114,6 +114,74 @@ fn baseline_cuda_update_matches_cpu() {
 }
 
 #[test]
+fn large_frame_and_wide_dilation_parity() {
+    use feral::model::Velocity as _;
+    // The context plan raises block to 128 (388 feature channels per frame) and dilations to 128.
+    // Both change kernel indexing, so check them against the CPU reference at a size that stays
+    // fast: width 5, block 128, dilations 1..128.
+    let n = 1024usize;
+    let model = Model::new(
+        Architecture {
+            block: 128,
+            width: 5,
+            dilations: vec![1, 2, 4, 8, 16, 32, 64, 128],
+            scales: vec![],
+        },
+        7,
+    );
+    // 128 frames of block 128 across dilations 1..128: a 4.1 s field at 16 kHz.
+    assert_eq!(model.architecture.context_samples(), 65_408);
+    let flow = FlowConfig::Velocity;
+    let adam = Adam::new(model.count(), 0.0003);
+    let mut device = feral::cuda::CudaTrainer::new(&model, &adam, n, 1, flow.clone())
+        .expect("CUDA device unavailable; this test only runs on a CUDA machine");
+
+    let clean: Vec<f32> = (0..n).map(|i| 0.2 * (i as f32 * 0.13).sin()).collect();
+    let noise: Vec<f32> = (0..n).map(|i| 0.1 * ((i * 7 % 11) as f32 - 5.)).collect();
+    let mut mask = vec![0f32; n];
+    mask[..n / 3].fill(1.);
+    let t = 0.37f32;
+
+    let (cpu_loss, cpu_grad) =
+        parameterization::loss_gradient(&model, &flow, &clean, &mask, &noise, t);
+    let step = device
+        .step(&clean, &mask, &noise, &[t], false)
+        .expect("device forward/backward at block 128");
+    let gpu_grad = device.read_gradients().expect("read gradients");
+    let gpu_pred = device.read_prediction().expect("read prediction");
+
+    assert!(
+        (cpu_loss - step.loss).abs() <= 1e-4 + 1e-3 * cpu_loss.abs(),
+        "loss parity at block 128: cpu {cpu_loss} device {}",
+        step.loss
+    );
+    let grad_max = cpu_grad
+        .iter()
+        .zip(&gpu_grad)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(grad_max <= 1e-4, "gradient parity at block 128: {grad_max}");
+    // The device builds x_t from clean/noise and feeds clean*mask as the known feature, which is
+    // exactly `Model::velocity(x_t, clean, mask, t)`.
+    let x_t: Vec<f32> = clean
+        .iter()
+        .zip(&noise)
+        .zip(&mask)
+        .map(|((&y, &z), &m)| if m == 1. { y } else { (1. - t) * z + t * y })
+        .collect();
+    let pred_max = model
+        .velocity(&x_t, &clean, &mask, t)
+        .iter()
+        .zip(&gpu_pred)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(
+        pred_max <= 1e-4,
+        "prediction parity at block 128: {pred_max}"
+    );
+}
+
+#[test]
 fn device_sampler_field_matches_cpu() {
     // The device sampler evaluates the same field by feeding x as both clean and noise, which the
     // trainer turns into x_t = x for every position. That is only exact when the solver's x already

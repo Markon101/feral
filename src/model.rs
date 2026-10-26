@@ -4,6 +4,9 @@ use crate::rng::Rng;
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 
+/// Largest window any backend may be asked to hold: 32 s at 16 kHz. Crops, render windows and
+/// previews all refer to this, so a checkpoint cannot describe a window that training rejects.
+pub const MAX_WINDOW_SAMPLES: usize = 512_000;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Architecture {
     pub block: usize,
@@ -27,10 +30,22 @@ impl Architecture {
     /// Small custom architectures remain valid for numerical-reference tests.
     pub fn with_width(mut self, width: usize) -> Result<Self> {
         ensure!(
-            (32..=256).contains(&width) && width.is_multiple_of(16),
-            "training width must be a multiple of 16 between 32 and 256"
+            (32..=512).contains(&width) && width.is_multiple_of(16),
+            "training width must be a multiple of 16 between 32 and 512"
         );
         self.width = width;
+        self.validate()?;
+        Ok(self)
+    }
+    /// Samples per frame. The stride trades time resolution for context: convolution cost scales
+    /// with frames, so a larger block is cheaper per sample and multiplies the receptive field by
+    /// the same factor.
+    pub fn with_frame_samples(mut self, block: usize) -> Result<Self> {
+        ensure!(
+            [16, 32, 64, 128].contains(&block),
+            "frame samples must be 16, 32, 64 or 128"
+        );
+        self.block = block;
         self.validate()?;
         Ok(self)
     }
@@ -38,8 +53,8 @@ impl Architecture {
     /// four blocks are the v1 baseline; five at width 256 is the ~1.02M-parameter configuration.
     pub fn with_blocks(mut self, blocks: usize) -> Result<Self> {
         ensure!(
-            (1..=7).contains(&blocks),
-            "block count must be 1..7 (dilations up to 64)"
+            (1..=10).contains(&blocks),
+            "block count must be 1..10 (dilations up to 512)"
         );
         ensure!(
             self.dilations.len() == Self::default().dilations.len() && self.scales.is_empty(),
@@ -78,13 +93,13 @@ impl Architecture {
     }
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            (1..=64).contains(&self.block) && (1..=256).contains(&self.width),
+            (1..=128).contains(&self.block) && (1..=512).contains(&self.width),
             "invalid model size"
         );
         ensure!(
             !self.dilations.is_empty()
-                && self.dilations.len() <= 8
-                && self.dilations.iter().all(|d| (1..=64).contains(d)),
+                && self.dilations.len() <= 10
+                && self.dilations.iter().all(|d| (1..=512).contains(d)),
             "invalid dilations"
         );
         ensure!(

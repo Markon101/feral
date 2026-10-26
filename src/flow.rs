@@ -111,8 +111,8 @@ pub fn sample<M: Velocity + ?Sized>(
         !known.is_empty()
             && known.len() == mask.len()
             && known.len().is_multiple_of(model.block())
-            && known.len() <= 160000,
-        "invalid sample shape or >160000 samples"
+            && known.len() <= crate::model::MAX_WINDOW_SAMPLES,
+        "invalid sample shape or beyond the maximum window",
     );
     ensure!(
         known.iter().all(|v| v.is_finite()) && mask.iter().all(|&m| m == 0. || m == 1.),

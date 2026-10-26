@@ -318,7 +318,9 @@ impl CudaTrainer {
         model.validate()?;
         flow.validate()?;
         ensure!(
-            n > 0 && n <= 160000 && n.is_multiple_of(model.architecture.block),
+            n > 0
+                && n <= crate::model::MAX_WINDOW_SAMPLES
+                && n.is_multiple_of(model.architecture.block),
             "invalid CUDA crop size"
         );
         ensure!((1..=64).contains(&items), "CUDA batch size must be 1..64");
