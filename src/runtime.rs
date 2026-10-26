@@ -238,6 +238,49 @@ fn evaluation(model: &Model, flow: &FlowConfig, dataset: &Dataset, n: usize) -> 
     }
     sum / 4.
 }
+/// Previews and the final take use the same backend as training. On an accelerator this builds a
+/// second resident trainer instead of reusing the training one: reusing it would leave the
+/// sampler's statistics in its deferred readback, and the next step would report the sampler's
+/// loss. The weights upload once per sample (a few MB), which is far cheaper than the CPU field.
+fn preview_sample(
+    ck: &Checkpoint,
+    c: &TrainConfig,
+    sampling: &Sampling,
+    n: usize,
+) -> Result<Vec<f32>> {
+    let zeros = vec![0.; n];
+    match c.backend.as_str() {
+        "cuda" => {
+            #[cfg(feature = "cuda")]
+            {
+                let placeholder_adam = Adam::new(ck.model.count(), ck.adam.lr);
+                let trainer = crate::cuda::CudaTrainer::new(
+                    &ck.model,
+                    &placeholder_adam,
+                    n,
+                    1,
+                    ck.flow.clone(),
+                )?;
+                let field = crate::sampler::DeviceVelocity::new(
+                    Box::new(trainer),
+                    &ck.flow,
+                    n,
+                    ck.model.architecture.block,
+                )?;
+                flow::sample(&field, &zeros, &zeros, sampling)
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = (&zeros, sampling);
+                anyhow::bail!(
+                    "CUDA previews were requested but not compiled; cargo build --locked --offline --release --features cuda -j 8"
+                )
+            }
+        }
+        // cpu, and opencl which has no sampled field of its own: the reference path.
+        _ => flow::sample(&ck.velocity(), &zeros, &zeros, sampling),
+    }
+}
 pub fn train(c: TrainConfig) -> Result<PathBuf> {
     ensure!(
         (1..=100000).contains(&c.steps),
@@ -350,10 +393,9 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         steps: 16,
         ..Default::default()
     };
-    let zeros = vec![0.; n];
     let mut sampling_ms = 0.;
     let start = Instant::now();
-    let initial_audio = flow::sample(&ck.velocity(), &zeros, &zeros, &sample_config)?;
+    let initial_audio = preview_sample(&ck, &c, &sample_config, n)?;
     sampling_ms += start.elapsed().as_secs_f64() * 1000.;
     audio::write_wav(
         &c.run.join("untrained-or-resumed-initial.wav"),
@@ -508,7 +550,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         }
         if local % c.preview_every == 0 {
             let now = Instant::now();
-            let x = flow::sample(&ck.velocity(), &zeros, &zeros, &sample_config)?;
+            let x = preview_sample(&ck, &c, &sample_config, n)?;
             sampling_ms += now.elapsed().as_secs_f64() * 1000.;
             audio::write_wav(
                 &c.run.join(format!("preview-{:06}.wav", ck.completed_steps)),
@@ -544,7 +586,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         val_curve.push(final_entry);
     }
     let now = Instant::now();
-    let final_audio = flow::sample(&ck.velocity(), &zeros, &zeros, &sample_config)?;
+    let final_audio = preview_sample(&ck, &c, &sample_config, n)?;
     let final_sampling_ms = now.elapsed().as_secs_f64() * 1000.;
     audio::write_wav(&c.run.join("generated.wav"), &final_audio, ck.sample_rate)?;
     let delta = initial_audio
@@ -558,7 +600,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     step_ms.sort_by(|a, b| a.total_cmp(b));
     write_json(
         &c.run.join("metrics.json"),
-        &serde_json::json!({"backend":trainer.name(),"backend_info":trainer.info(),"timing_scope":match c.backend.as_str(){"cpu"=>"CPU wall operations","cuda"=>"host wall time around synchronized CUDA kernel groups; includes payload upload",_=>"GPU event operation totals; step wall includes transfers, enqueue and sync"},"flow":ck.flow,"loss_units":if ck.flow.is_legacy(){"waveform velocity MSE"}else{"normalized Gaussian-residual MSE"},"parameters":ck.model.count(),"steps":c.steps,"total_steps":ck.completed_steps,"preprocessing_ms":preprocessing_ms,"neural_forward_backward_ms":neural_ms,"optimizer_ms":optimizer_ms,"training_wall_ms_with_previews":training_wall_ms,"step_mean_ms":step_ms.iter().sum::<f64>()/step_ms.len() as f64,"step_median_ms":step_ms[step_ms.len()/2],"step_max_ms":step_ms.last(),"final_sampling_ms":final_sampling_ms,"other_sampling_ms":sampling_ms,"sampling":sample_config,"batch":c.batch,"samples_per_step":n*c.batch,"steps_per_second":c.steps as f64/(training_wall_ms/1000.).max(1e-9),"validation_input":c.validation,"validation_initial_loss":initial_val,"validation_final_loss":final_val,"validation_curve":val_curve,"peak_rss_kib":peak_rss_kib(),"fixed_probe_initial_loss":initial_eval,"fixed_probe_final_loss":final_eval,"same_noise_output_mse_change":delta,"generated_rms":audio::rms(&final_audio),"task_counts":task_counts,"source_counts":source_counts,"silence_retries":silence_retries,"crop_sampling":"uniform file then uniform start; retry silent crops","quality_claim":"pipeline verification only; no perceptual quality or generalization established"}),
+        &serde_json::json!({"backend":trainer.name(),"backend_info":trainer.info(),"timing_scope":match c.backend.as_str(){"cpu"=>"CPU wall operations","cuda"=>"host wall time around synchronized CUDA kernel groups; includes payload upload",_=>"GPU event operation totals; step wall includes transfers, enqueue and sync"},"flow":ck.flow,"loss_units":if ck.flow.is_legacy(){"waveform velocity MSE"}else{"normalized Gaussian-residual MSE"},"parameters":ck.model.count(),"steps":c.steps,"total_steps":ck.completed_steps,"preprocessing_ms":preprocessing_ms,"neural_forward_backward_ms":neural_ms,"optimizer_ms":optimizer_ms,"training_wall_ms_with_previews":training_wall_ms,"step_mean_ms":step_ms.iter().sum::<f64>()/step_ms.len() as f64,"step_median_ms":step_ms[step_ms.len()/2],"step_max_ms":step_ms.last(),"final_sampling_ms":final_sampling_ms,"other_sampling_ms":sampling_ms,"sampling":sample_config,"sampling_backend":c.backend,"batch":c.batch,"samples_per_step":n*c.batch,"steps_per_second":c.steps as f64/(training_wall_ms/1000.).max(1e-9),"validation_input":c.validation,"validation_initial_loss":initial_val,"validation_final_loss":final_val,"validation_curve":val_curve,"peak_rss_kib":peak_rss_kib(),"fixed_probe_initial_loss":initial_eval,"fixed_probe_final_loss":final_eval,"same_noise_output_mse_change":delta,"generated_rms":audio::rms(&final_audio),"task_counts":task_counts,"source_counts":source_counts,"silence_retries":silence_retries,"crop_sampling":"uniform file then uniform start; retry silent crops","quality_claim":"pipeline verification only; no perceptual quality or generalization established"}),
     )?;
     eprintln!(
         "checkpoint {} | probe {:.6} -> {:.6} | output delta MSE {:.6}",

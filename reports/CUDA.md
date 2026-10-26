@@ -339,6 +339,31 @@ double-scales the preconditioned variant. It fails at t = 0 with 0.18 error whil
 the legacy parameterization still matches, which is how the mistake was found.
 The host feeds raw `x`; the device does the rest.
 
+### Previews inside `train`
+
+Training previews and the final take now sample on the training backend too, so the
+508 s of previews in the 10k run above become a rounding error. The sampler gets a
+*second* resident trainer built from the current checkpoint, not a borrow of the
+training one: a shared trainer would push the sampler's statistics into its deferred
+readback and the next step would report the sampler's loss — the same failure class
+as the step-2 bug fixed earlier. Weights upload once per sample (5 MB here).
+
+Two measurements, both against the CPU path on identical training:
+
+| configuration | previews | CPU path | device | speedup |
+| --- | --- | --- | --- | --- |
+| width 32, 2 blocks, 4 s crops, 40 steps, 3 previews | 3 | 1,785 ms | 282 ms | 6.3x |
+| width 256, 6 blocks (1.215 M), 4 s crops, 3 samples | 3 | 218 s | 1.40 s | 155x |
+
+The tiny model is the pessimistic case — its CPU step is only 2.8 ms, so the sampler
+was most of that run's wall clock (1,446 ms -> 441 ms end to end, 3.3x). At the real
+configuration the same three samples cost 72.6 s each on the CPU, which is exactly
+the 508 s the 10k run spent: that run would now take about 590 s instead of 1,016 s.
+
+The in-loop preview is the same audio, not merely similar: `preview-000020.wav` from
+the device-preview run against `feral generate --backend cpu` on the checkpoint that
+run wrote at step 20 gives max |Δ| 3.6e-7, correlation 1.00000000.
+
 ## Status at pause (2026-10-25)
 
 `experiments/audio-1m-cuda-02/run-80k-c4000-b8` is the first run on the full corpus: 62 recordings
@@ -360,16 +385,14 @@ deleting a directory while the previous process is still alive.
 
 Open items, in the order the measurements point at them:
 
-* **In-training previews still sample on the CPU.** `generate`/`continue`/`inpaint`/`variation` now
-  run the field on the device (below), but `train` still calls `flow::sample` with the CPU field, so
-  508 s of the 1,016 s run above was previews. Note that this must be a *second* resident trainer
-  with its weights uploaded per preview, not the training trainer: reusing it would leave the
-  sampler's statistics in the deferred readback, and the next step would report the sampler's loss —
-  the same failure class as the step-2 bug fixed above.
-* A device field evaluation currently pays for a backward pass it does not need
+* A device field evaluation still pays for a backward pass it does not need
   (`step(update = false)`): 7.6 ms per evaluation against roughly 2.5 ms for a forward-only entry.
-  At 64 evaluations per take that is 0.58 s versus about 0.2 s — worth doing only once previews
-  move to the device, where it would matter 5 times per run rather than once per command.
+  Both samplers now use it — 64 evaluations per take, so 0.58 s versus about 0.2 s — and previews
+  construct a trainer per sample. A forward-only entry would cut a take to ~0.2 s and drop the
+  per-preview trainer setup; it is the cheapest remaining win, ahead of any kernel work.
+* Checkpoints are written as pretty-printed decimal JSON, which is why one 1.215 M-parameter
+  checkpoint is 80 MB and why a 2-step run spends ~60 s writing artifacts. A compact binary or
+  `serde_json` without indentation would not change any number, only the I/O around them.
 * The residual error sits at t ≈ 0.9 (0.285 MSE versus 0.040 at t = 0.1); if that matters, it is a
   loss-weighting question rather than a capacity one, since validation stopped improving after
   1,000 steps at both 1.018 M and 1.215 M parameters.

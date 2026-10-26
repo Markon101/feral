@@ -251,13 +251,17 @@ Forward/backward, clipping and Adam stay resident on the device in fp32 with `fm
 `--batch` and `--validation` are backend-neutral runtime features. Discovery, kernel-load or
 launch failure is an error, never silent CPU fallback. `--blocks` selects 1..7 power-of-two
 dilations for the baseline stack (5 at width 256 is 1,018,400 parameters).
+Sampling runs on the device as well: `generate`, `continue`, `inpaint` and `variation` accept
+`--backend cuda`, and training previews follow the training backend. On the 1,215,264-parameter run a
+4 s take at 32 Heun steps drops from 144.6 s to 0.58 s with max |delta| 2.4e-7 against the CPU
+reference and identical protected samples.
 See [reports/CUDA.md](reports/CUDA.md) for the parity gates and the measured 1,018,400-parameter
 run (GTX 1080 Ti: 51.1 steps/s at batch 4, held-out validation 1.1958 -> 0.0439).
 
 ## Controlled scaling experiments
 
-`train --width 128` selects214,176 parameters (default64 stays57,952). CLI widths
-32..256 in multiples16 are supported; resume must repeat the checkpoint width.
+`train --width 128` selects 214,176 parameters (the default 64 stays 57,952). CLI
+widths 32..256 in multiples of 16 are supported; resume must repeat the checkpoint width.
 This is a capacity control, not a claim that a bigger model makes music.
 
 `scripts/prepare_scaling_data.py` creates sample-exact audio-window manifests with
