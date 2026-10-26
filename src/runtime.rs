@@ -153,12 +153,14 @@ pub fn source_hash() -> Result<String> {
     }
     Ok(format!("{:x}", h.finalize()))
 }
-/// Guard against absurd or untrusted files rather than a model-size limit. The
-/// largest architecture the CLI permits (width 256, 7 residual blocks) is about
-/// 1.61 M parameters, and a checkpoint stores weights plus both Adam moments as
-/// decimal JSON (roughly 22 bytes per number), which is about 110 MB. 192 MB
-/// leaves headroom for that without accepting multi-gigabyte garbage.
-pub const MAX_CHECKPOINT_BYTES: u64 = 192 * 1024 * 1024;
+/// Guard against absurd or untrusted files rather than a model-size limit.
+///
+/// A checkpoint stores weights plus both Adam moments as decimal JSON, about 13.5 bytes per
+/// number. The largest architecture the CLI permits (width 512, 10 dilations, block 128) is
+/// ~16.2 M parameters -> 48.6 M numbers -> ~660 MB; 768 MB leaves headroom without accepting
+/// multi-gigabyte garbage. Encoding the arrays as base64 would cut this ~3x (see the note in
+/// reports/CUDA.md); until then, a run's checkpoints are large.
+pub const MAX_CHECKPOINT_BYTES: u64 = 768 * 1024 * 1024;
 impl Checkpoint {
     pub fn velocity(&self) -> ConfiguredVelocity<'_> {
         ConfiguredVelocity {
