@@ -34,6 +34,21 @@ impl Architecture {
         self.validate()?;
         Ok(self)
     }
+    /// Rebuild the baseline residual stack with `blocks` power-of-two dilations. The default
+    /// four blocks are the v1 baseline; five at width 256 is the ~1.02M-parameter configuration.
+    pub fn with_blocks(mut self, blocks: usize) -> Result<Self> {
+        ensure!(
+            (1..=7).contains(&blocks),
+            "block count must be 1..7 (dilations up to 64)"
+        );
+        ensure!(
+            self.dilations.len() == Self::default().dilations.len() && self.scales.is_empty(),
+            "with_blocks only applies to the unscaled baseline residual stack"
+        );
+        self.dilations = (0..blocks).map(|i| 1 << i).collect();
+        self.validate()?;
+        Ok(self)
+    }
     pub fn pyramid() -> Self {
         Self {
             scales: vec![1, 4, 16, 64],

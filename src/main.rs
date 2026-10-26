@@ -78,6 +78,9 @@ enum Commands {
         output: PathBuf,
         #[arg(long, default_value_t = 20)]
         steps: usize,
+        /// Backend to audit; must match the build features and the machine.
+        #[arg(long, default_value="opencl", value_parser=["opencl","cuda"])]
+        backend: String,
     },
     /// Tiny actual training + sampling on deterministic diagnostic audio.
     Smoke {
@@ -114,9 +117,21 @@ impl AudioArgs {
 }
 #[derive(Args)]
 struct TrainArgs {
-    /// Explicit backend; opencl requires --features opencl and a working runtime.
-    #[arg(long, default_value="cpu", value_parser=["cpu","opencl"])]
+    /// Explicit backend; opencl/cuda require the matching --features build and hardware.
+    #[arg(long, default_value="cpu", value_parser=["cpu","opencl","cuda"])]
     backend: String,
+    /// Crops per optimizer step; loss and gradients are averaged over the batch.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(usize))]
+    batch: usize,
+    /// Residual branch count for --network baseline (dilations 1,2,4,8,16,...; max 7).
+    #[arg(long, default_value_t = 4, value_parser = parse_blocks)]
+    blocks: usize,
+    /// Optional held-out corpus for periodic validation (never overlapping train crops).
+    #[arg(long)]
+    validation: Option<PathBuf>,
+    /// Validation interval in optimizer steps.
+    #[arg(long, default_value_t = 100)]
+    validation_every: usize,
     /// Checkpointed velocity parameterization; changing it requires fresh training.
     #[arg(long, default_value="velocity", value_parser=["velocity", "preconditioned"])]
     parameterization: String,
@@ -214,6 +229,15 @@ impl RenderArgs {
         }
     }
 }
+fn parse_blocks(value: &str) -> std::result::Result<usize, String> {
+    let blocks = value.parse::<usize>().map_err(|e| e.to_string())?;
+    if (1..=7).contains(&blocks) {
+        Ok(blocks)
+    } else {
+        Err("blocks must be 1..7 (dilations 1,2,4,8,16,32,64)".into())
+    }
+}
+
 fn parse_width(value: &str) -> std::result::Result<usize, String> {
     let width = value.parse::<usize>().map_err(|e| e.to_string())?;
     Architecture::default()
@@ -315,10 +339,17 @@ fn main() -> Result<()> {
                 checkpoint_every: a.checkpoint_every,
                 resume: a.resume,
                 weights_only: a.weights_only,
+                batch: a.batch,
+                validation: a.validation,
+                validation_every: a.validation_every,
                 architecture: (if a.network == "pyramid" {
+                    ensure!(
+                        a.blocks == 4,
+                        "--blocks does not apply to --network pyramid"
+                    );
                     Architecture::pyramid()
                 } else {
-                    Architecture::default()
+                    Architecture::default().with_blocks(a.blocks)?
                 })
                 .with_width(a.width)?,
             })?;
@@ -347,13 +378,56 @@ fn main() -> Result<()> {
             checkpoint,
             output,
             steps,
+            backend: audit_backend,
         } => {
-            #[cfg(feature = "opencl")]
-            feral::gpu::audit(&checkpoint, &output, steps)?;
-            #[cfg(not(feature = "opencl"))]
+            let make = |model: &feral::model::Model,
+                        adam: &feral::runtime::Adam,
+                        n: usize,
+                        flow: &FlowConfig|
+             -> anyhow::Result<Box<dyn feral::backend::Resident>> {
+                match audit_backend.as_str() {
+                    "cuda" => {
+                        #[cfg(feature = "cuda")]
+                        {
+                            Ok(Box::new(feral::cuda::CudaTrainer::new(
+                                model,
+                                adam,
+                                n,
+                                1,
+                                flow.clone(),
+                            )?))
+                        }
+                        #[cfg(not(feature = "cuda"))]
+                        {
+                            let _ = (model, adam, n, flow);
+                            anyhow::bail!("gpu-audit --backend cuda requires --features cuda")
+                        }
+                    }
+                    "opencl" => {
+                        #[cfg(feature = "opencl")]
+                        {
+                            Ok(Box::new(feral::gpu::OpenClTrainer::new(
+                                model,
+                                adam,
+                                n,
+                                flow.clone(),
+                            )?))
+                        }
+                        #[cfg(not(feature = "opencl"))]
+                        {
+                            let _ = (model, adam, n, flow);
+                            anyhow::bail!("gpu-audit --backend opencl requires --features opencl")
+                        }
+                    }
+                    other => anyhow::bail!("gpu-audit backend must be opencl or cuda, got {other}"),
+                }
+            };
+            #[cfg(any(feature = "opencl", feature = "cuda"))]
+            feral::audit::audit(&checkpoint, &output, steps, &make)?;
+            #[cfg(not(any(feature = "opencl", feature = "cuda")))]
             {
-                let _ = (checkpoint, output, steps);
-                anyhow::bail!("gpu-audit requires a build with --features opencl");
+                let _ = (checkpoint, output, steps, make);
+                anyhow::bail!("gpu-audit requires --features opencl or --features cuda");
             }
         }
         Commands::Smoke { run, steps } => {
@@ -377,6 +451,9 @@ fn main() -> Result<()> {
                 checkpoint_every: 10,
                 resume: None,
                 weights_only: false,
+                batch: 1,
+                validation: None,
+                validation_every: 10,
                 architecture: Architecture::default(),
             })?;
         }

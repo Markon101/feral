@@ -138,6 +138,12 @@ pub fn source_hash() -> Result<String> {
     }
     Ok(format!("{:x}", h.finalize()))
 }
+/// Guard against absurd or untrusted files rather than a model-size limit. The
+/// largest architecture the CLI permits (width 256, 7 residual blocks) is about
+/// 1.61 M parameters, and a checkpoint stores weights plus both Adam moments as
+/// decimal JSON (roughly 22 bytes per number), which is about 110 MB. 192 MB
+/// leaves headroom for that without accepting multi-gigabyte garbage.
+pub const MAX_CHECKPOINT_BYTES: u64 = 192 * 1024 * 1024;
 impl Checkpoint {
     pub fn velocity(&self) -> ConfiguredVelocity<'_> {
         ConfiguredVelocity {
@@ -151,8 +157,9 @@ impl Checkpoint {
     }
     pub fn load(path: &Path) -> Result<Self> {
         ensure!(
-            fs::metadata(path)?.len() <= 64 * 1024 * 1024,
-            "checkpoint exceeds 64 MB"
+            fs::metadata(path)?.len() <= MAX_CHECKPOINT_BYTES,
+            "checkpoint exceeds {} MB",
+            MAX_CHECKPOINT_BYTES >> 20
         );
         let c: Self = serde_json::from_reader(std::io::BufReader::new(fs::File::open(path)?))?;
         ensure!(
@@ -210,6 +217,12 @@ pub struct TrainConfig {
     pub weights_only: bool,
     pub architecture: Architecture,
     pub flow: FlowConfig,
+    /// Crops per optimizer step. The loss and gradients are averaged over the batch.
+    pub batch: usize,
+    /// Optional held-out corpus for periodic validation. Unset means train-set probes only.
+    pub validation: Option<PathBuf>,
+    /// Validation interval in steps; every interval also writes a validation.jsonl row.
+    pub validation_every: usize,
 }
 fn evaluation(model: &Model, flow: &FlowConfig, dataset: &Dataset, n: usize) -> f32 {
     let mut rng = Rng::new(901);
@@ -230,9 +243,12 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         (1..=100000).contains(&c.steps),
         "training steps must be 1..100000"
     );
+    // Crops beyond 1 s were measured to cost the same per sample on the resident backends, so the
+    // bound is a memory/context guard rather than a speed limit: 4 s at 16 kHz is 64k samples per
+    // crop, which still fits the phone and desktop resident budgets at the documented batch sizes.
     ensure!(
-        c.crop_seconds.is_finite() && (0.032..=1.).contains(&c.crop_seconds),
-        "crop seconds must be 0.032..1"
+        c.crop_seconds.is_finite() && (0.032..=4.).contains(&c.crop_seconds),
+        "crop seconds must be 0.032..4"
     );
     ensure!(
         c.lr.is_finite() && c.lr > 0. && c.lr <= 0.01,
@@ -242,13 +258,18 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     c.flow.validate()?;
     c.preprocess.validate()?;
     ensure!(
-        c.preview_every > 0 && c.checkpoint_every > 0,
+        c.preview_every > 0 && c.checkpoint_every > 0 && c.validation_every > 0,
         "intervals must be positive"
     );
+    ensure!((1..=64).contains(&c.batch), "batch size must be 1..64");
     let b = c.architecture.block;
     let n = ((c.crop_seconds * c.preprocess.sample_rate as f32).round() as usize).div_ceil(b) * b;
     let pre_start = Instant::now();
     let dataset = Dataset::load(&c.input, c.preprocess.clone(), n)?;
+    let validation = match &c.validation {
+        Some(path) => Some(Dataset::load(path, c.preprocess.clone(), n)?),
+        None => None,
+    };
     let preprocessing_ms = pre_start.elapsed().as_secs_f64() * 1000.;
     let mut ck = if let Some(path) = &c.resume {
         let mut ck = Checkpoint::load(path)?;
@@ -309,7 +330,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
             unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         }
     };
-    let mut trainer = Trainer::new(&c.backend, &ck.model, &ck.adam, n, &ck.flow)?;
+    let mut trainer = Trainer::new(&c.backend, &ck.model, &ck.adam, n, &ck.flow, c.batch)?;
     if let Some(parent) = c.run.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -322,7 +343,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     let current_source = source_hash()?;
     write_json(
         &c.run.join("run.json"),
-        &serde_json::json!({"git_commit":git(&["rev-parse","HEAD"]),"git_dirty":!git(&["status","--porcelain"]).is_empty(),"source_hash":current_source,"dataset":dataset.identity,"parameters":ck.model.count(),"architecture":ck.model.architecture,"crop_samples":n,"sample_rate":ck.sample_rate,"additional_steps":c.steps,"seed":c.seed,"lr":ck.adam.lr,"optimizer":"Adam beta1=.9 beta2=.999 eps=1e-8 global gradient clip=1","resume":c.resume,"weights_only":c.weights_only,"backend":trainer.name(),"backend_info":trainer.info(),"objective":ck.objective,"representation":ck.representation,"flow":ck.flow}),
+        &serde_json::json!({"git_commit":git(&["rev-parse","HEAD"]),"git_dirty":!git(&["status","--porcelain"]).is_empty(),"source_hash":current_source,"dataset":dataset.identity,"parameters":ck.model.count(),"architecture":ck.model.architecture,"crop_samples":n,"batch":c.batch,"samples_per_step":n*c.batch,"validation_input":c.validation,"sample_rate":ck.sample_rate,"additional_steps":c.steps,"seed":c.seed,"lr":ck.adam.lr,"optimizer":"Adam beta1=.9 beta2=.999 eps=1e-8 global gradient clip=1","resume":c.resume,"weights_only":c.weights_only,"backend":trainer.name(),"backend_info":trainer.info(),"objective":ck.objective,"representation":ck.representation,"flow":ck.flow}),
     )?;
     ck.save(&c.run.join("initial.json"))?;
     let sample_config = Sampling {
@@ -342,10 +363,32 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     write_json(&c.run.join("preview-config.json"), &sample_config)?;
     let initial_eval = evaluation(&ck.model, &ck.flow, &dataset, n);
     ensure!(initial_eval.is_finite(), "invalid initial evaluation");
+    // Validation uses the held-out corpus when supplied; the probe seed and t are fixed so
+    // successive readings are comparable and are not drawn from the training crop stream.
+    let val_loss = |model: &Model, flow: &FlowConfig| -> f32 {
+        match &validation {
+            Some(v) => evaluation(model, flow, v, n),
+            None => evaluation(model, flow, &dataset, n),
+        }
+    };
+    let initial_val = val_loss(&ck.model, &ck.flow);
+    ensure!(initial_val.is_finite(), "invalid initial validation loss");
     let mut log = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(c.run.join("losses.jsonl"))?;
+    let mut val_log = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(c.run.join("validation.jsonl"))?;
+    let mut val_curve = vec![serde_json::json!({
+        "step": ck.completed_steps,
+        "split": if validation.is_some() { "validation" } else { "train-probe" },
+        "validation_loss": initial_val,
+        "train_probe_loss": initial_eval,
+    })];
+    writeln!(val_log, "{}", val_curve[0])?;
+    val_log.flush()?;
     let mut neural_ms = 0.;
     let mut optimizer_ms = 0.;
     let mut step_ms = Vec::new();
@@ -360,29 +403,67 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         dataset.audio.len(),
         preprocessing_ms
     );
+    let items = c.batch;
+    let mut clean_batch: Vec<f32> = Vec::with_capacity(items * n);
+    let mut mask_batch: Vec<f32> = Vec::with_capacity(items * n);
+    let mut noise_batch: Vec<f32> = Vec::with_capacity(items * n);
+    let mut t_batch: Vec<f32> = Vec::with_capacity(items);
+    let mut batch_tasks: Vec<&'static str> = Vec::with_capacity(items);
+    let mut batch_sources: Vec<usize> = Vec::with_capacity(items);
+    let mut batch_starts: Vec<usize> = Vec::with_capacity(items);
     for local in 1..=c.steps {
         let start = Instant::now();
-        let crop = dataset
-            .crop_traced(n, &mut ck.rng)
-            .context("16 crop attempts were silent; reduce --silence-rms or select useful audio")?;
-        *source_counts.entry(crop.source_index).or_insert(0usize) += 1;
-        silence_retries += crop.silence_rejections;
-        let clean = crop.samples;
-        let (mask, task) = conditioning::training_mask(n, &mut ck.rng);
-        *task_counts.entry(task).or_insert(0usize) += 1;
-        let noise: Vec<f32> = (0..n)
-            .map(|_| ck.rng.normal() * ck.flow.prior_std())
-            .collect();
-        let t = ck.rng.uniform();
+        clean_batch.clear();
+        mask_batch.clear();
+        noise_batch.clear();
+        t_batch.clear();
+        batch_tasks.clear();
+        batch_sources.clear();
+        batch_starts.clear();
+        let debug_timing = std::env::var("FERAL_DEBUG_TIMING").is_ok();
+        let mut t_crop = 0f64;
+        let mut t_mask = 0f64;
+        let mut t_noise = 0f64;
+        for _ in 0..items {
+            let mark = Instant::now();
+            let crop = dataset.crop_traced(n, &mut ck.rng).context(
+                "16 crop attempts were silent; reduce --silence-rms or select useful audio",
+            )?;
+            *source_counts.entry(crop.source_index).or_insert(0usize) += 1;
+            silence_retries += crop.silence_rejections;
+            clean_batch.extend_from_slice(&crop.samples);
+            t_crop += mark.elapsed().as_secs_f64() * 1000.;
+            let mark = Instant::now();
+            let (mask, task) = conditioning::training_mask(n, &mut ck.rng);
+            *task_counts.entry(task).or_insert(0usize) += 1;
+            mask_batch.extend_from_slice(&mask);
+            t_mask += mark.elapsed().as_secs_f64() * 1000.;
+            let mark = Instant::now();
+            noise_batch.extend((0..n).map(|_| ck.rng.normal() * ck.flow.prior_std()));
+            t_noise += mark.elapsed().as_secs_f64() * 1000.;
+            t_batch.push(ck.rng.uniform());
+            batch_tasks.push(task);
+            batch_sources.push(crop.source_index);
+            batch_starts.push(crop.start_sample);
+        }
+        let prep_ms = start.elapsed().as_secs_f64() * 1000.;
+        if debug_timing {
+            eprintln!(
+                "timing step {}: prep {prep_ms:.1} ms (crop {t_crop:.1} mask {t_mask:.1} noise {t_noise:.1})",
+                ck.completed_steps + 1
+            );
+        }
+        let task = batch_tasks[0];
+        let t = t_batch[0];
         let result = trainer.step(
             &mut ck.model,
             &mut ck.adam,
             &ck.flow,
             Batch {
-                clean: &clean,
-                mask: &mask,
-                noise: &noise,
-                t,
+                clean: &clean_batch,
+                mask: &mask_batch,
+                noise: &noise_batch,
+                t: &t_batch,
             },
         )?;
         let loss = result.loss;
@@ -396,7 +477,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         writeln!(
             log,
             "{}",
-            serde_json::json!({"step":ck.completed_steps,"loss":loss,"gradient_norm":norm,"task":task,"t":t,"milliseconds":ms,"rng_state":ck.rng.state,"source_index":crop.source_index,"crop_start_sample":crop.start_sample,"crop_attempts":crop.attempts,"silence_rejections":crop.silence_rejections})
+            serde_json::json!({"step":ck.completed_steps,"loss":loss,"gradient_norm":norm,"task":task,"t":t,"milliseconds":ms,"rng_state":ck.rng.state,"batch_items":items,"batch_sources":batch_sources,"batch_start_samples":batch_starts,"batch_tasks":batch_tasks,"batch_t":t_batch})
         )?;
         if local == 1 || local % 10 == 0 || local == c.steps {
             eprintln!(
@@ -404,6 +485,23 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
                 ck.completed_steps, loss, norm, ms
             );
             log.flush()?;
+        }
+        if local % c.validation_every == 0 {
+            trainer.sync(&mut ck.model, &mut ck.adam)?;
+            let v = val_loss(&ck.model, &ck.flow);
+            ensure!(v.is_finite(), "nonfinite validation loss");
+            let entry = serde_json::json!({
+                "step": ck.completed_steps,
+                "split": if validation.is_some() { "validation" } else { "train-probe" },
+                "validation_loss": v,
+                "train_probe_loss": serde_json::Value::Null,
+            });
+            writeln!(val_log, "{entry}")?;
+            val_log.flush()?;
+            val_curve.push(entry);
+            if local % (c.validation_every * 5) == 0 || local == c.steps {
+                eprintln!("  validation @ step {} | {:.6}", ck.completed_steps, v);
+            }
         }
         if local % c.preview_every == 0 || local % c.checkpoint_every == 0 {
             trainer.sync(&mut ck.model, &mut ck.adam)?;
@@ -428,6 +526,23 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     let training_wall_ms = training_start.elapsed().as_secs_f64() * 1000.;
     trainer.sync(&mut ck.model, &mut ck.adam)?;
     let final_eval = evaluation(&ck.model, &ck.flow, &dataset, n);
+    let final_val = val_loss(&ck.model, &ck.flow);
+    ensure!(final_val.is_finite(), "nonfinite final validation loss");
+    let final_entry = serde_json::json!({
+        "step": ck.completed_steps,
+        "split": if validation.is_some() { "validation" } else { "train-probe" },
+        "validation_loss": final_val,
+        "train_probe_loss": final_eval,
+    });
+    if val_curve
+        .last()
+        .map(|e| e["step"] != final_entry["step"])
+        .unwrap_or(true)
+    {
+        writeln!(val_log, "{final_entry}")?;
+        val_log.flush()?;
+        val_curve.push(final_entry);
+    }
     let now = Instant::now();
     let final_audio = flow::sample(&ck.velocity(), &zeros, &zeros, &sample_config)?;
     let final_sampling_ms = now.elapsed().as_secs_f64() * 1000.;
@@ -443,7 +558,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     step_ms.sort_by(|a, b| a.total_cmp(b));
     write_json(
         &c.run.join("metrics.json"),
-        &serde_json::json!({"backend":trainer.name(),"backend_info":trainer.info(),"timing_scope":if c.backend=="cpu" {"CPU wall operations"}else{"GPU event operation totals; step wall includes transfers, enqueue and sync"},"flow":ck.flow,"loss_units":if ck.flow.is_legacy(){"waveform velocity MSE"}else{"normalized Gaussian-residual MSE"},"parameters":ck.model.count(),"steps":c.steps,"total_steps":ck.completed_steps,"preprocessing_ms":preprocessing_ms,"neural_forward_backward_ms":neural_ms,"optimizer_ms":optimizer_ms,"training_wall_ms_with_previews":training_wall_ms,"step_mean_ms":step_ms.iter().sum::<f64>()/step_ms.len() as f64,"step_median_ms":step_ms[step_ms.len()/2],"step_max_ms":step_ms.last(),"final_sampling_ms":final_sampling_ms,"other_sampling_ms":sampling_ms,"sampling":sample_config,"peak_rss_kib":peak_rss_kib(),"fixed_probe_initial_loss":initial_eval,"fixed_probe_final_loss":final_eval,"same_noise_output_mse_change":delta,"generated_rms":audio::rms(&final_audio),"task_counts":task_counts,"source_counts":source_counts,"silence_retries":silence_retries,"crop_sampling":"uniform file then uniform start; retry silent crops","quality_claim":"pipeline verification only; no perceptual quality or generalization established"}),
+        &serde_json::json!({"backend":trainer.name(),"backend_info":trainer.info(),"timing_scope":match c.backend.as_str(){"cpu"=>"CPU wall operations","cuda"=>"host wall time around synchronized CUDA kernel groups; includes payload upload",_=>"GPU event operation totals; step wall includes transfers, enqueue and sync"},"flow":ck.flow,"loss_units":if ck.flow.is_legacy(){"waveform velocity MSE"}else{"normalized Gaussian-residual MSE"},"parameters":ck.model.count(),"steps":c.steps,"total_steps":ck.completed_steps,"preprocessing_ms":preprocessing_ms,"neural_forward_backward_ms":neural_ms,"optimizer_ms":optimizer_ms,"training_wall_ms_with_previews":training_wall_ms,"step_mean_ms":step_ms.iter().sum::<f64>()/step_ms.len() as f64,"step_median_ms":step_ms[step_ms.len()/2],"step_max_ms":step_ms.last(),"final_sampling_ms":final_sampling_ms,"other_sampling_ms":sampling_ms,"sampling":sample_config,"batch":c.batch,"samples_per_step":n*c.batch,"steps_per_second":c.steps as f64/(training_wall_ms/1000.).max(1e-9),"validation_input":c.validation,"validation_initial_loss":initial_val,"validation_final_loss":final_val,"validation_curve":val_curve,"peak_rss_kib":peak_rss_kib(),"fixed_probe_initial_loss":initial_eval,"fixed_probe_final_loss":final_eval,"same_noise_output_mse_change":delta,"generated_rms":audio::rms(&final_audio),"task_counts":task_counts,"source_counts":source_counts,"silence_retries":silence_retries,"crop_sampling":"uniform file then uniform start; retry silent crops","quality_claim":"pipeline verification only; no perceptual quality or generalization established"}),
     )?;
     eprintln!(
         "checkpoint {} | probe {:.6} -> {:.6} | output delta MSE {:.6}",

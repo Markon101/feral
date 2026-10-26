@@ -125,7 +125,8 @@ same dataset/preprocessing/crop/learning rate, and writes a fresh run. `--weight
 explicitly resets optimizer/RNG and permits another dataset. `--steps` always means
 additional steps. Full resume restores the original RNG stream, so `--seed`
 only selects a new stream for fresh or weights-only training. Tests compare
-uninterrupted and resumed parameters exactly on CPU. Checkpoints are versioned, portable JSON, hash checked, and capped at 64 MB.
+uninterrupted and resumed parameters exactly on CPU. Checkpoints are versioned, portable JSON, hash checked, and capped at 192 MB (enough for
+the largest architecture the CLI allows; the cap is a guard against untrusted files, not a model limit).
 Run metadata includes architecture, parameter count, source/Git identity, data
 hash, objective, preprocessing, optimizer and seed. `losses.jsonl` records every
 step, task, loss, gradient norm, time and RNG state. Previews use a fixed seed.
@@ -223,6 +224,29 @@ quality score. Ten-second listening packs are at
 `level_matched/current.wav` with `baseline.wav` and the labeled noise controls.
 The checkpoint is `runs/opencl-long100k-v1/final-checkpoint.json`.
 See [full results and reproduction](reports/OPENCL_TRAINING.md).
+
+## Optional resident CUDA training (Pascal desktops)
+
+`--features cuda` adds a driver-API backend for hardware that has no vendor OpenCL runtime, built
+ahead of time by `build.rs`. CUDA 13 dropped sm_61, so the build requires a CUDA 11.x/12.x `nvcc`
+(override with `FERAL_NVCC`; arch with `FERAL_CUDA_ARCH`). No crate is added and nothing is
+downloaded.
+
+```sh
+cargo build --locked --offline --release --features cuda -j 8
+feral gpu-audit --backend cuda --checkpoint runs/<run>/checkpoint.json \
+  --output runs/<new-audit>/report.json --steps 30
+feral train --backend cuda --batch 4 --width 256 --blocks 5 \
+  --input corpus/train --validation corpus/validation \
+  --steps 6000 --run runs/<new-run>
+```
+
+Forward/backward, clipping and Adam stay resident on the device in fp32 with `fmad` disabled;
+`--batch` and `--validation` are backend-neutral runtime features. Discovery, kernel-load or
+launch failure is an error, never silent CPU fallback. `--blocks` selects 1..7 power-of-two
+dilations for the baseline stack (5 at width 256 is 1,018,400 parameters).
+See [reports/CUDA.md](reports/CUDA.md) for the parity gates and the measured 1,018,400-parameter
+run (GTX 1080 Ti: 51.1 steps/s at batch 4, held-out validation 1.1958 -> 0.0439).
 
 ## Controlled scaling experiments
 

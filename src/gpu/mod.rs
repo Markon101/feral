@@ -607,5 +607,39 @@ impl OpenClTrainer {
     }
 }
 
-mod audit;
-pub use audit::{audit, temperatures};
+impl crate::backend::Resident for OpenClTrainer {
+    fn step(
+        &mut self,
+        clean: &[f32],
+        mask: &[f32],
+        noise: &[f32],
+        t: &[f32],
+        update: bool,
+    ) -> Result<Step> {
+        let t = t.first().copied().unwrap_or(0.);
+        if update {
+            self.train_step(clean, mask, noise, t)
+        } else {
+            self.gradients(clean, mask, noise, t)
+        }
+    }
+    fn read_gradients(&self) -> Result<Vec<f32>> {
+        OpenClTrainer::read_gradients(self)
+    }
+    fn read_prediction(&self) -> Result<Vec<f32>> {
+        OpenClTrainer::read_prediction(self)
+    }
+    fn sync(&self, model: &mut Model, adam: &mut Adam) -> Result<()> {
+        OpenClTrainer::sync(self, model, adam)
+    }
+    fn flush(&self) -> Result<()> {
+        // OpenCL steps already block on the queue, so there is nothing outstanding here.
+        Ok(())
+    }
+    fn info(&self) -> Value {
+        OpenClTrainer::info(self)
+    }
+    fn completed_steps(&self) -> usize {
+        self.step
+    }
+}

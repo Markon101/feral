@@ -4,14 +4,21 @@ use crate::{
     parameterization::{self, FlowConfig},
     runtime::Adam,
 };
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Result};
 use serde_json::{json, Value};
 use std::time::Instant;
+/// One optimizer step's worth of crops. `t` holds one flow time per item, so `t.len()` is the
+/// batch size and every other slice holds `items * n` samples in per-item order.
 pub struct Batch<'a> {
     pub clean: &'a [f32],
     pub mask: &'a [f32],
     pub noise: &'a [f32],
-    pub t: f32,
+    pub t: &'a [f32],
+}
+impl Batch<'_> {
+    pub fn items(&self) -> usize {
+        self.t.len()
+    }
 }
 pub struct Step {
     pub loss: f32,
@@ -19,10 +26,32 @@ pub struct Step {
     pub neural_ms: f64,
     pub optimizer_ms: f64,
 }
+/// Resident-device operations shared by the accelerator audits. Each accelerator keeps its
+/// parameters on the device and exposes read-back only for verification.
+pub trait Resident {
+    fn step(
+        &mut self,
+        clean: &[f32],
+        mask: &[f32],
+        noise: &[f32],
+        t: &[f32],
+        update: bool,
+    ) -> Result<Step>;
+    fn read_gradients(&self) -> Result<Vec<f32>>;
+    fn read_prediction(&self) -> Result<Vec<f32>>;
+    fn sync(&self, model: &mut Model, adam: &mut Adam) -> Result<()>;
+    /// Wait for every queued device operation. Timing harnesses must call this: a trainer is free
+    /// to pipeline steps, so the time around `step()` alone is enqueue time, not device time.
+    fn flush(&self) -> Result<()>;
+    fn info(&self) -> Value;
+    fn completed_steps(&self) -> usize;
+}
 pub enum Trainer {
     Cpu,
     #[cfg(feature = "opencl")]
     OpenCl(Box<crate::gpu::OpenClTrainer>),
+    #[cfg(feature = "cuda")]
+    Cuda(Box<crate::cuda::CudaTrainer>),
 }
 impl Trainer {
     pub fn new(
@@ -31,12 +60,18 @@ impl Trainer {
         adam: &Adam,
         n: usize,
         flow: &FlowConfig,
+        batch: usize,
     ) -> Result<Self> {
+        ensure!((1..=64).contains(&batch), "batch size must be 1..64");
         match name {
             "cpu" => Ok(Self::Cpu),
             "opencl" => {
                 #[cfg(feature = "opencl")]
                 {
+                    ensure!(
+                        batch == 1,
+                        "the OpenCL backend is single-crop; use --backend cuda or --batch 1"
+                    );
                     Ok(Self::OpenCl(Box::new(crate::gpu::OpenClTrainer::new(
                         model,
                         adam,
@@ -46,11 +81,28 @@ impl Trainer {
                 }
                 #[cfg(not(feature = "opencl"))]
                 {
-                    let _ = (model, adam, n, flow);
+                    let _ = (model, adam, n, flow, batch);
                     bail!("OpenCL was requested but not compiled; cargo build --locked --offline --release --features opencl -j 8")
                 }
             }
-            _ => bail!("backend must be cpu or opencl"),
+            "cuda" => {
+                #[cfg(feature = "cuda")]
+                {
+                    Ok(Self::Cuda(Box::new(crate::cuda::CudaTrainer::new(
+                        model,
+                        adam,
+                        n,
+                        batch,
+                        flow.clone(),
+                    )?)))
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    let _ = (model, adam, n, flow, batch);
+                    bail!("CUDA was requested but not compiled; cargo build --locked --offline --release --features cuda -j 8")
+                }
+            }
+            _ => bail!("backend must be cpu, opencl or cuda"),
         }
     }
     pub fn name(&self) -> &'static str {
@@ -58,13 +110,19 @@ impl Trainer {
             Self::Cpu => "cpu-f32",
             #[cfg(feature = "opencl")]
             Self::OpenCl(_) => "opencl-f32-resident",
+            #[cfg(feature = "cuda")]
+            Self::Cuda(_) => "cuda-f32-resident",
         }
     }
     pub fn info(&self) -> Value {
         match self {
-            Self::Cpu => json!({"backend":"cpu-f32","precision":"fp32","training":"CPU reference"}),
+            Self::Cpu => {
+                json!({"backend":"cpu-f32","precision":"fp32","training":"CPU reference"})
+            }
             #[cfg(feature = "opencl")]
             Self::OpenCl(g) => g.info(),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(g) => g.info(),
         }
     }
     pub fn step(
@@ -76,27 +134,70 @@ impl Trainer {
     ) -> Result<Step> {
         match self {
             Self::Cpu => {
-                let start = Instant::now();
-                let (loss, g) = parameterization::loss_gradient(
-                    model,
-                    flow,
-                    batch.clean,
-                    batch.mask,
-                    batch.noise,
-                    batch.t,
+                let items = batch.items();
+                ensure!(
+                    items > 0 && batch.clean.len().is_multiple_of(items),
+                    "invalid CPU batch shape"
                 );
-                let neural_ms = start.elapsed().as_secs_f64() * 1000.;
-                let start = Instant::now();
-                let norm = adam.update(model, &g)?;
+                let n = batch.clean.len() / items;
+                let mut loss = 0f32;
+                let mut accumulated = vec![0f32; model.count()];
+                let neural = Instant::now();
+                for i in 0..items {
+                    ensure!(
+                        batch.mask.len() == batch.clean.len()
+                            && batch.noise.len() == batch.clean.len(),
+                        "invalid CPU batch shape"
+                    );
+                    let row = i * n..(i + 1) * n;
+                    let (item_loss, g) = parameterization::loss_gradient(
+                        model,
+                        flow,
+                        &batch.clean[row.clone()],
+                        &batch.mask[row.clone()],
+                        &batch.noise[row.clone()],
+                        batch.t[i],
+                    );
+                    loss += item_loss;
+                    for (dst, src) in accumulated.iter_mut().zip(&g) {
+                        *dst += src;
+                    }
+                }
+                for g in &mut accumulated {
+                    *g /= items as f32;
+                }
+                let neural_ms = neural.elapsed().as_secs_f64() * 1000.;
+                let optimizer = Instant::now();
+                let norm = adam.update(model, &accumulated)?;
                 Ok(Step {
-                    loss,
+                    loss: loss / items as f32,
                     norm,
                     neural_ms,
-                    optimizer_ms: start.elapsed().as_secs_f64() * 1000.,
+                    optimizer_ms: optimizer.elapsed().as_secs_f64() * 1000.,
                 })
             }
             #[cfg(feature = "opencl")]
             Self::OpenCl(g) => {
+                ensure!(
+                    batch.items() == 1,
+                    "the OpenCL backend is single-crop; use --backend cuda or --batch 1"
+                );
+                let s = g.train_step(
+                    batch.clean,
+                    batch.mask,
+                    batch.noise,
+                    batch.t.first().copied().unwrap_or(0.),
+                )?;
+                adam.step = g.step;
+                Ok(Step {
+                    loss: s.loss,
+                    norm: s.norm,
+                    neural_ms: s.neural_ms,
+                    optimizer_ms: s.optimizer_ms,
+                })
+            }
+            #[cfg(feature = "cuda")]
+            Self::Cuda(g) => {
                 let s = g.train_step(batch.clean, batch.mask, batch.noise, batch.t)?;
                 adam.step = g.step;
                 Ok(Step {
@@ -116,6 +217,8 @@ impl Trainer {
             }
             #[cfg(feature = "opencl")]
             Self::OpenCl(g) => g.sync(model, adam),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(g) => g.sync(model, adam),
         }
     }
 }

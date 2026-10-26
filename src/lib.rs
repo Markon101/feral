@@ -11,6 +11,12 @@ pub mod runtime;
 #[cfg(feature = "opencl")]
 pub mod gpu;
 
+#[cfg(feature = "cuda")]
+pub mod cuda;
+
+#[cfg(any(feature = "opencl", feature = "cuda"))]
+pub mod audit;
+
 pub mod backend;
 
 pub mod structure;
