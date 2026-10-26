@@ -510,6 +510,47 @@ Correctness at the new shapes was checked twice, because block 128 changes the f
 * a full `gpu-audit` on a small checkpoint built at the new shapes: every gate passes, gradients and
   Adam match, device resume is exact, 16.74x on that reference workload.
 
+## What actually fixed the sound: corpus, not capacity
+
+Five arms at equal sample budget (512 k samples/step), each generating four takes at seeds 11/22/33/44.
+Per-take numbers are in `reports/arm-comparison-01.json`; the audio is in
+`~/Downloads/feral-arm-compare-20261026-1656/`.
+
+| recipe | params | corpus | steps | held-out | RMS | flatness | lag-1 | bands <250/250-1k/1k-4k/>4k |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| baseline, 4 s | 1.2 M | 31 min | 50 k | 0.0237 | 0.137 | 0.370 | 0.792 | 0.45 / 0.20 / 0.27 / 0.08 |
+| D, 4 s | 1.2 M | 189 min | 20 k | 0.0322 | 0.160 | 0.142 | 0.922 | 0.71 / 0.16 / 0.10 / 0.03 |
+| E, 16 s, block 128 | 6.5 M | 189 min | 20 k | 0.0388 | 0.150 | 0.146 | 0.921 | 0.63 / 0.24 / 0.10 / 0.03 |
+| curriculum 4→8→16→24 s | 6.5 M | 189 min | 20 k | 0.0431 | 0.167 | 0.145 | 0.922 | 0.66 / 0.20 / 0.11 / 0.03 |
+| C, preconditioned | 1.2 M | 31 min | 20 k | — | 0.252 | 0.327 | 0.812 | 0.49 / 0.25 / 0.18 / 0.08 |
+| F, preconditioned | 1.2 M | 189 min | 20 k | — | 0.247 | 0.093 | 0.952 | 0.75 / 0.17 / 0.06 / 0.02 |
+| real corpus | — | — | — | — | 0.301 | 0.105 | 0.930 | 0.68 / 0.14 / 0.16 / 0.02 |
+
+* **The corpus was the defect.** At fixed architecture and steps, 31 → 189 minutes of audio took
+  flatness from 0.370 to 0.142 against real audio's 0.105, lag-1 from 0.792 to 0.922 against 0.930,
+  and limiter hits to zero. The 50 k-step baseline on the short corpus is the noisiest model in the
+  set — more steps on 31 minutes does not compete with less training on 189.
+* **Capacity and context did not pay at this budget.** 6.5 M parameters with a 4.09 s field and
+  16 s crops land on the same descriptors as the 1.2 M/4 s model, are worse on held-out loss at
+  equal steps (0.0388 vs 0.0322), and cost 3x more per take (0.9 s vs 0.3 s). With 189 minutes of
+  audio, 6.5 M parameters at 20 k steps is undertrained rather than capable.
+* **The curriculum added nothing measurable.** Validation ran 0.0431 → 0.0415 → 0.0432 → 0.0431
+  across 4/8/16/24 s stages. That is what a 4.09 s receptive field predicts: a crop longer than the
+  field only adds padding behind each prediction. Note also that the 32 s stage had to be run at
+  24 s: at 32 s the 30 s file becomes "shorter than one crop", which changes the dataset identity and
+  makes a full resume refuse — the guard is right, the curriculum was simply out of useful range.
+* **Preconditioning fixes level, then over-smooths.** F reached RMS 0.247 against real 0.301 and
+  flatness 0.093 against 0.105 — but its 1–4 kHz share fell to 0.06 against real 0.16, with too much
+  below 250 Hz. That is MSE regression to the conditional mean: right level, missing detail.
+* **What is left is the objective.** Every full-corpus arm is short of real audio in the 1–4 kHz
+  band (0.10, 0.10, 0.11, 0.06 against 0.16) while sitting at or above it in level. More data and
+  more parameters will not close that; a detail-aware objective (spectral weighting, or a
+  high-pass-weighted residual) is the next real piece of work.
+
+Two limits were hit and fixed on the way: a 6.5 M checkpoint is 267 MB of decimal JSON, so the load
+cap went 192 → 768 MB (base64 would cut that ~3x), and `--grow-crop` exists because a curriculum
+step changes the crop but not the weights.
+
 ## Status at pause (2026-10-25)
 
 `experiments/audio-1m-cuda-02/run-80k-c4000-b8` is the first run on the full corpus: 62 recordings
