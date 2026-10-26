@@ -522,8 +522,11 @@ Per-take numbers are in `reports/arm-comparison-01.json`; the audio is in
 | D, 4 s | 1.2 M | 189 min | 20 k | 0.0322 | 0.160 | 0.142 | 0.922 | 0.71 / 0.16 / 0.10 / 0.03 |
 | E, 16 s, block 128 | 6.5 M | 189 min | 20 k | 0.0388 | 0.150 | 0.146 | 0.921 | 0.63 / 0.24 / 0.10 / 0.03 |
 | curriculum 4→8→16→24 s | 6.5 M | 189 min | 20 k | 0.0431 | 0.167 | 0.145 | 0.922 | 0.66 / 0.20 / 0.11 / 0.03 |
-| C, preconditioned | 1.2 M | 31 min | 20 k | — | 0.252 | 0.327 | 0.812 | 0.49 / 0.25 / 0.18 / 0.08 |
-| F, preconditioned | 1.2 M | 189 min | 20 k | — | 0.247 | 0.093 | 0.952 | 0.75 / 0.17 / 0.06 / 0.02 |
+| C, preconditioned ds=0.10 | 1.2 M | 31 min | 20 k | — | 0.252 | 0.327 | 0.812 | 0.49 / 0.25 / 0.18 / 0.08 |
+| F, preconditioned ds=0.10 | 1.2 M | 189 min | 20 k | — | 0.247 | 0.093 | 0.952 | 0.75 / 0.17 / 0.06 / 0.02 |
+| H, preconditioned ds=0.16 | 1.2 M | 189 min | 20 k | — | 0.217 | 0.116 | 0.938 | 0.66 / 0.23 / 0.09 / 0.02 |
+| G, preconditioned ds=0.10 | 1.2 M | 189 min | 50 k | — | 0.172 | 0.123 | 0.935 | 0.74 / 0.14 / 0.10 / 0.02 |
+| I, preconditioned ds=0.16 | 1.2 M | 189 min | 50 k | — | 0.318 | 0.026 | 0.982 | 0.78 / 0.16 / 0.05 / 0.00 |
 | real corpus | — | — | — | — | 0.301 | 0.105 | 0.930 | 0.68 / 0.14 / 0.16 / 0.02 |
 
 * **The corpus was the defect.** At fixed architecture and steps, 31 → 189 minutes of audio took
@@ -539,13 +542,21 @@ Per-take numbers are in `reports/arm-comparison-01.json`; the audio is in
   field only adds padding behind each prediction. Note also that the 32 s stage had to be run at
   24 s: at 32 s the 30 s file becomes "shorter than one crop", which changes the dataset identity and
   makes a full resume refuse — the guard is right, the curriculum was simply out of useful range.
-* **Preconditioning fixes level, then over-smooths.** F reached RMS 0.247 against real 0.301 and
-  flatness 0.093 against 0.105 — but its 1–4 kHz share fell to 0.06 against real 0.16, with too much
-  below 250 Hz. That is MSE regression to the conditional mean: right level, missing detail.
-* **What is left is the objective.** Every full-corpus arm is short of real audio in the 1–4 kHz
-  band (0.10, 0.10, 0.11, 0.06 against 0.16) while sitting at or above it in level. More data and
-  more parameters will not close that; a detail-aware objective (spectral weighting, or a
-  high-pass-weighted residual) is the next real piece of work.
+* **Preconditioning's `data_scale` is a real parameter, and it buys level but not detail.** The
+  preconditioner was told the data std is 0.1 while the corpus median per-file RMS is 0.160.
+  Matching it (H, ds=0.16) improved raw velocity MSE 0.0392 → 0.0342, level 0.247 → 0.217, flatness
+  0.093 → 0.116 against real 0.105, and fixed the low-band overweight (0.75 → 0.66 against 0.68).
+  Rule: `--data-scale` should be the corpus median RMS, not the default.
+* **Every arm drifts toward the conditional mean as it trains, and that is the remaining ceiling.**
+  Extending F to 50 k (G) and H to 50 k (I) shows the drift in both directions: G keeps spectral
+  shape (flatness 0.123, 1–4 kHz 0.10) but falls to RMS 0.172; I reaches the right level (0.318
+  against 0.301) by becoming far too smooth (flatness 0.026, 1–4 kHz 0.054, lag-1 0.982). Tuning
+  `data_scale` moves a model along that curve rather than off it. Data, capacity and context have all
+  now been tested against this and lost; a detail-aware objective — spectral weighting, or a
+  high-pass-weighted residual such as `<r,r> + λ<Δr,Δr>` — is the next real piece of work.
+* Practical note: `--noise-scale` is **not** a level knob for preconditioned checkpoints. The prior
+  std is part of the parameterisation; at 1.3 the output degrades to noise (flatness 0.123 → 0.706,
+  lag-1 0.935 → 0.543). It must stay ~1.0, so level has to be fixed in the model or in the mix.
 
 Two limits were hit and fixed on the way: a 6.5 M checkpoint is 267 MB of decimal JSON, so the load
 cap went 192 → 768 MB (base64 would cut that ~3x), and `--grow-crop` exists because a curriculum

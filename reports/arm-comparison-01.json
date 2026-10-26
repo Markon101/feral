@@ -90,24 +90,6 @@
   ]
  },
  {
-  "recipe": "F: 1.2M preconditioned, 189 min, 20k steps",
-  "params": 1215264,
-  "crop": 64000,
-  "corpus_min": 189,
-  "steps": 20000,
-  "val": null,
-  "rms": 0.247,
-  "flat": 0.093,
-  "lag1": 0.952,
-  "lim": 4,
-  "bands": [
-   0.75,
-   0.17,
-   0.06,
-   0.02
-  ]
- },
- {
   "recipe": "real corpus reference (one recording)",
   "params": null,
   "crop": null,
@@ -123,6 +105,78 @@
    0.14,
    0.16,
    0.02
+  ]
+ },
+ {
+  "recipe": "F: 1.2M preconditioned ds=0.10, 189 min, 20k steps",
+  "params": 1215264,
+  "crop": 64000,
+  "corpus_min": 189,
+  "steps": 20000,
+  "val_raw": 0.0392,
+  "rms": 0.247,
+  "flat": 0.093,
+  "lag1": 0.952,
+  "lim": 4,
+  "bands": [
+   0.75,
+   0.17,
+   0.06,
+   0.02
+  ]
+ },
+ {
+  "recipe": "H: 1.2M preconditioned ds=0.16, 189 min, 20k steps",
+  "params": 1215264,
+  "crop": 64000,
+  "corpus_min": 189,
+  "steps": 20000,
+  "val_raw": 0.0342,
+  "rms": 0.217,
+  "flat": 0.116,
+  "lag1": 0.938,
+  "lim": 0,
+  "bands": [
+   0.66,
+   0.23,
+   0.09,
+   0.02
+  ]
+ },
+ {
+  "recipe": "G: 1.2M preconditioned ds=0.10, 189 min, 50k steps",
+  "params": 1215264,
+  "crop": 64000,
+  "corpus_min": 189,
+  "steps": 50000,
+  "val_raw": 0.0294,
+  "rms": 0.172,
+  "flat": 0.123,
+  "lag1": 0.935,
+  "lim": 1,
+  "bands": [
+   0.74,
+   0.14,
+   0.1,
+   0.02
+  ]
+ },
+ {
+  "recipe": "I: 1.2M preconditioned ds=0.16, 189 min, 50k steps",
+  "params": 1215264,
+  "crop": 64000,
+  "corpus_min": 189,
+  "steps": 50000,
+  "val_raw": 0.0294,
+  "rms": 0.318,
+  "flat": 0.026,
+  "lag1": 0.982,
+  "lim": 30,
+  "bands": [
+   0.78,
+   0.16,
+   0.05,
+   0.003
   ]
  }
 ]
