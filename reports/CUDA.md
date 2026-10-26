@@ -297,6 +297,25 @@ Artifacts: `experiments/big-1m4-c4000/run-10k-b8-c4000/` plus
 `experiments/big-1m4-c4000/takes/`. A copy for listening, with the metrics that
 belong to it, is in `~/Downloads/feral-big-1m-20261025-1841/`.
 
+### Continuation to 50,000 steps
+
+Resuming `checkpoint.json` for 40,000 further steps with identical flags (`run-50k-b8-c4000`) is
+the first experiment the new sampler made cheap: 20 previews cost 7.2 s where the CPU field would
+have cost about 500 s. Held-out validation keeps falling, so the flatness after 1,000 steps in the
+shorter runs was not this configuration's limit:
+
+| step | 10 k | 20 k | 30 k | 40 k | 50 k |
+| --- | --- | --- | --- | --- | --- |
+| held-out validation | 0.0331 | 0.0298 | 0.0277 | 0.0241 | 0.0237 |
+| fixed probe | 0.0674 | — | — | — | 0.0627 |
+
+The 40,000 steps took 2,549.7 s wall: mean 51.2 ms/step, median 50.2 ms, 15.7 steps/s end to end
+including previews, 500 MB device-resident, host peak RSS 433 MB. The larger probe change is small
+(0.0073 output delta MSE) because the model was already fitting this corpus; the held-out loss is
+the number that moved. `audit.json` in that run directory passes every gate against the CPU
+reference (386.6x, 6.3e-6 aligned loss difference, 1.8e-7 parameter drift, exact device resume and
+CPU continuation), which also covers the forward/backward refactor below.
+
 ## Sampling on the device (250x faster, same trajectory)
 
 The run above spent 508 s of its 1,016 s wall clock in the CPU sampler, so the next
@@ -364,6 +383,36 @@ The in-loop preview is the same audio, not merely similar: `preview-000020.wav` 
 the device-preview run against `feral generate --backend cpu` on the checkpoint that
 run wrote at step 20 gives max |Δ| 3.6e-7, correlation 1.00000000.
 
+### Forward-only device evaluation
+
+`step(update = false)` computed gradients nobody read, which cost more than the forward
+itself. The upload-and-forward half of `execute` is now `forward_pass`, shared by both
+paths; `CudaTrainer::predict` stops after it, and `Resident::predict` keeps the old
+behaviour as the default for backends that have no cheaper entry.
+
+| path | 4 s take, 32 Heun steps | per field evaluation |
+| --- | --- | --- |
+| CPU reference | 144.6 s | ~2.3 s |
+| device, `step(update = false)` | 0.583 s | 7.6 ms |
+| device, forward-only | 0.293–0.317 s | 2.9 ms |
+
+That is 1.96x over the step-based sampler and about 490x over the CPU reference. The
+output is not merely close: the same checkpoint and seed produce the identical WAV
+sha256 (`24dcc8c7…`) through both device paths, which is the regression test that
+matters for this refactor. `gpu-audit` on the 50k checkpoint re-verifies gradients,
+Adam updates and resume through the shared `forward_pass`.
+
+### Checkpoints are written compact
+
+Pretty-printing a checkpoint costs about 39 % more bytes for no reader: a 1.215 M-parameter
+checkpoint was 79.9 MB and is now 49.6 MB, and `Checkpoint::save` takes 146 ms instead of 220 ms for
+the same state. Artifacts (`metrics.json`, `run.json`, take metadata) keep the readable writer, and
+both forms parse identically, so every checkpoint written before this change still loads — the
+40,000-step continuation above wrote its checkpoints in the old format.
+
+Measured on this machine with a throwaway test that saved both forms of the 50k checkpoint and
+reloaded them: identical `model_hash`, identical `completed_steps`.
+
 ## Status at pause (2026-10-25)
 
 `experiments/audio-1m-cuda-02/run-80k-c4000-b8` is the first run on the full corpus: 62 recordings
@@ -385,17 +434,14 @@ deleting a directory while the previous process is still alive.
 
 Open items, in the order the measurements point at them:
 
-* A device field evaluation still pays for a backward pass it does not need
-  (`step(update = false)`): 7.6 ms per evaluation against roughly 2.5 ms for a forward-only entry.
-  Both samplers now use it — 64 evaluations per take, so 0.58 s versus about 0.2 s — and previews
-  construct a trainer per sample. A forward-only entry would cut a take to ~0.2 s and drop the
-  per-preview trainer setup; it is the cheapest remaining win, ahead of any kernel work.
-* Checkpoints are written as pretty-printed decimal JSON, which is why one 1.215 M-parameter
-  checkpoint is 80 MB and why a 2-step run spends ~60 s writing artifacts. A compact binary or
-  `serde_json` without indentation would not change any number, only the I/O around them.
-* The residual error sits at t ≈ 0.9 (0.285 MSE versus 0.040 at t = 0.1); if that matters, it is a
-  loss-weighting question rather than a capacity one, since validation stopped improving after
-  1,000 steps at both 1.018 M and 1.215 M parameters.
+* Previews construct a resident trainer per sample (~0.3 s of sampling plus ~0.2 s of context
+  setup and weight upload at this size). Caching one preview trainer and uploading weights before
+  each sample needs an upload path that does not exist yet; it is worth building only if previews
+  become much more frequent than every 2,000 steps.
+* The residual error sits at t ≈ 0.9 (0.285 MSE versus 0.040 at t = 0.1). Forty thousand extra
+  steps cut held-out validation by 28 % (0.0331 → 0.0237) but moved the fixed probe only 7 %
+  (0.0674 → 0.0627), so the endpoint is not simply under-trained — a loss weighting that spends
+  more capacity near t = 1 is the next thing to try, not more steps.
 * The ≈ 4.8 ms fixed per-step cost measured earlier is still there, but at 4 s crops it is under
   10 % of a step; it only matters for short crops.
 * 64×64 tiles with 4×4 register blocking were measured (above) and rejected: same speed, more

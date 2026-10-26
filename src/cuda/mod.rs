@@ -657,6 +657,16 @@ impl CudaTrainer {
         info["last_step_host_ms"] = self.last_host_ms.into();
         info
     }
+    /// Forward-only field evaluation for sampling: payload upload and network forward, then the
+    /// prediction comes back. No loss reduction, no backward pass, no optimizer.
+    ///
+    /// A pending statistics readback from an earlier training step is deliberately left in place:
+    /// it belongs to that step, and resolving it here would change the reported loss sequence.
+    pub fn predict(&mut self, x: &[f32], mask: &[f32], t: f32) -> Result<Vec<f32>> {
+        self.activate()?;
+        self.forward_pass(x, mask, x, &[t], false)?;
+        self.read_prediction()
+    }
     pub fn gradients(
         &mut self,
         clean: &[f32],
@@ -675,37 +685,18 @@ impl CudaTrainer {
     ) -> Result<Step> {
         self.execute(clean, mask, noise, t, true)
     }
-    fn execute(
+    /// Uploads the payload and runs the network forward, leaving the prediction in the last
+    /// activation buffer. Returns the upload milliseconds and the instant the kernels were
+    /// enqueued, which `execute` folds into its device and wall timings. `predict` uses this alone:
+    /// evaluating a field needs no loss reduction, backward pass or optimizer.
+    fn forward_pass(
         &mut self,
         clean: &[f32],
         mask: &[f32],
         noise: &[f32],
         t: &[f32],
-        update: bool,
-    ) -> Result<Step> {
-        self.activate()?;
-        // Collect the previous step's statistics without draining the device for this step's work.
-        if self.pin_pending {
-            self.driver.check(
-                unsafe { (self.driver.ev_sync)(self.pin_event) },
-                "cuEventSynchronize",
-            )?;
-            // SAFETY: the pinned block is 64 bytes and holds exactly these four floats.
-            unsafe {
-                let p = self.pinned as *const f32;
-                for (i, slot) in self.prev_stats.iter_mut().enumerate() {
-                    *slot = *p.add(i);
-                }
-            }
-            self.pin_pending = false;
-            let mut g = 0f32;
-            self.driver.check(
-                unsafe { (self.driver.ev_elapsed)(&mut g, self.ev_start, self.ev_end) },
-                "cuEventElapsedTime",
-            )?;
-            self.last_gpu_ms = g as f64;
-            self.last_host_ms = (self.prev_wall_ms - self.last_gpu_ms).max(0.);
-        }
+        timed: bool,
+    ) -> Result<(f64, Instant)> {
         let total_samples = self.items * self.n;
         ensure!(
             t.len() == self.items
@@ -749,17 +740,17 @@ impl CudaTrainer {
             "trig",
         )?;
         let upload_ms = start.elapsed().as_secs_f64() * 1000.;
-        let ev_s = self.ev_start;
-        let ev_e = self.ev_end;
-        self.driver.check(
-            unsafe { (self.driver.ev_record)(ev_s, std::ptr::null_mut()) },
-            "cuEventRecord",
-        )?;
+        if timed {
+            self.driver.check(
+                unsafe { (self.driver.ev_record)(self.ev_start, std::ptr::null_mut()) },
+                "cuEventRecord",
+            )?;
+        }
         let n = total_samples as u32;
         let items = self.items as u32;
         let frames = self.frames;
         let block = self.block;
-        let (cskip, cout, cin) = self.flow.coefficients(t[0]);
+        let cin = self.flow.coefficients(t[0]).2;
         let (pre, scale) = match self.flow {
             FlowConfig::Velocity => (0i32, 1f32),
             FlowConfig::Preconditioned { data_scale, .. } => (1i32, data_scale),
@@ -844,6 +835,49 @@ impl CudaTrainer {
                 ],
             )?;
         }
+        Ok((upload_ms, launch_start))
+    }
+    fn execute(
+        &mut self,
+        clean: &[f32],
+        mask: &[f32],
+        noise: &[f32],
+        t: &[f32],
+        update: bool,
+    ) -> Result<Step> {
+        self.activate()?;
+        // Collect the previous step's statistics without draining the device for this step's work.
+        if self.pin_pending {
+            self.driver.check(
+                unsafe { (self.driver.ev_sync)(self.pin_event) },
+                "cuEventSynchronize",
+            )?;
+            // SAFETY: the pinned block is 64 bytes and holds exactly these four floats.
+            unsafe {
+                let p = self.pinned as *const f32;
+                for (i, slot) in self.prev_stats.iter_mut().enumerate() {
+                    *slot = *p.add(i);
+                }
+            }
+            self.pin_pending = false;
+            let mut g = 0f32;
+            self.driver.check(
+                unsafe { (self.driver.ev_elapsed)(&mut g, self.ev_start, self.ev_end) },
+                "cuEventElapsedTime",
+            )?;
+            self.last_gpu_ms = g as f64;
+            self.last_host_ms = (self.prev_wall_ms - self.last_gpu_ms).max(0.);
+        }
+        let start = Instant::now();
+        let (upload_ms, launch_start) = self.forward_pass(clean, mask, noise, t, true)?;
+        let total_samples = self.items * self.n;
+        let items = self.items as u32;
+        let frames = self.frames;
+        let (cskip, cout, _) = self.flow.coefficients(t[0]);
+        let pre = match self.flow {
+            FlowConfig::Velocity => 0i32,
+            FlowConfig::Preconditioned { .. } => 1i32,
+        };
         let last = self.specs.len();
         let parts = (total_samples).div_ceil(BATCH_THREADS) as u32;
         let mut d_pred = self.acts[last].ptr;
@@ -966,7 +1000,7 @@ impl CudaTrainer {
             &mut kargs![h_grad, h_parts, h_stats, h_count, h_nparts, h_inv],
         )?;
         self.driver.check(
-            unsafe { (self.driver.ev_record)(ev_e, std::ptr::null_mut()) },
+            unsafe { (self.driver.ev_record)(self.ev_end, std::ptr::null_mut()) },
             "cuEventRecord",
         )?;
         let neural_ms = launch_start.elapsed().as_secs_f64() * 1000. + upload_ms;
@@ -1135,6 +1169,9 @@ impl crate::backend::Resident for CudaTrainer {
     }
     fn read_prediction(&self) -> Result<Vec<f32>> {
         CudaTrainer::read_prediction(self)
+    }
+    fn predict(&mut self, x: &[f32], mask: &[f32], t: f32) -> Result<Vec<f32>> {
+        CudaTrainer::predict(self, x, mask, t)
     }
     fn sync(&self, model: &mut Model, adam: &mut Adam) -> Result<()> {
         CudaTrainer::sync(self, model, adam)

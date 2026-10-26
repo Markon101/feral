@@ -72,8 +72,7 @@ impl Velocity for DeviceVelocity<'_> {
             "device sampling needs x to hold the known samples wherever the mask is set"
         );
         let mut device = self.device.borrow_mut();
-        device.step(x, mask, x, &[t], false)?;
-        let f = device.read_prediction()?;
+        let f = device.predict(x, mask, t)?;
         ensure!(
             f.len() == x.len(),
             "device prediction length {} != {}",

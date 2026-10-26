@@ -131,7 +131,8 @@ same dataset/preprocessing/crop/learning rate, and writes a fresh run. `--weight
 explicitly resets optimizer/RNG and permits another dataset. `--steps` always means
 additional steps. Full resume restores the original RNG stream, so `--seed`
 only selects a new stream for fresh or weights-only training. Tests compare
-uninterrupted and resumed parameters exactly on CPU. Checkpoints are versioned, portable JSON, hash checked, and capped at 192 MB (enough for
+uninterrupted and resumed parameters exactly on CPU. Checkpoints are versioned, portable JSON, hash checked, written compact (a
+1.215M-parameter checkpoint is 49.6 MB; artifacts such as metrics.json stay readable), and capped at 192 MB (enough for
 the largest architecture the CLI allows; the cap is a guard against untrusted files, not a model limit).
 Run metadata includes architecture, parameter count, source/Git identity, data
 hash, objective, preprocessing, optimizer and seed. `losses.jsonl` records every
@@ -253,8 +254,9 @@ launch failure is an error, never silent CPU fallback. `--blocks` selects 1..7 p
 dilations for the baseline stack (5 at width 256 is 1,018,400 parameters).
 Sampling runs on the device as well: `generate`, `continue`, `inpaint` and `variation` accept
 `--backend cuda`, and training previews follow the training backend. On the 1,215,264-parameter run a
-4 s take at 32 Heun steps drops from 144.6 s to 0.58 s with max |delta| 2.4e-7 against the CPU
-reference and identical protected samples.
+4 s take at 32 Heun steps drops from 144.6 s to 0.30 s with max |delta| 2.4e-7 against the CPU
+reference, identical protected samples and the same WAV bytes as the step-based device path.
+Sampling uses a forward-only device entry, so a field evaluation costs 2.9 ms rather than 7.6 ms.
 See [reports/CUDA.md](reports/CUDA.md) for the parity gates and the measured 1,018,400-parameter
 run (GTX 1080 Ti: 51.1 steps/s at batch 4, held-out validation 1.1958 -> 0.0439).
 

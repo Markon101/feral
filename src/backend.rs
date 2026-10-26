@@ -37,6 +37,12 @@ pub trait Resident {
         t: &[f32],
         update: bool,
     ) -> Result<Step>;
+    /// Forward-only field evaluation. A backend without a cheaper path stays correct by running a
+    /// full step without an update; the CUDA resident skips the backward pass instead.
+    fn predict(&mut self, x: &[f32], mask: &[f32], t: f32) -> Result<Vec<f32>> {
+        self.step(x, mask, x, &[t], false)?;
+        self.read_prediction()
+    }
     fn read_gradients(&self) -> Result<Vec<f32>>;
     fn read_prediction(&self) -> Result<Vec<f32>>;
     fn sync(&self, model: &mut Model, adam: &mut Adam) -> Result<()>;
