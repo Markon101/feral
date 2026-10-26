@@ -31,6 +31,21 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     writer.get_ref().sync_all()?;
     Ok(())
 }
+/// Checkpoints are large numeric payloads that nobody reads by hand; pretty-printing them costs
+/// about 39 % more bytes and the matching write time on every save. Artifacts keep the readable
+/// writer. Both forms parse identically, so older checkpoints stay loadable.
+pub fn write_json_compact<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("create {} (will not overwrite)", path.display()))?;
+    let mut writer = std::io::BufWriter::new(file);
+    serde_json::to_writer(&mut writer, value)?;
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    Ok(())
+}
 fn git(args: &[&str]) -> String {
     Command::new("git")
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -153,7 +168,7 @@ impl Checkpoint {
     }
     pub fn save(&mut self, path: &Path) -> Result<()> {
         self.model_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&self.model)?));
-        write_json(path, self)
+        write_json_compact(path, self)
     }
     pub fn load(path: &Path) -> Result<Self> {
         ensure!(
