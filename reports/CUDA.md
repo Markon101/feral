@@ -558,6 +558,40 @@ Per-take numbers are in `reports/arm-comparison-01.json`; the audio is in
   std is part of the parameterisation; at 1.3 the output degrades to noise (flatness 0.123 → 0.706,
   lag-1 0.935 → 0.543). It must stay ~1.0, so level has to be fixed in the model or in the mix.
 
+### The detail term did not work, and the reason is instructive
+
+`--detail-weight w` adds `w * mean((r[i+1] - r[i])^2)` to the residual MSE: a 3-tap stencil that
+up-weights high-frequency residual, implemented and verified like any other training math (w = 0
+bit-identical, analytic gradient against finite differences, device/CPU parity at w = 2 and w = 8).
+The hypothesis was that it would lift the 1-4 kHz band toward the corpus's 0.16. It did the
+opposite:
+
+| objective | RMS | flatness | lag-1 | bands <250 / 250-1k / 1k-4k / >4k |
+| --- | --- | --- | --- | --- |
+| plain (w = 0), arm H | 0.217 | 0.116 | 0.938 | 0.66 / 0.23 / 0.09 / 0.02 |
+| w = 2 | 0.260 | 0.058 | 0.968 | 0.74 / 0.19 / 0.06 / 0.01 |
+| w = 8 | 0.272 | 0.061 | 0.968 | 0.78 / 0.16 / 0.05 / 0.01 |
+| real corpus | 0.301 | 0.105 | 0.930 | 0.68 / 0.14 / 0.16 / 0.02 |
+
+More detail weight made the output *smoother*, not sharper: flatness halves, the 1-4 kHz share
+falls from 0.09 to 0.05, lag-1 rises to 0.968. Level rises toward real audio, which is the only
+direction it helped.
+
+Why: a penalty on the difference of the residual is still a quadratic form in `pred - target`, so it
+vanishes at `pred = target` and therefore **does not move the optimum at all** — it only reweights
+which errors the optimiser attends to. With limited capacity the high-frequency residual is
+irreducible, so the cheapest way to shrink `mean((Δr)^2)` is to stop producing high-frequency output
+and let the target's detail sit in the error, which also lets the low band dominate. The measurement
+is consistent with that: every arm that trains longer or weights residual detail more ends in the
+same place, the conditional mean.
+
+The conclusion is structural rather than a tuning failure. A supervised squared-error objective
+converges to the conditional mean of the waveform, and the conditional mean of a noisy, phase-rich
+signal is smoother than any single realisation. Detail has to come from somewhere the mean cannot
+supply it: a perceptual or adversarial term, a distributional objective sampled stochastically, or
+a model large enough to make the residual small. The stencil experiment rules out the cheap version
+of the first idea.
+
 Two limits were hit and fixed on the way: a 6.5 M checkpoint is 267 MB of decimal JSON, so the load
 cap went 192 → 768 MB (base64 would cut that ~3x), and `--grow-crop` exists because a curriculum
 step changes the crop but not the weights.
