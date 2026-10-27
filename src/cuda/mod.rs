@@ -33,8 +33,9 @@ extern "C" {
 const TILE: usize = 16; // thread block
 const TILE_OUT: usize = 32; // register-blocked output tile
 const BATCH_THREADS: usize = 256;
-/// Resident device allocation ceiling; the owner-approved working-memory ceiling is 3 GiB
-/// for the whole process, and this leaves room for the host-side checkpoint and dataset.
+/// Resident device allocation ceiling. The owner-approved working-memory ceiling is 8 GiB on
+/// the desktop and 3 GiB on mobile (AGENTS.md); the default below leaves room for the
+/// host-side checkpoint and dataset under either.
 /// Default resident ceiling. The desktop path may raise it with `FERAL_CUDA_BUDGET_MB`
 /// (256..=9216 MiB); the value actually in force is reported in `backend_info`.
 const DEFAULT_DEVICE_BYTES: usize = 1024 * 1024 * 1024;

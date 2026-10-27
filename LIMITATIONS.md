@@ -18,9 +18,10 @@ output for any of those results. No subjective listening evaluation is claimed.
   468 ms, shortened by crop edges. Neither can plan musical form. Outputs after very
   short training can be noisy, clipped, strange or unrecognizable. Unknown-region
   hard clipping can introduce distortion; counts are a future diagnostic.
-* Training is currently single-threaded batch one. The 3 GB working ceiling is
-  respected by a much smaller profile. Thermal state, background scheduling and
-  device load are uncontrolled; measured latency is not a maximum-speed claim.
+* Training is currently single-threaded batch one. The working-memory ceiling is 8 GB on
+  the desktop and 3 GB on the mobile target; both are respected by a much smaller profile.
+  Thermal state, background scheduling and device load are uncontrolled; measured latency
+  is not a maximum-speed claim.
 * Only mono is modeled. Stereo inputs are downmixed or one channel selected.
 * Every selected file is cropped at its beginning to `--max-file-seconds`
   (default 30); random training crops are taken inside that decoded section.

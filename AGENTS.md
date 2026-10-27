@@ -8,7 +8,11 @@ Keep changes inside this repository. Source recordings and existing research
 repositories are read only. Preserve initial controls, existing runs, checkpoints,
 seeds and failed experiments; use new output names. Do not publish or add remotes
 without an explicit owner request. Do not download models, datasets or system
-packages automatically. The current owner-approved working memory ceiling is 3 GB.
+packages automatically. Working memory ceilings are owner-approved and differ by target:
+**8 GB on the desktop** (this machine) and **3 GB on mobile/Termux**, which is a separate
+configuration. Report measured peak RSS (`metrics.json: peak_rss_kib`) against the ceiling
+in force for that target. Reports written before 2026-10-27 record the 3 GB desktop ceiling
+they were measured under; do not rewrite those numbers.
 
 Use the locked dependencies and small CPU checks before costly training:
 

@@ -114,9 +114,10 @@ impl Dataset {
                 Ok((x, s)) => {
                     total += x.len();
                     // 256 M samples is 1 GB of f32 at 16 kHz (about 4.4 hours): enough for the whole
-                    // local corpus inside the 3 GB host ceiling, while still refusing a decode that
-                    // would blow it. Long corpora are a desktop configuration; a phone run should
-                    // select fewer files or a shorter --max-file-seconds.
+                    // local corpus at 16 kHz inside the 3 GB mobile ceiling, while still refusing a
+                    // decode that would blow it. The desktop ceiling is 8 GB (AGENTS.md), so a
+                    // desktop run at a higher sample rate may raise this deliberately; a phone run
+                    // should select fewer files or a shorter --max-file-seconds instead.
                     ensure!(
                         total <= MAX_DATASET_SAMPLES,
                         "decoded dataset exceeds {} MB; reduce --max-file-seconds or file selection",
