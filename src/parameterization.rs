@@ -119,8 +119,23 @@ pub fn loss_gradient(
     noise: &[f32],
     t: f32,
 ) -> (f32, Vec<f32>) {
+    loss_gradient_detailed(model, config, clean, mask, noise, t, 0.)
+}
+/// Residual MSE plus the optional detail term, in whichever space the parameterization trains in.
+///
+/// For the preconditioned flow the residual is `f - target` (normalized units), so the stencil
+/// weights detail exactly where the optimizer works; `detail = 0` reproduces the plain objective.
+pub fn loss_gradient_detailed(
+    model: &Model,
+    config: &FlowConfig,
+    clean: &[f32],
+    mask: &[f32],
+    noise: &[f32],
+    t: f32,
+    detail: f32,
+) -> (f32, Vec<f32>) {
     if config.is_legacy() {
-        return flow::loss_gradient(model, clean, mask, noise, t);
+        return flow::loss_gradient_detailed(model, clean, mask, noise, t, detail);
     }
     let x: Vec<f32> = clean
         .iter()
@@ -132,20 +147,27 @@ pub fn loss_gradient(
     let (f, tape) = model.forward(&xx, &k, mask, t);
     let (skip, out, _) = config.coefficients(t);
     let count = mask.iter().filter(|&&m| m == 0.).count().max(1) as f32;
+    let n = clean.len();
     let mut loss = 0.;
-    let dy: Vec<f32> = f
-        .iter()
-        .zip(&x)
-        .zip(clean)
-        .zip(noise)
-        .zip(mask)
-        .map(|((((&f, &x), &y), &z), &m)| {
-            let target = (y - z - skip * x) / out;
-            let d = (f - target) * (1. - m);
-            loss += d * d / count;
-            2. * d / count
-        })
-        .collect();
+    let mut dy = vec![0f32; n];
+    let mut r = vec![0f32; n];
+    for i in 0..n {
+        let target = (clean[i] - noise[i] - skip * x[i]) / out;
+        r[i] = f[i] - target;
+        let d = r[i] * (1. - mask[i]);
+        loss += d * d / count;
+        dy[i] = 2. * d / count;
+    }
+    if detail > 0. {
+        for i in 0..n.saturating_sub(1) {
+            if mask[i] == 0. && mask[i + 1] == 0. {
+                let delta = r[i + 1] - r[i];
+                loss += detail * delta * delta / count;
+                dy[i] -= 2. * detail * delta / count;
+                dy[i + 1] += 2. * detail * delta / count;
+            }
+        }
+    }
     (loss, model.backward(&tape, &dy))
 }
 /// Forward-only loss with exactly the algebra of `loss_gradient`, for evaluation.

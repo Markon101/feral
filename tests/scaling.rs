@@ -135,6 +135,98 @@ fn training_width_rejects_unsupported_sizes_before_input_io() {
 }
 
 #[test]
+fn detail_weight_keeps_the_gradient_exact() {
+    // The detail term is a stencil on the residual; its analytic gradient must match finite
+    // differences, and detail = 0 must reproduce the plain objective bit for bit.
+    for config in [
+        FlowConfig::Velocity,
+        FlowConfig::Preconditioned {
+            data_scale: 0.16,
+            prior_std: 1.,
+        },
+    ] {
+        let model = Model::new(Architecture::default().with_width(64).unwrap(), 71);
+        let clean: Vec<f32> = (0..256).map(|i| (i as f32 * 0.13).sin() * 0.2).collect();
+        let mut rng = Rng::new(73);
+        let noise: Vec<f32> = (0..clean.len()).map(|_| rng.normal()).collect();
+        // Unknown samples in the middle of the window, so there are many valid difference pairs.
+        let mut mask = vec![1f32; clean.len()];
+        mask[64..192].fill(0.);
+
+        let (plain, plain_grad) =
+            parameterization::loss_gradient(&model, &config, &clean, &mask, &noise, 0.37);
+        let (zero, zero_grad) = parameterization::loss_gradient_detailed(
+            &model, &config, &clean, &mask, &noise, 0.37, 0.,
+        );
+        assert_eq!(
+            plain.to_bits(),
+            zero.to_bits(),
+            "detail=0 must not change the loss"
+        );
+        assert_eq!(
+            plain_grad, zero_grad,
+            "detail=0 must not change the gradient"
+        );
+
+        let detail = 2.0f32;
+        let (loss, gradient) = parameterization::loss_gradient_detailed(
+            &model, &config, &clean, &mask, &noise, 0.37, detail,
+        );
+        assert!(loss.is_finite());
+        assert!(
+            loss > plain,
+            "the detail term must add to the loss: {loss} vs {plain}"
+        );
+
+        let eps = 0.004f32;
+        let mut checked = 0;
+        let mut offset = 0;
+        for layer in &model.layers {
+            let weight_end = offset + layer.w.len();
+            // Strongest weight plus a bias in each layer is enough to exercise the stencil.
+            let index = offset
+                + layer
+                    .w
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+            for probe in [index, weight_end] {
+                let mut high = model.clone();
+                let mut params = high.parameters();
+                params[probe] += eps;
+                high.set_parameters(&params);
+                let high_loss = parameterization::loss_gradient_detailed(
+                    &high, &config, &clean, &mask, &noise, 0.37, detail,
+                )
+                .0;
+                let mut low = model.clone();
+                let mut params = low.parameters();
+                params[probe] -= eps;
+                low.set_parameters(&params);
+                let low_loss = parameterization::loss_gradient_detailed(
+                    &low, &config, &clean, &mask, &noise, 0.37, detail,
+                )
+                .0;
+                let numerical = (high_loss - low_loss) / (2. * eps);
+                assert!(
+                    (gradient[probe] - numerical).abs() < 0.002 + 0.05 * numerical.abs(),
+                    "detail gradient mismatch for {config:?} at {probe}: analytic {} numerical {numerical}",
+                    gradient[probe]
+                );
+                checked += 1;
+            }
+            offset = weight_end + layer.b.len();
+        }
+        assert!(
+            checked >= 4,
+            "expected several gradient probes, got {checked}"
+        );
+    }
+}
+
+#[test]
 fn frame_samples_and_dilations_cover_the_long_context_range() {
     // Frames trade time resolution for context: convolution cost scales with frames, so a larger
     // block is cheaper per sample and multiplies the receptive field by the same factor.

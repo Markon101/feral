@@ -53,6 +53,23 @@ pub fn loss_gradient(
     noise: &[f32],
     t: f32,
 ) -> (f32, Vec<f32>) {
+    loss_gradient_detailed(model, clean, mask, noise, t, 0.)
+}
+
+/// Velocity MSE plus an optional detail term: `mean(r^2) + detail * mean((r[i+1] - r[i])^2)`,
+/// both averaged over unknown samples. `r = prediction - (y - z)`.
+///
+/// The difference pair only counts when *both* samples are unknown, so a known region can never
+/// leak into it. The term is a 3-tap stencil, not a transform: it weights higher temporal
+/// frequencies without an FFT, and `detail = 0` reproduces the plain objective exactly.
+pub fn loss_gradient_detailed(
+    model: &Model,
+    clean: &[f32],
+    mask: &[f32],
+    noise: &[f32],
+    t: f32,
+    detail: f32,
+) -> (f32, Vec<f32>) {
     let x: Vec<f32> = clean
         .iter()
         .zip(noise)
@@ -61,18 +78,26 @@ pub fn loss_gradient(
         .collect();
     let (pred, tape) = model.forward(&x, clean, mask, t);
     let count = mask.iter().filter(|&&m| m == 0.).count().max(1) as f32;
+    let n = clean.len();
     let mut loss = 0.;
-    let dy: Vec<f32> = pred
-        .iter()
-        .zip(clean)
-        .zip(noise)
-        .zip(mask)
-        .map(|(((&v, &y), &z), &m)| {
-            let d = (v - (y - z)) * (1. - m);
-            loss += d * d / count;
-            2. * d / count
-        })
-        .collect();
+    let mut dy = vec![0f32; n];
+    let mut r = vec![0f32; n];
+    for i in 0..n {
+        r[i] = pred[i] - (clean[i] - noise[i]);
+        let d = r[i] * (1. - mask[i]);
+        loss += d * d / count;
+        dy[i] = 2. * d / count;
+    }
+    if detail > 0. {
+        for i in 0..n.saturating_sub(1) {
+            if mask[i] == 0. && mask[i + 1] == 0. {
+                let delta = r[i + 1] - r[i];
+                loss += detail * delta * delta / count;
+                dy[i] -= 2. * detail * delta / count;
+                dy[i + 1] += 2. * detail * delta / count;
+            }
+        }
+    }
     (loss, model.backward(&tape, &dy))
 }
 fn field<M: Velocity + ?Sized>(

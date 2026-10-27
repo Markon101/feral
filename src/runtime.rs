@@ -112,6 +112,10 @@ pub struct Checkpoint {
     pub format_version: u32,
     #[serde(default, skip_serializing_if = "FlowConfig::is_legacy")]
     pub flow: FlowConfig,
+    /// Weight of the detail term the model was trained with. Checkpointed, because it is part of
+    /// the objective the weights belong to; older checkpoints default to 0 (the plain objective).
+    #[serde(default)]
+    pub detail: f32,
     pub model: Model,
     pub adam: Adam,
     pub rng: Rng,
@@ -185,6 +189,10 @@ impl Checkpoint {
         );
         c.flow.validate()?;
         ensure!(
+            c.detail.is_finite() && (0. ..=100.).contains(&c.detail),
+            "invalid detail weight"
+        );
+        ensure!(
             c.format_version == c.flow.format_version(),
             "checkpoint format/flow configuration mismatch"
         );
@@ -237,6 +245,8 @@ pub struct TrainConfig {
     pub grow_crop: bool,
     pub architecture: Architecture,
     pub flow: FlowConfig,
+    /// Weight of the detail term, `<r,r> + detail * <dr,dr>`, in the objective.
+    pub detail: f32,
     /// Crops per optimizer step. The loss and gradients are averaged over the batch.
     pub batch: usize,
     /// Optional held-out corpus for periodic validation. Unset means train-set probes only.
@@ -423,6 +433,12 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
                 ck.adam.lr == c.lr,
                 "full resume requires same learning rate"
             );
+            ensure!(
+                ck.detail == c.detail,
+                "full resume requires the same detail weight ({} vs {}); it is part of the objective",
+                ck.detail,
+                c.detail
+            );
         }
         ck
     } else {
@@ -431,6 +447,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         Checkpoint {
             format_version: c.flow.format_version(),
             flow: c.flow.clone(),
+            detail: c.detail,
             model,
             adam,
             rng: Rng::new(c.seed ^ 0x464552414c),
@@ -442,10 +459,20 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
             git_commit: git(&["rev-parse", "HEAD"]),
             git_dirty: !git(&["status", "--porcelain"]).is_empty(),
             source_hash: source_hash()?,
-            objective: if c.flow.is_legacy() {
-                "conditional rectified flow, unknown-sample MSE, uniform t, N(0,1) noise".into()
-            } else {
-                "conditional rectified flow, Gaussian residual preconditioning, residual MSE (=velocity MSE/out^2), uniform t, checkpointed Gaussian prior".into()
+            objective: {
+                let base = if c.flow.is_legacy() {
+                    "conditional rectified flow, unknown-sample MSE, uniform t, N(0,1) noise"
+                } else {
+                    "conditional rectified flow, Gaussian residual preconditioning, residual MSE (=velocity MSE/out^2), uniform t, checkpointed Gaussian prior"
+                };
+                if c.detail > 0. {
+                    format!(
+                        "{base} + {} x mean squared first difference of the residual",
+                        c.detail
+                    )
+                } else {
+                    base.into()
+                }
             },
             representation: "f32 mono waveform; lossless time-major blocks".into(),
             model_hash: String::new(),
@@ -465,7 +492,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     let current_source = source_hash()?;
     write_json(
         &c.run.join("run.json"),
-        &serde_json::json!({"git_commit":git(&["rev-parse","HEAD"]),"git_dirty":!git(&["status","--porcelain"]).is_empty(),"source_hash":current_source,"dataset":dataset.identity,"parameters":ck.model.count(),"architecture":ck.model.architecture,"crop_samples":n,"batch":c.batch,"samples_per_step":n*c.batch,"validation_input":c.validation,"sample_rate":ck.sample_rate,"additional_steps":c.steps,"seed":c.seed,"lr":ck.adam.lr,"optimizer":"Adam beta1=.9 beta2=.999 eps=1e-8 global gradient clip=1","resume":c.resume,"weights_only":c.weights_only,"backend":trainer.name(),"backend_info":trainer.info(),"objective":ck.objective,"representation":ck.representation,"flow":ck.flow}),
+        &serde_json::json!({"git_commit":git(&["rev-parse","HEAD"]),"git_dirty":!git(&["status","--porcelain"]).is_empty(),"source_hash":current_source,"dataset":dataset.identity,"parameters":ck.model.count(),"architecture":ck.model.architecture,"crop_samples":n,"batch":c.batch,"samples_per_step":n*c.batch,"validation_input":c.validation,"sample_rate":ck.sample_rate,"additional_steps":c.steps,"seed":c.seed,"lr":ck.adam.lr,"optimizer":"Adam beta1=.9 beta2=.999 eps=1e-8 global gradient clip=1","resume":c.resume,"weights_only":c.weights_only,"backend":trainer.name(),"backend_info":trainer.info(),"objective":ck.objective,"representation":ck.representation,"flow":ck.flow,"detail":ck.detail}),
     )?;
     ck.save(&c.run.join("initial.json"))?;
     let sample_config = Sampling {
@@ -585,6 +612,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
                 mask: &mask_batch,
                 noise: &noise_batch,
                 t: &t_batch,
+                detail: ck.detail,
             },
         )?;
         let loss = result.loss;
@@ -679,7 +707,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     step_ms.sort_by(|a, b| a.total_cmp(b));
     write_json(
         &c.run.join("metrics.json"),
-        &serde_json::json!({"backend":trainer.name(),"backend_info":trainer.info(),"timing_scope":match c.backend.as_str(){"cpu"=>"CPU wall operations","cuda"=>"host wall time around synchronized CUDA kernel groups; includes payload upload",_=>"GPU event operation totals; step wall includes transfers, enqueue and sync"},"flow":ck.flow,"loss_units":if ck.flow.is_legacy(){"waveform velocity MSE"}else{"normalized Gaussian-residual MSE"},"parameters":ck.model.count(),"steps":c.steps,"total_steps":ck.completed_steps,"preprocessing_ms":preprocessing_ms,"neural_forward_backward_ms":neural_ms,"optimizer_ms":optimizer_ms,"training_wall_ms_with_previews":training_wall_ms,"step_mean_ms":step_ms.iter().sum::<f64>()/step_ms.len() as f64,"step_median_ms":step_ms[step_ms.len()/2],"step_max_ms":step_ms.last(),"final_sampling_ms":final_sampling_ms,"other_sampling_ms":sampling_ms,"sampling":sample_config,"sampling_backend":c.backend,"batch":c.batch,"samples_per_step":n*c.batch,"steps_per_second":c.steps as f64/(training_wall_ms/1000.).max(1e-9),"validation_input":c.validation,"validation_initial_loss":initial_val,"validation_final_loss":final_val,"validation_curve":val_curve,"peak_rss_kib":peak_rss_kib(),"fixed_probe_initial_loss":initial_eval,"fixed_probe_final_loss":final_eval,"same_noise_output_mse_change":delta,"generated_rms":audio::rms(&final_audio),"task_counts":task_counts,"source_counts":source_counts,"silence_retries":silence_retries,"crop_sampling":"uniform file then uniform start; retry silent crops","quality_claim":"pipeline verification only; no perceptual quality or generalization established"}),
+        &serde_json::json!({"backend":trainer.name(),"backend_info":trainer.info(),"timing_scope":match c.backend.as_str(){"cpu"=>"CPU wall operations","cuda"=>"host wall time around synchronized CUDA kernel groups; includes payload upload",_=>"GPU event operation totals; step wall includes transfers, enqueue and sync"},"flow":ck.flow,"detail":ck.detail,"loss_units":if ck.flow.is_legacy(){"waveform velocity MSE"}else{"normalized Gaussian-residual MSE"},"parameters":ck.model.count(),"steps":c.steps,"total_steps":ck.completed_steps,"preprocessing_ms":preprocessing_ms,"neural_forward_backward_ms":neural_ms,"optimizer_ms":optimizer_ms,"training_wall_ms_with_previews":training_wall_ms,"step_mean_ms":step_ms.iter().sum::<f64>()/step_ms.len() as f64,"step_median_ms":step_ms[step_ms.len()/2],"step_max_ms":step_ms.last(),"final_sampling_ms":final_sampling_ms,"other_sampling_ms":sampling_ms,"sampling":sample_config,"sampling_backend":c.backend,"batch":c.batch,"samples_per_step":n*c.batch,"steps_per_second":c.steps as f64/(training_wall_ms/1000.).max(1e-9),"validation_input":c.validation,"validation_initial_loss":initial_val,"validation_final_loss":final_val,"validation_curve":val_curve,"peak_rss_kib":peak_rss_kib(),"fixed_probe_initial_loss":initial_eval,"fixed_probe_final_loss":final_eval,"same_noise_output_mse_change":delta,"generated_rms":audio::rms(&final_audio),"task_counts":task_counts,"source_counts":source_counts,"silence_retries":silence_retries,"crop_sampling":"uniform file then uniform start; retry silent crops","quality_claim":"pipeline verification only; no perceptual quality or generalization established"}),
     )?;
     eprintln!(
         "checkpoint {} | probe {:.6} -> {:.6} | output delta MSE {:.6}",

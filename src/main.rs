@@ -145,6 +145,10 @@ struct TrainArgs {
     /// Training AND sampling prior standard deviation; checkpointed, not an OOD knob.
     #[arg(long, default_value_t = 1.)]
     prior_std: f32,
+    /// Weight of the detail term in the objective: `<r,r> + weight * <dr,dr>` over unknown samples.
+    /// 0 is the plain waveform residual MSE. Checkpointed; CPU and CUDA backends only.
+    #[arg(long, default_value_t = 0.)]
+    detail_weight: f32,
     /// baseline preserves v1; pyramid pools residual branches at scales 1/4/16/64.
     #[arg(long, default_value="baseline", value_parser=["baseline", "pyramid"])]
     network: String,
@@ -347,6 +351,7 @@ fn main() -> Result<()> {
                 } else {
                     FlowConfig::Velocity
                 },
+                detail: a.detail_weight,
                 backend: a.backend,
                 input: a.input,
                 run: a.run,
@@ -461,6 +466,7 @@ fn main() -> Result<()> {
             audio::synthetic(&corpus, 16000)?;
             runtime::train(TrainConfig {
                 flow: FlowConfig::Velocity,
+                detail: 0.,
                 backend: "cpu".into(),
                 input: corpus,
                 run: run.join("training"),

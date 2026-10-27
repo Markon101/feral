@@ -52,12 +52,25 @@ extern "C" __global__ void feral_pool(const float *__restrict__ x, float *__rest
 
 // Unknown-sample MSE and its derivative. `unknown` holds the per-item unknown count so the
 // reported loss is the mean over batch items; weight gradients divide by batch as well.
+// Residual at one sample, in whichever space the parameterization trains in.
+__device__ __forceinline__ float feral_residual(const float *__restrict__ prediction,
+                                                const float *__restrict__ data, unsigned n,
+                                                unsigned total, unsigned j, int pre, float cskip,
+                                                float cout) {
+  unsigned item = j / n;
+  float y = data[j], z = data[total + j], m = data[2u * total + j];
+  float t = data[3u * total + 4u * item];
+  float xt = (m == 1.0f) ? y : (1.0f - t) * z + t * y;
+  float target = pre ? (y - z - cskip * xt) / cout : (y - z);
+  return prediction[j] - target;
+}
+
 extern "C" __global__ void feral_loss_grad(const float *__restrict__ prediction,
                                            const float *__restrict__ data,
                                            const float *__restrict__ unknown,
                                            float *__restrict__ dy, float *__restrict__ partial,
                                            unsigned n, int pre, float cskip, float cout,
-                                           unsigned items) {
+                                           float detail, unsigned items) {
   unsigned id = blockIdx.x * blockDim.x + threadIdx.x, lane = threadIdx.x;
   __shared__ float scratch[256];
   float value = 0.f;
@@ -69,9 +82,25 @@ extern "C" __global__ void feral_loss_grad(const float *__restrict__ prediction,
     float u = fmaxf(unknown[item], 1.0f);
     float xt = (m == 1.0f) ? y : (1.0f - t) * z + t * y;
     float target = pre ? (y - z - cskip * xt) / cout : (y - z);
-    float d = (prediction[id] - target) * (1.0f - m);
-    dy[id] = 2.0f * d / u;
+    float r = prediction[id] - target;
+    float d = r * (1.0f - m);
+    float dyv = 2.0f * d / u;
     value = d * d / u;
+    // Detail term: mean squared first difference of the residual over pairs where both samples
+    // are unknown, so known regions never leak in. Mirrors flow::loss_gradient_detailed.
+    if (detail > 0.f) {
+      unsigned base = item * n, end = base + n;
+      if (m == 0.f && id + 1 < end && data[2u * total + id + 1] == 0.f) {
+        float delta = feral_residual(prediction, data, n, total, id + 1, pre, cskip, cout) - r;
+        value += detail * delta * delta / u;
+        dyv -= 2.f * detail * delta / u;
+      }
+      if (m == 0.f && id > base && data[2u * total + id - 1] == 0.f) {
+        float delta = r - feral_residual(prediction, data, n, total, id - 1, pre, cskip, cout);
+        dyv += 2.f * detail * delta / u;
+      }
+    }
+    dy[id] = dyv;
   }
   scratch[lane] = value;
   __syncthreads();

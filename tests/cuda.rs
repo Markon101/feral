@@ -114,6 +114,47 @@ fn baseline_cuda_update_matches_cpu() {
 }
 
 #[test]
+fn detail_term_matches_cpu_on_device() {
+    // The detail term is a stencil inside the loss kernel; at a non-zero weight the device loss and
+    // gradient must still match the CPU reference exactly (up to fp32 summation order).
+    use feral::backend::Resident as _;
+    let n = 96usize;
+    let model = tiny();
+    let flow = FlowConfig::Velocity;
+    let adam = Adam::new(model.count(), 0.0003);
+    let clean: Vec<f32> = (0..n).map(|i| 0.2 * (i as f32 * 0.13).sin()).collect();
+    let noise: Vec<f32> = (0..n).map(|i| 0.1 * ((i * 7 % 11) as f32 - 5.)).collect();
+    let mut mask = vec![1f32; n];
+    mask[16..80].fill(0.);
+    let t = 0.37f32;
+    for detail in [2.0f32, 8.0] {
+        let (cpu_loss, cpu_grad) = feral::parameterization::loss_gradient_detailed(
+            &model, &flow, &clean, &mask, &noise, t, detail,
+        );
+        // A fresh trainer per weight: the resident reports the *previous* step's statistics
+        // (reported_loss_lag_steps = 1), so reusing one would compare against the wrong lambda.
+        let mut device = feral::cuda::CudaTrainer::new(&model, &adam, n, 1, flow.clone())
+            .expect("CUDA device unavailable; this test only runs on a CUDA machine");
+        device.set_detail(detail);
+        let step = device
+            .step(&clean, &mask, &noise, &[t], false)
+            .expect("device step with detail");
+        let gpu_grad = device.read_gradients().expect("gradients");
+        assert!(
+            (cpu_loss - step.loss).abs() <= 1e-5 + 1e-3 * cpu_loss.abs(),
+            "detail loss parity at {detail}: cpu {cpu_loss} device {}",
+            step.loss
+        );
+        let max = cpu_grad
+            .iter()
+            .zip(&gpu_grad)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(max <= 2e-5, "detail gradient parity at {detail}: {max}");
+    }
+}
+
+#[test]
 fn device_evaluation_loss_matches_cpu() {
     // `parameterization::loss` is what validation reports. It must give the same number through a
     // device-backed Velocity as through the CPU reference, for both parameterizations.

@@ -14,6 +14,8 @@ pub struct Batch<'a> {
     pub mask: &'a [f32],
     pub noise: &'a [f32],
     pub t: &'a [f32],
+    /// Weight of the detail term in the loss; 0 is the plain objective.
+    pub detail: f32,
 }
 impl Batch<'_> {
     pub fn items(&self) -> usize {
@@ -37,6 +39,9 @@ pub trait Resident {
         t: &[f32],
         update: bool,
     ) -> Result<Step>;
+    /// Weight of the detail term in the loss. Backends without it keep the plain objective; a
+    /// caller that asks for a non-zero weight on such a backend gets an error from `step`.
+    fn set_detail(&mut self, _detail: f32) {}
     /// Forward-only field evaluation. A backend without a cheaper path stays correct by running a
     /// full step without an update; the CUDA resident skips the backward pass instead.
     fn predict(&mut self, x: &[f32], mask: &[f32], t: f32) -> Result<Vec<f32>> {
@@ -156,13 +161,14 @@ impl Trainer {
                         "invalid CPU batch shape"
                     );
                     let row = i * n..(i + 1) * n;
-                    let (item_loss, g) = parameterization::loss_gradient(
+                    let (item_loss, g) = parameterization::loss_gradient_detailed(
                         model,
                         flow,
                         &batch.clean[row.clone()],
                         &batch.mask[row.clone()],
                         &batch.noise[row.clone()],
                         batch.t[i],
+                        batch.detail,
                     );
                     loss += item_loss;
                     for (dst, src) in accumulated.iter_mut().zip(&g) {
@@ -188,6 +194,10 @@ impl Trainer {
                     batch.items() == 1,
                     "the OpenCL backend is single-crop; use --backend cuda or --batch 1"
                 );
+                ensure!(
+                    batch.detail == 0.,
+                    "detail weighting is implemented on the CPU and CUDA backends only"
+                );
                 let s = g.train_step(
                     batch.clean,
                     batch.mask,
@@ -204,6 +214,7 @@ impl Trainer {
             }
             #[cfg(feature = "cuda")]
             Self::Cuda(g) => {
+                g.set_detail(batch.detail);
                 let s = g.train_step(batch.clean, batch.mask, batch.noise, batch.t)?;
                 adam.step = g.step;
                 Ok(Step {

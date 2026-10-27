@@ -259,6 +259,12 @@ decide the receptive field as `block * (1 + 2 * sum(dilations))`. The default 32
 frames are cheaper per sample (convolution cost scales with frames), which is what makes a wider,
 longer-context model affordable.
 
+`--detail-weight <w>` adds an optional detail term to the objective:
+`mean(r^2) + w * mean((r[i+1] - r[i])^2)` over unknown samples, where `r` is the residual. It is a
+3-tap stencil rather than a transform, so it weights detail without an FFT; `0` (the default)
+reproduces the plain objective bit for bit. It is checkpointed, must be repeated on a full resume,
+and is implemented on the CPU and CUDA backends.
+
 Long-context configurations are checked the same way as any other: `--block 128` changes the feature
 layout and exercises 128-frame dilations, so `tests/cuda.rs::large_frame_and_wide_dilation_parity`
 pins loss, gradient and prediction parity there, and `gpu-audit` passes on a checkpoint built at the

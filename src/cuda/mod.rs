@@ -287,6 +287,8 @@ pub struct CudaTrainer {
     block: u32,
     count: usize,
     flow: FlowConfig,
+    /// Detail-term weight applied by the loss kernel; 0 reproduces the plain objective.
+    detail: f32,
     pub step: usize,
     lr: f32,
     info: Value,
@@ -560,6 +562,7 @@ impl CudaTrainer {
             block: model.architecture.block as u32,
             count: offset,
             flow,
+            detail: 0.,
             step: adam.step,
             lr: adam.lr,
             info,
@@ -658,6 +661,10 @@ impl CudaTrainer {
         info["last_step_gpu_ms"] = self.last_gpu_ms.into();
         info["last_step_host_ms"] = self.last_host_ms.into();
         info
+    }
+    /// Weight of the detail term in the loss. 0 reproduces the plain objective exactly.
+    pub fn set_detail(&mut self, detail: f32) {
+        self.detail = detail.max(0.);
     }
     /// Forward-only field evaluation for sampling: payload upload and network forward, then the
     /// prediction comes back. No loss reduction, no backward pass, no optimizer.
@@ -891,6 +898,7 @@ impl CudaTrainer {
         let mut d_pre = pre;
         let mut d_cskip = cskip;
         let mut d_cout = cout;
+        let mut d_detail = self.detail;
         let mut d_items = items;
         self.launch(
             "pool+conv",
@@ -898,7 +906,8 @@ impl CudaTrainer {
             (parts, 1, 1),
             (BATCH_THREADS as u32, 1, 1),
             &mut kargs![
-                d_pred, d_data, d_unknown, d_dy, d_parts, d_n, d_pre, d_cskip, d_cout, d_items
+                d_pred, d_data, d_unknown, d_dy, d_parts, d_n, d_pre, d_cskip, d_cout, d_detail,
+                d_items
             ],
         )?;
         for j in (0..last).rev() {
@@ -1174,6 +1183,9 @@ impl crate::backend::Resident for CudaTrainer {
     }
     fn predict(&mut self, x: &[f32], mask: &[f32], t: f32) -> Result<Vec<f32>> {
         CudaTrainer::predict(self, x, mask, t)
+    }
+    fn set_detail(&mut self, detail: f32) {
+        CudaTrainer::set_detail(self, detail)
     }
     fn sync(&self, model: &mut Model, adam: &mut Adam) -> Result<()> {
         CudaTrainer::sync(self, model, adam)
