@@ -596,6 +596,46 @@ Two limits were hit and fixed on the way: a 6.5 M checkpoint is 267 MB of decima
 cap went 192 → 768 MB (base64 would cut that ~3x), and `--grow-crop` exists because a curriculum
 step changes the crop but not the weights.
 
+### More steps: level and flatness, and the control was wrong
+
+Arm K continues arm D — plain velocity, full corpus, 4 s crops, batch 8 — from its 20k checkpoint to
+60k, carrying Adam and RNG, so it is one continuous data stream and not a new recipe. Held-out loss
+0.03221 → 0.02568 (−20.3 %), fixed probe 0.05590 → 0.05037 (−9.9 %). Four takes at seeds
+11/22/33/44, Heun 32, device sampler; audio in `~/Downloads/feral-arm-k-20261027-151848/`.
+
+The table above uses a "real corpus" row that is one 60 s excerpt of a single clipped master
+(862 limiter hits in that window). That is not a length match for a 4 s take, and it made the corpus
+look darker, quieter and less flat than real audio actually is at this length. The control here is
+183 four-second windows cut at 25/50/75 % through all 61 usable training files, measured by
+`scripts/matched_corpus_control.py` and stored in `reports/corpus-control-4s.json`; the takes and
+their descriptors are in `reports/arm-k-60k.json`:
+
+| recipe | steps | held-out | probe | RMS | flatness | lag-1 | limiter | bands <250 / 250-1k / 1k-4k / >4k |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| D, plain velocity | 20 k | 0.0322 | 0.0559 | 0.160 | 0.142 | 0.922 | 0 | 0.71 / 0.16 / 0.10 / 0.03 |
+| K, plain velocity | 60 k | 0.0257 | 0.0504 | 0.177 | 0.113 | 0.939 | 0 | 0.72 / 0.18 / 0.08 / 0.02 |
+| real audio, 4 s windows | — | — | — | 0.225 | 0.112 | 0.921 | — | 0.58 / 0.19 / 0.13 / 0.02 |
+
+Interquartile spread of those 183 real windows: RMS 0.172–0.269, flatness 0.070–0.195, lag-1
+0.848–0.950, 1–4 kHz 0.073–0.225. Per-seed sd: flatness 0.006 at 20k and 0.012 at 60k.
+
+* **Level was the real deficit and 40k steps mostly closed it.** 0.160 → 0.177, from below the
+  corpus interquartile range to inside it.
+* **Flatness 0.142 → 0.113 lands on the corpus median 0.112**, and the 250–1k share 0.16 → 0.18
+  against 0.19. Both changes are ~3 sigma over the per-seed spread.
+* **The two descriptors that say "too smooth" moved the wrong way**: 1–4 kHz 0.10 → 0.08 against
+  0.13, lag-1 0.922 → 0.939 against 0.921. That is the same direction the detail term pushed, and
+  it is what the conditional-mean argument predicts: extra capacity goes to level and to the mean,
+  not to detail.
+* **Earlier deficit claims need re-basing.** Against a matched-length control both arms sit inside
+  the corpus interquartile range on every descriptor, and the corpus range is wide enough
+  (flatness 0.07–0.195) that these descriptors cannot rank models against each other with four
+  takes. "1–4 kHz is 0.10 against the corpus's 0.16" was a 4 s take compared with a 60 s master
+  excerpt; the like-for-like figure is 0.10 against 0.133. The within-arm comparisons (detail
+  weight w = 0 / 2 / 8, the preconditioned arms at fixed corpus) are unaffected — they never used
+  that control — but the size of the corpus gap was overstated. The right control is measured
+  windows at the length being generated, and that belongs in the generator script from now on.
+
 ## Status at pause (2026-10-25)
 
 `experiments/audio-1m-cuda-02/run-80k-c4000-b8` is the first run on the full corpus: 62 recordings
@@ -624,7 +664,10 @@ Open items, in the order the measurements point at them:
 * The residual error sits at t ≈ 0.9 (0.285 MSE versus 0.040 at t = 0.1). Forty thousand extra
   steps cut held-out validation by 28 % (0.0331 → 0.0237) but moved the fixed probe only 7 %
   (0.0674 → 0.0627), so the endpoint is not simply under-trained — a loss weighting that spends
-  more capacity near t = 1 is the next thing to try, not more steps.
+  more capacity near t = 1 is the next untried thing. Arm K has since measured what plain extra
+  steps buy at this configuration: 20 % off held-out loss, level 0.160 → 0.177 and flatness
+  0.142 → 0.113 toward the corpus, while the 1-4 kHz share fell 0.10 → 0.08, i.e. further from
+  real detail rather than closer.
 * The ≈ 4.8 ms fixed per-step cost measured earlier is still there, but at 4 s crops it is under
   10 % of a step; it only matters for short crops.
 * 64×64 tiles with 4×4 register blocking were measured (above) and rejected: same speed, more
