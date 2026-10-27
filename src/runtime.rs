@@ -349,6 +349,25 @@ fn preview_sample(
         _ => flow::sample(&ck.velocity(), &zeros, &zeros, sampling),
     }
 }
+/// Fixed probe and held-out validation window, in seconds of audio.
+///
+/// Pinned by duration rather than by sample count so `validation_loss` means the same window at
+/// every sample rate: 64,000 samples is 4 s at 16 kHz but 1.33 s at 48 kHz, which made runs at
+/// different rates incomparable. The CPU reference costs parameters x window, so 4 s stays the
+/// cheap end for probes; for a 6.5 M model that is still minutes per pass on the CPU.
+pub const PROBE_WINDOW_SECONDS: f32 = 4.0;
+
+/// The probe/validation window for a checkpoint at `sample_rate`, clamped to the training crop.
+///
+/// The field needs whole frames, so the duration is rounded down to a multiple of `block` — by
+/// less than one frame, and never above 4 s. The CLI's frame sizes (16, 32, 64, 128) divide 4 s at
+/// 16, 24 and 48 kHz exactly, and at 16 kHz the result is the old `min(crop, 64_000)`, so existing
+/// runs keep their numbers bit for bit.
+pub fn probe_window_samples(sample_rate: u32, crop_samples: usize, block: usize) -> usize {
+    let window = (PROBE_WINDOW_SECONDS as f64 * sample_rate as f64).round() as usize;
+    crop_samples.min(window - window % block)
+}
+
 pub fn train(c: TrainConfig) -> Result<PathBuf> {
     ensure!(
         (1..=100000).contains(&c.steps),
@@ -383,8 +402,9 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     // Fixed probes and validation always use at most a 4 s window, whatever the training crop is.
     // Two reasons: the CPU reference evaluation costs parameters x window, which at a 16 s crop is
     // minutes per probe, and a constant window keeps `validation_loss` comparable across runs that
-    // train at different crop lengths.
-    let eval_n = n.min(64_000);
+    // train at different crop lengths. It is a duration rather than a sample count so the window
+    // covers the same span of audio at every rate; 64,000 samples was 4 s only at 16 kHz.
+    let eval_n = probe_window_samples(c.preprocess.sample_rate, n, b);
     let validation = match &c.validation {
         Some(path) => Some(Dataset::load(path, c.preprocess.clone(), eval_n)?),
         None => None,
@@ -739,6 +759,32 @@ pub struct RenderConfig {
     /// field on the device. Never a silent fallback - an unavailable backend is a hard error.
     pub backend: String,
 }
+/// Enforces the protected-sample contract for a conditioned render.
+///
+/// Every position with `mask != 0` is a known sample — a continue suffix, an inpaint collar or a
+/// variation anchor — and must come back bit-identical (README, AGENTS.md, reports/VALIDATION.md).
+/// This used to be reported as `protected_samples_exact` in the take's JSON without being
+/// enforced; a take that differs by one bit is broken, so the assertion names the mode and the
+/// first offending index. The JSON field stays, because readers and reports key on it.
+pub fn ensure_protected(output: &[f32], known: &[f32], mask: &[f32], mode: &str) -> Result<()> {
+    ensure!(
+        output.len() == known.len() && output.len() == mask.len(),
+        "protected-sample check shape mismatch"
+    );
+    if let Some(i) = output
+        .iter()
+        .zip(known)
+        .zip(mask)
+        .position(|((&a, &b), &m)| m != 0. && a.to_bits() != b.to_bits())
+    {
+        anyhow::bail!(
+            "{mode} render changed protected sample {i} ({} -> {}); known samples must be retained bit-exactly",
+            known[i],
+            output[i]
+        );
+    }
+    Ok(())
+}
 pub fn render(c: RenderConfig) -> Result<()> {
     let ck = Checkpoint::load(&c.checkpoint)?;
     c.sampling.validate()?;
@@ -878,11 +924,16 @@ pub fn render(c: RenderConfig) -> Result<()> {
     };
     let sampling_ms = now.elapsed().as_secs_f64() * 1000.;
     let jumps = conditioning::boundary_jumps(&output[..output_len], &mask[..output_len]);
-    let preserved = output
-        .iter()
-        .zip(&known)
-        .zip(&mask)
-        .all(|((&a, &b), &m)| m == 0. || a.to_bits() == b.to_bits());
+    let mode_label = match c.mode {
+        Mode::Generate => "generate",
+        Mode::Continue => "continue",
+        Mode::Inpaint => "inpaint",
+        Mode::Variation => "variation",
+    };
+    ensure_protected(&output, &known, &mask, mode_label)?;
+    // The check above refuses any changed protected sample, so a written take is always exact.
+    // The field stays in the JSON because readers and existing reports key on it.
+    let preserved = true;
     output.truncate(output_len);
     let mut all = prefix;
     all.extend(output);

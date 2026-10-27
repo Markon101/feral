@@ -558,6 +558,132 @@ fn continuity_retains_feasible_transient_slopes() {
 }
 
 #[test]
+fn sixteen_kilohertz_validation_loss_matches_the_sample_pinned_window() {
+    // The probe/validation window used to be pinned at 64,000 samples, which is exactly 4.0 s at
+    // 16 kHz. Deriving it from the sample rate must leave every 16 kHz run bit-identical, so this
+    // pins the loss measured with the pre-change window (crop 5 s, so the clamp is exercised).
+    let dir = temp();
+    let corpus = dir.join("corpus");
+    fs::create_dir(&corpus).unwrap();
+    let x: Vec<f32> = (0..16000 * 6)
+        .map(|i| 0.2 * (i as f32 * 0.013).sin())
+        .collect();
+    audio::write_wav(&corpus.join("held.wav"), &x, 16000).unwrap();
+    let mut c = config(&dir, "pinned", 1, None);
+    c.crop_seconds = 5.;
+    c.validation = Some(corpus);
+    runtime::train(c).unwrap();
+    let metrics: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("pinned/metrics.json")).unwrap()).unwrap();
+    let loss = metrics["validation_initial_loss"].as_f64().unwrap() as f32;
+    // Captured from the pre-change build (`eval_n = n.min(64_000)`) with this exact config:
+    // decimal 1.4121605, bits 0x3fb4c1ad. Any difference here means the duration-derived window
+    // moved a 16 kHz number and broke comparability with every existing run.
+    assert_eq!(
+        loss.to_bits(),
+        0x3fb4c1ad,
+        "16 kHz validation loss changed: {loss}"
+    );
+    assert_eq!(
+        runtime::probe_window_samples(16_000, 80_000, 4),
+        64_000,
+        "the 16 kHz window must stay 64,000 samples"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn probe_window_is_four_seconds_at_every_supported_rate() {
+    // 4.0 s of audio, whatever the rate: the fixed probe and held-out validation window used to be
+    // 64,000 samples, which is 4 s at 16 kHz but 1.33 s at 48 kHz.
+    for (rate, four_seconds) in [(16_000, 64_000), (24_000, 96_000), (48_000, 192_000)] {
+        for block in [16, 32, 64, 128] {
+            assert_eq!(
+                runtime::probe_window_samples(rate, four_seconds * 2, block),
+                four_seconds,
+                "{rate} Hz window"
+            );
+            let short = block * 100;
+            assert_eq!(
+                runtime::probe_window_samples(rate, short, block),
+                short,
+                "{rate} Hz window must clamp to a shorter crop"
+            );
+        }
+    }
+    // A rate whose 4 s is not frame-aligned rounds down to a whole frame, never above 4 s.
+    let window = runtime::probe_window_samples(44_100, 512_000, 128);
+    assert!(window <= 176_400 && window.is_multiple_of(128), "{window}");
+    // 16 kHz keeps the old value bit for bit, so no existing run's window moves.
+    for crop in [512, 63_936, 64_000, 80_000, 512_000] {
+        assert_eq!(
+            runtime::probe_window_samples(16_000, crop, 64),
+            crop.min(64_000)
+        );
+    }
+}
+
+#[test]
+fn protected_samples_are_asserted_exactly_and_violations_are_refused() {
+    let dir = temp();
+    audio::synthetic(&dir.join("corpus"), 16000).unwrap();
+    let checkpoint = runtime::train(config(&dir, "protected", 2, None)).unwrap();
+    let reference = dir.join("corpus/pattern-0.wav");
+    let original: Vec<f32> = hound::WavReader::open(&reference)
+        .unwrap()
+        .into_samples::<f32>()
+        .map(Result::unwrap)
+        .collect();
+    let output = dir.join("continued.wav");
+    runtime::render(RenderConfig {
+        checkpoint: checkpoint.clone(),
+        input: Some(reference),
+        output: output.clone(),
+        seconds: 0.032,
+        start: 0.,
+        end: 0.,
+        sampling: Sampling {
+            steps: 3,
+            ..Default::default()
+        },
+        mode: Mode::Continue,
+        backend: "cpu".into(),
+        max_input_seconds: 600.,
+    })
+    .unwrap();
+    let rendered: Vec<f32> = hound::WavReader::open(&output)
+        .unwrap()
+        .into_samples::<f32>()
+        .map(Result::unwrap)
+        .collect();
+    // Continue protects the last crop/2 samples of the input. They must survive conditioning,
+    // sampling, the WAV roundtrip and the metadata write exactly, not just be reported as exact.
+    let context = (Checkpoint::load(&checkpoint).unwrap().crop_samples / 2).min(original.len());
+    let offset = original.len() - context;
+    assert_eq!(&rendered[offset..original.len()], &original[offset..]);
+    let meta: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.with_extension("json")).unwrap()).unwrap();
+    assert!(meta["protected_samples_exact"].as_bool().unwrap());
+    let mask: Vec<f32> = (0..original.len())
+        .map(|i| if i >= offset { 1. } else { 0. })
+        .collect();
+    runtime::ensure_protected(&rendered[..original.len()], &original, &mask, "continue").unwrap();
+    // Negative control: one flipped mantissa bit inside the protected region must be refused,
+    // and the error must name the mode and the first offending index.
+    let mut violated = rendered[..original.len()].to_vec();
+    violated[offset + 3] = f32::from_bits(violated[offset + 3].to_bits() ^ 1);
+    let err = runtime::ensure_protected(&violated, &original, &mask, "continue").unwrap_err();
+    assert!(
+        err.to_string().contains(&format!(
+            "continue render changed protected sample {}",
+            offset + 3
+        )),
+        "{err}"
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn collar_tangent_adapts_to_headroom_and_limiter_handles_impossible_slope() {
     let mut known = vec![0.; 64];
     known[14] = 0.85;
