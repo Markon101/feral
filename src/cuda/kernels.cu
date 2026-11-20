@@ -10,22 +10,31 @@
 // waveform block is contiguous per item and trig holds t, 1-t, sin, cos per item.
 extern "C" __global__ void feral_features(
     const float *__restrict__ data, float *__restrict__ x,
-    unsigned n, unsigned block, int pre, float cin, float scale, unsigned frames) {
+    unsigned n, unsigned block, int pre, float data_scale, float prior_std,
+    unsigned frames, unsigned total_frames) {
   unsigned channels = 3u * block + 4u;
-  unsigned id = blockIdx.x * blockDim.x + threadIdx.x;
-  if (id >= (n / block) * channels) return;
-  unsigned p = id / channels, c = id % channels;
+  unsigned c = blockIdx.y * blockDim.x + threadIdx.x;
+  unsigned p = blockIdx.x * blockDim.y + threadIdx.y;
+  if (c >= channels || p >= total_frames) return;
+  unsigned id = p * channels + c;
   unsigned item = p / frames;
   if (c < block) {
     unsigned i = p * block + c;
     float y = data[i], z = data[n + i], m = data[2u * n + i];
     float t = data[3u * n + 4u * item];
     float xt = (m == 1.0f) ? y : (1.0f - t) * z + t * y;
-    x[id] = pre ? ((m == 1.0f) ? y / scale : xt * cin) : xt;
+    if (pre) {
+      float omt = 1.0f - t;
+      float a = data_scale * data_scale, b = prior_std * prior_std;
+      float cin = 1.0f / sqrtf(t * t * a + omt * omt * b);
+      x[id] = (m == 1.0f) ? y / data_scale : xt * cin;
+    } else {
+      x[id] = xt;
+    }
   } else if (c < 2u * block) {
     unsigned i = p * block + (c - block);
     float y = data[i];
-    x[id] = (pre ? y / scale : y) * data[2u * n + i];
+    x[id] = (pre ? y / data_scale : y) * data[2u * n + i];
   } else if (c < 3u * block) {
     x[id] = data[2u * n + p * block + (c - 2u * block)];
   } else {
@@ -53,13 +62,20 @@ extern "C" __global__ void feral_pool(const float *__restrict__ x, float *__rest
 // Unknown-sample MSE and its derivative. `unknown` holds the per-item unknown count so the
 // reported loss is the mean over batch items; weight gradients divide by batch as well.
 // Residual at one sample, in whichever space the parameterization trains in.
+__device__ __forceinline__ void feral_precond_coeffs(
+    float t, float data_scale, float prior_std, float *cskip, float *cout) {
+  float omt = 1.0f - t;
+  float a = data_scale * data_scale, b = prior_std * prior_std;
+  float d = t * t * a + omt * omt * b;
+  *cskip = (t * a - omt * b) / d;
+  *cout = data_scale * prior_std / sqrtf(d);
+}
+
 __device__ __forceinline__ float feral_residual(const float *__restrict__ prediction,
-                                                const float *__restrict__ data, unsigned n,
-                                                unsigned total, unsigned j, int pre, float cskip,
+                                                const float *__restrict__ data, unsigned total,
+                                                unsigned j, int pre, float t, float cskip,
                                                 float cout) {
-  unsigned item = j / n;
   float y = data[j], z = data[total + j], m = data[2u * total + j];
-  float t = data[3u * total + 4u * item];
   float xt = (m == 1.0f) ? y : (1.0f - t) * z + t * y;
   float target = pre ? (y - z - cskip * xt) / cout : (y - z);
   return prediction[j] - target;
@@ -69,8 +85,8 @@ extern "C" __global__ void feral_loss_grad(const float *__restrict__ prediction,
                                            const float *__restrict__ data,
                                            const float *__restrict__ unknown,
                                            float *__restrict__ dy, float *__restrict__ partial,
-                                           unsigned n, int pre, float cskip, float cout,
-                                           float detail, unsigned items) {
+                                           unsigned n, int pre, float data_scale,
+                                           float prior_std, float detail, unsigned items) {
   unsigned id = blockIdx.x * blockDim.x + threadIdx.x, lane = threadIdx.x;
   __shared__ float scratch[256];
   float value = 0.f;
@@ -80,6 +96,8 @@ extern "C" __global__ void feral_loss_grad(const float *__restrict__ prediction,
     float y = data[id], z = data[total + id], m = data[2u * total + id];
     float t = data[3u * total + 4u * item];
     float u = fmaxf(unknown[item], 1.0f);
+    float cskip = 0.0f, cout = 1.0f;
+    if (pre) feral_precond_coeffs(t, data_scale, prior_std, &cskip, &cout);
     float xt = (m == 1.0f) ? y : (1.0f - t) * z + t * y;
     float target = pre ? (y - z - cskip * xt) / cout : (y - z);
     float r = prediction[id] - target;
@@ -91,12 +109,12 @@ extern "C" __global__ void feral_loss_grad(const float *__restrict__ prediction,
     if (detail > 0.f) {
       unsigned base = item * n, end = base + n;
       if (m == 0.f && id + 1 < end && data[2u * total + id + 1] == 0.f) {
-        float delta = feral_residual(prediction, data, n, total, id + 1, pre, cskip, cout) - r;
+        float delta = feral_residual(prediction, data, total, id + 1, pre, t, cskip, cout) - r;
         value += detail * delta * delta / u;
         dyv -= 2.f * detail * delta / u;
       }
       if (m == 0.f && id > base && data[2u * total + id - 1] == 0.f) {
-        float delta = r - feral_residual(prediction, data, n, total, id - 1, pre, cskip, cout);
+        float delta = r - feral_residual(prediction, data, total, id - 1, pre, t, cskip, cout);
         dyv += 2.f * detail * delta / u;
       }
     }

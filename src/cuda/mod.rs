@@ -297,6 +297,7 @@ pub struct CudaTrainer {
     pub total_wall_ms: f64,
     unknown_buf: Buf,
     trig: Vec<f32>,
+    unknown_host: Vec<f32>,
     ev_start: CuEvent,
     ev_end: CuEvent,
     pub last_gpu_ms: f64,
@@ -467,9 +468,11 @@ impl CudaTrainer {
                 .checked_mul(4)
                 .context("CUDA allocation overflow")?;
             allocated += bytes;
+            let budget = device_budget_bytes();
             ensure!(
-                allocated <= device_budget_bytes(),
-                "CUDA allocation would exceed the 1 GiB resident budget; reduce crop, batch or width"
+                allocated <= budget,
+                "CUDA allocation would exceed the {} MiB resident budget; reduce crop, batch or width",
+                budget >> 20
             );
             let mut ptr: CuDeviceptr = 0;
             // SAFETY: allocate bytes validated above; freed with the owning context.
@@ -571,6 +574,7 @@ impl CudaTrainer {
             total_wall_ms: 0.,
             unknown_buf,
             trig: vec![0.; 4 * items.max(1)],
+            unknown_host: vec![0.; items.max(1)],
             ev_start,
             ev_end,
             last_gpu_ms: 0.,
@@ -650,6 +654,18 @@ impl CudaTrainer {
                 unsafe { (self.driver.ev_sync)(self.pin_event) },
                 "cuEventSynchronize",
             )?;
+            let mut stats = [0f32; 4];
+            // SAFETY: pin_event completed above; the 64-byte pinned block holds these four floats.
+            unsafe {
+                let p = self.pinned as *const f32;
+                for (i, slot) in stats.iter_mut().enumerate() {
+                    *slot = *p.add(i);
+                }
+            }
+            ensure!(
+                stats[3].to_bits() == 0 && stats[0].is_finite() && stats[1].is_finite(),
+                "CUDA detected nonfinite loss, gradients or optimizer state; no checkpoint written"
+            );
         }
         Ok(())
     }
@@ -731,12 +747,17 @@ impl CudaTrainer {
                 (ti * std::f32::consts::TAU).cos(),
             ]);
         }
-        let mut unknown = vec![0f32; self.items];
-        for (i, slot) in unknown.iter_mut().enumerate() {
+        for (i, slot) in self.unknown_host.iter_mut().enumerate() {
             let row = &mask[i * self.n..(i + 1) * self.n];
             *slot = row.iter().filter(|&&v| v == 0.).count().max(1) as f32;
         }
-        Self::upload(&self.driver, self.unknown_buf, &unknown, "unknown counts")?;
+        Self::upload_at(
+            &self.driver,
+            self.unknown_buf,
+            0,
+            &self.unknown_host,
+            "unknown counts",
+        )?;
         // Three straight uploads instead of one host-side concatenation: the payload build used to
         // copy every crop twice (host memcpy, then PCIe) while the device sat idle.
         Self::upload_at(&self.driver, self.data, 0, clean, "clean")?;
@@ -760,29 +781,46 @@ impl CudaTrainer {
         let items = self.items as u32;
         let frames = self.frames;
         let block = self.block;
-        let cin = self.flow.coefficients(t[0]).2;
-        let (pre, scale) = match self.flow {
-            FlowConfig::Velocity => (0i32, 1f32),
-            FlowConfig::Preconditioned { data_scale, .. } => (1i32, data_scale),
+        let (pre, data_scale, prior_std) = match self.flow {
+            FlowConfig::Velocity => (0i32, 1f32, 1f32),
+            FlowConfig::Preconditioned {
+                data_scale,
+                prior_std,
+            } => (1i32, data_scale, prior_std),
         };
         let launch_start = Instant::now();
-        // features
+        // features: 2D grid keeps total_frames on blockIdx.x (2^31-1 max) and channels on blockIdx.y.
+        let total_frames = self.frames * items;
+        let channels = 3u32 * self.block + 4u32;
         let mut a_data = self.data.ptr;
         let mut a_x = self.acts[0].ptr;
         let mut a_n = n;
         let mut a_block = block;
         let mut a_pre = pre;
-        let mut a_cin = cin;
-        let mut a_scale = scale;
+        let mut a_data_scale = data_scale;
+        let mut a_prior_std = prior_std;
         let mut a_frames = frames;
-        let feature_elems =
-            (self.frames as usize * self.items * (3 * self.block as usize + 4)) as u32;
+        let mut a_total_frames = total_frames;
         self.launch(
             "features",
             self.k.features,
-            (feature_elems.div_ceil(BATCH_THREADS as u32).max(1), 1, 1),
-            (BATCH_THREADS as u32, 1, 1),
-            &mut kargs![a_data, a_x, a_n, a_block, a_pre, a_cin, a_scale, a_frames],
+            (
+                total_frames.div_ceil(8).max(1),
+                channels.div_ceil(32).max(1),
+                1,
+            ),
+            (32, 8, 1),
+            &mut kargs![
+                a_data,
+                a_x,
+                a_n,
+                a_block,
+                a_pre,
+                a_data_scale,
+                a_prior_std,
+                a_frames,
+                a_total_frames
+            ],
         )?;
         for (j, s) in self.specs.iter().enumerate() {
             let cf = (self.frames as usize).div_ceil(s.s as usize) as u32;
@@ -883,10 +921,12 @@ impl CudaTrainer {
         let total_samples = self.items * self.n;
         let items = self.items as u32;
         let frames = self.frames;
-        let (cskip, cout, _) = self.flow.coefficients(t[0]);
-        let pre = match self.flow {
-            FlowConfig::Velocity => 0i32,
-            FlowConfig::Preconditioned { .. } => 1i32,
+        let (pre, data_scale, prior_std) = match self.flow {
+            FlowConfig::Velocity => (0i32, 1f32, 1f32),
+            FlowConfig::Preconditioned {
+                data_scale,
+                prior_std,
+            } => (1i32, data_scale, prior_std),
         };
         let last = self.specs.len();
         let parts = (total_samples).div_ceil(BATCH_THREADS) as u32;
@@ -897,17 +937,26 @@ impl CudaTrainer {
         let mut d_parts = self.loss_parts.ptr;
         let mut d_n = self.n as u32;
         let mut d_pre = pre;
-        let mut d_cskip = cskip;
-        let mut d_cout = cout;
+        let mut d_data_scale = data_scale;
+        let mut d_prior_std = prior_std;
         let mut d_detail = self.detail;
         let mut d_items = items;
         self.launch(
-            "pool+conv",
+            "loss",
             self.k.loss,
             (parts, 1, 1),
             (BATCH_THREADS as u32, 1, 1),
             &mut kargs![
-                d_pred, d_data, d_unknown, d_dy, d_parts, d_n, d_pre, d_cskip, d_cout, d_detail,
+                d_pred,
+                d_data,
+                d_unknown,
+                d_dy,
+                d_parts,
+                d_n,
+                d_pre,
+                d_data_scale,
+                d_prior_std,
+                d_detail,
                 d_items
             ],
         )?;
@@ -926,7 +975,7 @@ impl CudaTrainer {
                 let mut e_items = items;
                 let elems = self.items * cf as usize * s.co as usize;
                 self.launch(
-                    "loss",
+                    "activation_grad",
                     self.k.dz,
                     (elems.div_ceil(BATCH_THREADS) as u32, 1, 1),
                     (BATCH_THREADS as u32, 1, 1),
@@ -956,7 +1005,7 @@ impl CudaTrainer {
             let mut f_inv = 1.0f32 / self.items as f32;
             let mut f_items = items;
             self.launch(
-                "dsoftmax",
+                "weight_grad",
                 self.k.dw,
                 (
                     (s.ci * s.k).div_ceil(TILE_OUT as u32),
@@ -1005,7 +1054,7 @@ impl CudaTrainer {
         let mut h_nparts = parts;
         let mut h_inv = 1.0f32 / self.items as f32;
         self.launch(
-            "param-grad",
+            "statistics",
             self.k.stats,
             (1, 1, 1),
             (BATCH_THREADS as u32, 1, 1),
@@ -1095,8 +1144,7 @@ impl CudaTrainer {
             optimizer_ms,
         })
     }
-    /// Small transient buffers (per-item unknown counts) allocate and free per step. They are
-    /// tiny (batch * 4 bytes) and freed immediately, so the resident budget stays exact.
+    /// Asynchronous host-to-device slice upload on the default stream.
     fn upload_at(driver: &Driver, buf: Buf, offset: usize, host: &[f32], what: &str) -> Result<()> {
         ensure!(
             offset + host.len() <= buf.len,
@@ -1130,8 +1178,24 @@ impl CudaTrainer {
         Self::download(&self.driver, *last, &mut y, "prediction")?;
         Ok(y)
     }
+    /// Upload updated parameters onto this resident trainer without recreating its context or
+    /// allocations. Used by cached preview and validation fields.
+    pub fn load_weights(&self, model: &Model) -> Result<()> {
+        self.activate()?;
+        ensure!(
+            model.count() == self.count,
+            "CUDA checkpoint model shape mismatch"
+        );
+        Self::upload(
+            &self.driver,
+            self.weights,
+            &model.parameters(),
+            "parameters",
+        )
+    }
     pub fn sync(&self, model: &mut Model, adam: &mut Adam) -> Result<()> {
         self.activate()?;
+        self.flush_pending()?;
         ensure!(
             model.count() == self.count,
             "CUDA checkpoint model shape mismatch"
@@ -1193,6 +1257,9 @@ impl crate::backend::Resident for CudaTrainer {
     }
     fn flush(&self) -> Result<()> {
         self.flush_pending()
+    }
+    fn load_weights(&self, model: &Model) -> Result<()> {
+        CudaTrainer::load_weights(self, model)
     }
     fn info(&self) -> Value {
         CudaTrainer::info(self)

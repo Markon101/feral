@@ -2,24 +2,31 @@ use crate::rng::Rng;
 /// 0 = generated, 1 = protected. Tasks: unconditional, prefix, hole, suffix.
 pub fn training_mask(n: usize, rng: &mut Rng) -> (Vec<f32>, &'static str) {
     let mut m = vec![0.; n];
+    let task = training_mask_into(&mut m, rng);
+    (m, task)
+}
+/// Writes a training mask into an existing buffer without allocating.
+pub fn training_mask_into(m: &mut [f32], rng: &mut Rng) -> &'static str {
+    let n = m.len();
+    m.fill(0.);
     match rng.index(4) {
-        0 => (m, "unconditional"),
+        0 => "unconditional",
         1 => {
             let end = n / 4 + rng.index(n / 2);
             m[..end].fill(1.);
-            (m, "prefix")
+            "prefix"
         }
         2 => {
             m.fill(1.);
             let a = n / 8 + rng.index(n / 4);
             let b = (a + n / 4 + rng.index(n / 4)).min(n - 1);
             m[a..b].fill(0.);
-            (m, "hole")
+            "hole"
         }
         _ => {
             let start = n / 4 + rng.index(n / 2);
             m[start..].fill(1.);
-            (m, "suffix")
+            "suffix"
         }
     }
 }
@@ -59,6 +66,23 @@ pub fn continuity(x: &mut [f32], known: &[f32], mask: &[f32], collar: usize) {
             b += 1;
         }
         let width = collar.min((b - a) / 2).max(1);
+        if b - a == 1 && a > 0 && b < x.len() {
+            let left_slope = if a > 1 {
+                known[a - 1] - known[a - 2]
+            } else {
+                0.
+            };
+            let right_slope = if b + 1 < x.len() {
+                known[b + 1] - known[b]
+            } else {
+                0.
+            };
+            let left = tangent(known[a - 1], left_slope, 0);
+            let right = tangent(known[b], -right_slope, 0);
+            x[a] = 0.5 * (left + right);
+            a = b;
+            continue;
+        }
         if a > 0 {
             let slope = if a > 1 {
                 known[a - 1] - known[a - 2]

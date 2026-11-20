@@ -273,77 +273,45 @@ fn evaluation(
     }
     sum / 4.
 }
-/// Evaluates the fixed probes against the checkpoint's *current* weights.
-///
-/// On CUDA this builds a fresh resident trainer for the probe window (a few MB, ~0.1 s) instead of
-/// running the CPU reference, which costs parameters x window - minutes per pass for a 6.5 M
-/// model. The arithmetic is `parameterization::loss`, the same expression training minimises, and
-/// the device field is verified against the CPU one to ~1e-7.
-fn evaluate_checkpoint(ck: &Checkpoint, backend: &str, dataset: &Dataset, n: usize) -> Result<f32> {
+fn make_cuda_velocity(
+    ck: &Checkpoint,
+    n: usize,
+) -> Result<crate::sampler::DeviceVelocity<'static>> {
+    crate::sampler::DeviceVelocity::from_cuda(&ck.model, ck.adam.lr, &ck.flow, n)
+}
+/// Evaluates the fixed probes against the checkpoint's *current* weights, reusing a cached CUDA
+/// device field when supplied so periodic validation does not rebuild the context each interval.
+fn evaluate_checkpoint(
+    ck: &Checkpoint,
+    backend: &str,
+    dataset: &Dataset,
+    n: usize,
+    cached: Option<&crate::sampler::DeviceVelocity<'_>>,
+) -> Result<f32> {
     match backend {
         "cuda" => {
-            #[cfg(feature = "cuda")]
-            {
-                let adam = Adam::new(ck.model.count(), ck.adam.lr);
-                let trainer =
-                    crate::cuda::CudaTrainer::new(&ck.model, &adam, n, 1, ck.flow.clone())?;
-                let field = crate::sampler::DeviceVelocity::new(
-                    Box::new(trainer),
-                    &ck.flow,
-                    n,
-                    ck.model.architecture.block,
-                )?;
-                Ok(evaluation(&field, &ck.flow, dataset, n))
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                let _ = (dataset, n);
-                anyhow::bail!(
-                    "CUDA evaluation was requested but not compiled; cargo build --locked --offline --release --features cuda -j 8"
-                )
-            }
+            let field = cached.context("missing cached CUDA evaluation field")?;
+            field.load_weights(&ck.model)?;
+            Ok(evaluation(field, &ck.flow, dataset, n))
         }
         _ => Ok(evaluation(&ck.velocity(), &ck.flow, dataset, n)),
     }
 }
-/// Previews and the final take use the same backend as training. On an accelerator this builds a
-/// second resident trainer instead of reusing the training one: reusing it would leave the
-/// sampler's statistics in its deferred readback, and the next step would report the sampler's
-/// loss. The weights upload once per sample (a few MB), which is far cheaper than the CPU field.
+/// Previews and the final take use the same backend as training, reusing a cached CUDA field so
+/// only updated weights upload per preview instead of recreating contexts and allocations.
 fn preview_sample(
     ck: &Checkpoint,
     c: &TrainConfig,
     sampling: &Sampling,
     n: usize,
+    cached: Option<&crate::sampler::DeviceVelocity<'_>>,
 ) -> Result<Vec<f32>> {
     let zeros = vec![0.; n];
     match c.backend.as_str() {
         "cuda" => {
-            #[cfg(feature = "cuda")]
-            {
-                let placeholder_adam = Adam::new(ck.model.count(), ck.adam.lr);
-                let trainer = crate::cuda::CudaTrainer::new(
-                    &ck.model,
-                    &placeholder_adam,
-                    n,
-                    1,
-                    ck.flow.clone(),
-                )?;
-                let field = crate::sampler::DeviceVelocity::new(
-                    Box::new(trainer),
-                    &ck.flow,
-                    n,
-                    ck.model.architecture.block,
-                )?;
-                flow::sample(&field, &zeros, &zeros, sampling)
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                let _ = (&zeros, sampling);
-                anyhow::bail!(
-                    "CUDA previews were requested but not compiled; cargo build --locked --offline --release --features cuda -j 8"
-                )
-            }
+            let field = cached.context("missing cached CUDA preview field")?;
+            field.load_weights(&ck.model)?;
+            flow::sample(field, &zeros, &zeros, sampling)
         }
         // cpu, and opencl which has no sampled field of its own: the reference path.
         _ => flow::sample(&ck.velocity(), &zeros, &zeros, sampling),
@@ -397,6 +365,11 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     ensure!((1..=64).contains(&c.batch), "batch size must be 1..64");
     let b = c.architecture.block;
     let n = ((c.crop_seconds * c.preprocess.sample_rate as f32).round() as usize).div_ceil(b) * b;
+    ensure!(
+        n <= crate::model::MAX_WINDOW_SAMPLES,
+        "rounded crop ({n} samples) exceeds maximum window ({})",
+        crate::model::MAX_WINDOW_SAMPLES
+    );
     let pre_start = Instant::now();
     let dataset = Dataset::load(&c.input, c.preprocess.clone(), n)?;
     // Fixed probes and validation always use at most a 4 s window, whatever the training crop is.
@@ -515,13 +488,24 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         &serde_json::json!({"git_commit":git(&["rev-parse","HEAD"]),"git_dirty":!git(&["status","--porcelain"]).is_empty(),"source_hash":current_source,"dataset":dataset.identity,"parameters":ck.model.count(),"architecture":ck.model.architecture,"crop_samples":n,"batch":c.batch,"samples_per_step":n*c.batch,"validation_input":c.validation,"sample_rate":ck.sample_rate,"additional_steps":c.steps,"seed":c.seed,"lr":ck.adam.lr,"optimizer":"Adam beta1=.9 beta2=.999 eps=1e-8 global gradient clip=1","resume":c.resume,"weights_only":c.weights_only,"backend":trainer.name(),"backend_info":trainer.info(),"objective":ck.objective,"representation":ck.representation,"flow":ck.flow,"detail":ck.detail}),
     )?;
     ck.save(&c.run.join("initial.json"))?;
+    let cached_eval = if c.backend == "cuda" {
+        Some(make_cuda_velocity(&ck, eval_n)?)
+    } else {
+        None
+    };
+    let cached_preview = if c.backend == "cuda" && n != eval_n {
+        Some(make_cuda_velocity(&ck, n)?)
+    } else {
+        None
+    };
+    let preview_field = cached_preview.as_ref().or(cached_eval.as_ref());
     let sample_config = Sampling {
         steps: 16,
         ..Default::default()
     };
     let mut sampling_ms = 0.;
     let start = Instant::now();
-    let initial_audio = preview_sample(&ck, &c, &sample_config, n)?;
+    let initial_audio = preview_sample(&ck, &c, &sample_config, n, preview_field)?;
     sampling_ms += start.elapsed().as_secs_f64() * 1000.;
     audio::write_wav(
         &c.run.join("untrained-or-resumed-initial.wav"),
@@ -529,14 +513,15 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         ck.sample_rate,
     )?;
     write_json(&c.run.join("preview-config.json"), &sample_config)?;
-    let initial_eval = evaluate_checkpoint(&ck, &c.backend, &dataset, eval_n)?;
+    let initial_eval =
+        evaluate_checkpoint(&ck, &c.backend, &dataset, eval_n, cached_eval.as_ref())?;
     ensure!(initial_eval.is_finite(), "invalid initial evaluation");
     // Validation uses the held-out corpus when supplied; the probe seed and t are fixed so
     // successive readings are comparable and are not drawn from the training crop stream.
     let val_loss = |ck: &Checkpoint| -> Result<f32> {
         match &validation {
-            Some(v) => evaluate_checkpoint(ck, &c.backend, v, eval_n),
-            None => evaluate_checkpoint(ck, &c.backend, &dataset, eval_n),
+            Some(v) => evaluate_checkpoint(ck, &c.backend, v, eval_n, cached_eval.as_ref()),
+            None => evaluate_checkpoint(ck, &c.backend, &dataset, eval_n, cached_eval.as_ref()),
         }
     };
     let initial_val = val_loss(&ck)?;
@@ -572,6 +557,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         preprocessing_ms
     );
     let items = c.batch;
+    let debug_timing = std::env::var_os("FERAL_DEBUG_TIMING").is_some();
     let mut clean_batch: Vec<f32> = Vec::with_capacity(items * n);
     let mut mask_batch: Vec<f32> = Vec::with_capacity(items * n);
     let mut noise_batch: Vec<f32> = Vec::with_capacity(items * n);
@@ -588,23 +574,27 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         batch_tasks.clear();
         batch_sources.clear();
         batch_starts.clear();
-        let debug_timing = std::env::var("FERAL_DEBUG_TIMING").is_ok();
         let mut t_crop = 0f64;
         let mut t_mask = 0f64;
         let mut t_noise = 0f64;
         for _ in 0..items {
             let mark = Instant::now();
-            let crop = dataset.crop_traced(n, &mut ck.rng).context(
-                "16 crop attempts were silent; reduce --silence-rms or select useful audio",
-            )?;
+            let crop = dataset
+                .crop_traced_into(n, &mut ck.rng, &mut clean_batch)
+                .context(
+                    "16 crop attempts were silent; reduce --silence-rms or select useful audio",
+                )?;
             *source_counts.entry(crop.source_index).or_insert(0usize) += 1;
             silence_retries += crop.silence_rejections;
-            clean_batch.extend_from_slice(&crop.samples);
             t_crop += mark.elapsed().as_secs_f64() * 1000.;
             let mark = Instant::now();
-            let (mask, task) = conditioning::training_mask(n, &mut ck.rng);
+            let mask_start = mask_batch.len();
+            mask_batch.resize(mask_start + n, 0.);
+            let task = conditioning::training_mask_into(
+                &mut mask_batch[mask_start..mask_start + n],
+                &mut ck.rng,
+            );
             *task_counts.entry(task).or_insert(0usize) += 1;
-            mask_batch.extend_from_slice(&mask);
             t_mask += mark.elapsed().as_secs_f64() * 1000.;
             let mark = Instant::now();
             noise_batch.extend((0..n).map(|_| ck.rng.normal() * ck.flow.prior_std()));
@@ -655,7 +645,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
             );
             log.flush()?;
         }
-        if local % c.validation_every == 0 {
+        let synced = if local % c.validation_every == 0 {
             trainer.sync(&mut ck.model, &mut ck.adam)?;
             let v = val_loss(&ck)?;
             ensure!(v.is_finite(), "nonfinite validation loss");
@@ -671,13 +661,16 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
             if local % (c.validation_every * 5) == 0 || local == c.steps {
                 eprintln!("  validation @ step {} | {:.6}", ck.completed_steps, v);
             }
-        }
-        if local % c.preview_every == 0 || local % c.checkpoint_every == 0 {
+            true
+        } else {
+            false
+        };
+        if !synced && (local % c.preview_every == 0 || local % c.checkpoint_every == 0) {
             trainer.sync(&mut ck.model, &mut ck.adam)?;
         }
         if local % c.preview_every == 0 {
             let now = Instant::now();
-            let x = preview_sample(&ck, &c, &sample_config, n)?;
+            let x = preview_sample(&ck, &c, &sample_config, n, preview_field)?;
             sampling_ms += now.elapsed().as_secs_f64() * 1000.;
             audio::write_wav(
                 &c.run.join(format!("preview-{:06}.wav", ck.completed_steps)),
@@ -694,7 +687,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     }
     let training_wall_ms = training_start.elapsed().as_secs_f64() * 1000.;
     trainer.sync(&mut ck.model, &mut ck.adam)?;
-    let final_eval = evaluate_checkpoint(&ck, &c.backend, &dataset, eval_n)?;
+    let final_eval = evaluate_checkpoint(&ck, &c.backend, &dataset, eval_n, cached_eval.as_ref())?;
     let final_val = val_loss(&ck)?;
     ensure!(final_val.is_finite(), "nonfinite final validation loss");
     let final_entry = serde_json::json!({
@@ -713,7 +706,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         val_curve.push(final_entry);
     }
     let now = Instant::now();
-    let final_audio = preview_sample(&ck, &c, &sample_config, n)?;
+    let final_audio = preview_sample(&ck, &c, &sample_config, n, preview_field)?;
     let final_sampling_ms = now.elapsed().as_secs_f64() * 1000.;
     audio::write_wav(&c.run.join("generated.wav"), &final_audio, ck.sample_rate)?;
     let delta = initial_audio
@@ -897,28 +890,11 @@ pub fn render(c: RenderConfig) -> Result<()> {
     let mut output = match c.backend.as_str() {
         "cpu" => flow::sample(&ck.velocity(), &known, &mask, &c.sampling)?,
         "cuda" => {
-            #[cfg(feature = "cuda")]
-            {
-                // One resident trainer for the whole trajectory: the weights upload once, and each
-                // field evaluation is a forward pass on the device.
-                let placeholder_adam = Adam::new(ck.model.count(), ck.adam.lr);
-                let trainer = crate::cuda::CudaTrainer::new(
-                    &ck.model,
-                    &placeholder_adam,
-                    n,
-                    1,
-                    ck.flow.clone(),
-                )?;
-                let field =
-                    crate::sampler::DeviceVelocity::new(Box::new(trainer), &ck.flow, n, block)?;
-                flow::sample(&field, &known, &mask, &c.sampling)?
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                anyhow::bail!(
-                    "CUDA sampling was requested but not compiled; cargo build --locked --offline --release --features cuda -j 8"
-                )
-            }
+            // One resident trainer for the whole trajectory: the weights upload once, and each
+            // field evaluation is a forward pass on the device.
+            let field =
+                crate::sampler::DeviceVelocity::from_cuda(&ck.model, ck.adam.lr, &ck.flow, n)?;
+            flow::sample(&field, &known, &mask, &c.sampling)?
         }
         other => anyhow::bail!("sampling backend must be cpu or cuda, got {other}"),
     };

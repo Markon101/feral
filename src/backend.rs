@@ -54,6 +54,11 @@ pub trait Resident {
     /// Wait for every queued device operation. Timing harnesses must call this: a trainer is free
     /// to pipeline steps, so the time around `step()` alone is enqueue time, not device time.
     fn flush(&self) -> Result<()>;
+    /// Upload updated parameters onto an existing resident device trainer without recreating its
+    /// context or allocations.
+    fn load_weights(&self, _model: &Model) -> Result<()> {
+        bail!("resident weight reload is not implemented for this backend")
+    }
     fn info(&self) -> Value;
     fn completed_steps(&self) -> usize;
 }

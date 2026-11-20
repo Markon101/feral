@@ -705,3 +705,75 @@ fn collar_tangent_adapts_to_headroom_and_limiter_handles_impossible_slope() {
     assert!(out[16..].iter().all(|v| v.abs() <= 0.98));
     assert_eq!(&out[..16], &known[..16]);
 }
+
+#[test]
+fn continuity_one_sample_hole_is_symmetric() {
+    let mut known = vec![0.; 16];
+    known[6] = 0.20;
+    known[7] = 0.30;
+    known[9] = 0.30;
+    known[10] = 0.20;
+    let mut mask = vec![1.; 16];
+    mask[8] = 0.;
+    let mut x = vec![-0.9; 16];
+    conditioning::continuity(&mut x, &known, &mask, 16);
+    assert!((x[8] - 0.40).abs() < 1e-6, "got {}", x[8]);
+    for i in 0..16 {
+        if mask[i] == 1. {
+            assert_eq!(x[i], known[i]);
+        }
+    }
+}
+
+#[test]
+fn variation_mode_retains_anchors_and_regenerates_gaps() {
+    let dir = temp();
+    audio::synthetic(&dir.join("corpus"), 16000).unwrap();
+    let ck = runtime::train(config(&dir, "var-train", 2, None)).unwrap();
+    let reference = dir.join("corpus/pattern-0.wav");
+    let original: Vec<f32> = hound::WavReader::open(&reference)
+        .unwrap()
+        .into_samples::<f32>()
+        .map(Result::unwrap)
+        .collect();
+    let output = dir.join("variation.wav");
+    runtime::render(RenderConfig {
+        checkpoint: ck,
+        input: Some(reference),
+        output: output.clone(),
+        seconds: 0.032,
+        start: 0.,
+        end: 0.,
+        sampling: Sampling {
+            steps: 3,
+            ..Default::default()
+        },
+        mode: Mode::Variation,
+        backend: "cpu".into(),
+        max_input_seconds: 600.,
+    })
+    .unwrap();
+    let rendered: Vec<f32> = hound::WavReader::open(&output)
+        .unwrap()
+        .into_samples::<f32>()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rendered.len(), original.len());
+    let stride = 16000usize / 32;
+    let mut checked_anchor = false;
+    let mut changed_gap = false;
+    for i in 0..original.len() {
+        if (i / stride).is_multiple_of(4) {
+            assert_eq!(rendered[i].to_bits(), original[i].to_bits());
+            checked_anchor = true;
+        } else if rendered[i].to_bits() != original[i].to_bits() {
+            changed_gap = true;
+        }
+    }
+    assert!(checked_anchor && changed_gap);
+    let meta: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.with_extension("json")).unwrap()).unwrap();
+    assert_eq!(meta["mode"], "variation-masked-anchors");
+    assert_eq!(meta["protected_samples_exact"], true);
+    fs::remove_dir_all(dir).unwrap();
+}

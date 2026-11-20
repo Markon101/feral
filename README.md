@@ -270,8 +270,9 @@ layout and exercises 128-frame dilations, so `tests/cuda.rs::large_frame_and_wid
 pins loss, gradient and prediction parity there, and `gpu-audit` passes on a checkpoint built at the
 new shapes.
 
-Sampling runs on the device as well: `generate`, `continue`, `inpaint` and `variation` accept
-`--backend cuda`, and training previews follow the training backend. On the 1,215,264-parameter run a
+Sampling and evaluation run on the device as well: `generate`, `continue`, `inpaint`,
+`variation` and `evaluate` accept `--backend cuda`, and training previews and validation probes
+follow the training backend. On the 1,215,264-parameter run a
 4 s take at 32 Heun steps drops from 144.6 s to 0.30 s with max |delta| 2.4e-7 against the CPU
 reference, identical protected samples and the same WAV bytes as the step-based device path.
 Sampling uses a forward-only device entry, so a field evaluation costs 2.9 ms rather than 7.6 ms.

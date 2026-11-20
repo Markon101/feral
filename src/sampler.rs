@@ -36,6 +36,31 @@ impl<'a> DeviceVelocity<'a> {
             block,
         })
     }
+    /// Upload fresh parameters onto the cached resident device without recreating its context.
+    pub fn load_weights(&self, model: &crate::model::Model) -> Result<()> {
+        self.device.borrow().load_weights(model)
+    }
+    /// Construct a CUDA-backed [`Velocity`] field for a fixed window length `n`.
+    pub fn from_cuda(
+        model: &crate::model::Model,
+        lr: f32,
+        flow: &FlowConfig,
+        n: usize,
+    ) -> Result<Self> {
+        #[cfg(feature = "cuda")]
+        {
+            let adam = crate::runtime::Adam::new(model.count(), lr);
+            let trainer = crate::cuda::CudaTrainer::new(model, &adam, n, 1, flow.clone())?;
+            Self::new(Box::new(trainer), flow, n, model.architecture.block)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (model, lr, flow, n);
+            anyhow::bail!(
+                "CUDA was requested but not compiled; cargo build --locked --offline --release --features cuda -j 8"
+            )
+        }
+    }
 }
 
 impl Velocity for DeviceVelocity<'_> {

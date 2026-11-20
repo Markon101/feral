@@ -2,6 +2,21 @@
 #define TT 32
 #define TP 33
 
+__device__ __forceinline__ void feral_split_k_ch(unsigned r, unsigned ch, unsigned ks,
+                                                   unsigned *k, unsigned *c) {
+  if (ks == 1u) {
+    *k = 0u;
+    *c = r;
+  } else if (ks == 3u) {
+    unsigned kk = (unsigned)(r >= ch) + (unsigned)(r >= 2u * ch);
+    *k = kk;
+    *c = r - kk * ch;
+  } else {
+    *k = r / ch;
+    *c = r % ch;
+  }
+}
+
 extern "C" __global__ void feral_conv_forward(
     const float *__restrict__ x, const float *__restrict__ w, const float *__restrict__ skip,
     float *__restrict__ z, float *__restrict__ y, unsigned frames, unsigned ci, unsigned co,
@@ -17,6 +32,9 @@ extern "C" __global__ void feral_conv_forward(
   const unsigned row0 = lr * 2u, col0 = lc * 2u;          // tile-relative offsets
   const unsigned pg0 = blockIdx.y * TT + row0;
   const unsigned o0 = blockIdx.x * TT + col0;
+  const unsigned pg_t[2] = {pg0, pg0 + 1u};
+  const unsigned pg_item[2] = {pg_t[0] / cf, pg_t[1] / cf};
+  const unsigned pg_q[2] = {pg_t[0] % cf, pg_t[1] % cf};
 
   float a00 = (o0 < co) ? w[bo + o0] : 0.f;
   float a01 = (o0 + 1u < co) ? w[bo + o0 + 1u] : 0.f;
@@ -24,21 +42,23 @@ extern "C" __global__ void feral_conv_forward(
 
   for (unsigned base = 0; base < reduce; base += TT) {
     for (unsigned t = 0; t < 2u; t++) {
-      const unsigned row = row0 + t, ocol = lc + t * 16u;
+      const unsigned row = row0 + t;
+      const unsigned pg = pg_t[t];
+      const unsigned item_base = pg_item[t] * cf;
+      const unsigned q_base = pg_q[t];
       for (unsigned h = 0; h < 2u; h++) {
         const unsigned col = lc + h * 16u;
         const unsigned r = base + col;
-        const unsigned pg = blockIdx.y * TT + row;
-        const unsigned k = r / ci, i = r % ci;
-        const int qf = (int)(pg % cf) + ((int)k - (int)(ks / 2u)) * (int)d;
+        unsigned k, i;
+        feral_split_k_ch(r, ci, ks, &k, &i);
+        const int qf = (int)q_base + ((int)k - (int)(ks / 2u)) * (int)d;
         xs[row][col] = (pg < total && r < reduce && qf >= 0 && qf < (int)cf)
-                           ? x[((pg / cf) * cf + (unsigned)qf) * ci + i]
+                           ? x[(item_base + (unsigned)qf) * ci + i]
                            : 0.f;
         const unsigned o = blockIdx.x * TT + col;
         ws[row][col] = ((base + row) < reduce && o < co)
                            ? w[wo + o * reduce + (base + row)]
                            : 0.f;
-        (void)ocol;
       }
     }
     __syncthreads();
@@ -56,16 +76,17 @@ extern "C" __global__ void feral_conv_forward(
 
 #pragma unroll
   for (unsigned ra = 0; ra < 2u; ra++) {
-    const unsigned pg = pg0 + ra;
+    const unsigned pg = pg_t[ra];
+    if (pg >= total) continue;
+    const unsigned item = pg_item[ra], q = pg_q[ra];
+    const unsigned count = min(scale, frames - q * scale);
     const float v0 = ra ? a10 : a00, v1 = ra ? a11 : a01;
 #pragma unroll
     for (unsigned cb = 0; cb < 2u; cb++) {
       const unsigned o = o0 + cb;
-      if (pg >= total || o >= co) continue;
+      if (o >= co) continue;
       const float act = activation ? tanhf(cb ? v1 : v0) : (cb ? v1 : v0);
       z[pg * co + o] = act;
-      const unsigned item = pg / cf, q = pg % cf;
-      const unsigned count = min(scale, frames - q * scale);
       for (unsigned r = 0; r < count; r++) {
         const unsigned at = (item * frames + q * scale + r) * co + o;
         y[at] = residual ? skip[at] + 0.5f * act : act;
@@ -83,6 +104,10 @@ extern "C" __global__ void feral_weight_grad(
   const unsigned row0 = lr * 2u, col0 = lc * 2u;      // tile-relative: rows = batch pos, cols = r/o
   const unsigned r0 = blockIdx.x * TT + row0;         // output reduction index
   const unsigned o0 = blockIdx.y * TT + col0;         // output channel
+  const unsigned r_h[2] = {blockIdx.x * TT + lc, blockIdx.x * TT + lc + 16u};
+  unsigned k_h[2], i_h[2];
+  feral_split_k_ch(r_h[0], ci, ks, &k_h[0], &i_h[0]);
+  feral_split_k_ch(r_h[1], ci, ks, &k_h[1], &i_h[1]);
   __shared__ float zs[TT][TP];  // [batch pos][o tile]
   __shared__ float xs[TT][TP];  // [batch pos][r tile]
 
@@ -91,16 +116,17 @@ extern "C" __global__ void feral_weight_grad(
   for (unsigned base = 0; base < total; base += TT) {
     for (unsigned t = 0; t < 2u; t++) {
       const unsigned row = row0 + t;
+      const unsigned pp = base + row;
+      const unsigned q = pp % cf;
+      const unsigned item_base = pp - q;
       for (unsigned h = 0; h < 2u; h++) {
         const unsigned col = lc + h * 16u;
-        const unsigned pp = base + row;
         const unsigned o = blockIdx.y * TT + col;
         zs[row][col] = (pp < total && o < co) ? dz[pp * co + o] : 0.f;
-        const unsigned r = blockIdx.x * TT + col;
-        const unsigned q = pp % cf, k = r / ci, i = r % ci;
-        const int qf = (int)q + ((int)k - (int)(ks / 2u)) * (int)d;
+        const unsigned r = r_h[h];
+        const int qf = (int)q + ((int)k_h[h] - (int)(ks / 2u)) * (int)d;
         xs[row][col] = (pp < total && r < reduce && qf >= 0 && qf < (int)cf)
-                           ? x[(pp - q + (unsigned)qf) * ci + i]
+                           ? x[(item_base + (unsigned)qf) * ci + i_h[h]]
                            : 0.f;
       }
     }
@@ -147,6 +173,9 @@ extern "C" __global__ void feral_input_grad(
   const unsigned row0 = lr * 2u, col0 = lc * 2u;   // rows = batch pos (q), cols = input channel
   const unsigned q0 = blockIdx.y * TT + row0;
   const unsigned i0 = blockIdx.x * TT + col0;
+  const unsigned qg_t[2] = {q0, q0 + 1u};
+  const unsigned qg_item[2] = {qg_t[0] / cf, qg_t[1] / cf};
+  const unsigned qg_q[2] = {qg_t[0] % cf, qg_t[1] % cf};
   __shared__ float zs[TT][TP];  // [q][r]
   __shared__ float ws[TT][TP];  // [r][i]
 
@@ -155,16 +184,21 @@ extern "C" __global__ void feral_input_grad(
   for (unsigned base = 0; base < reduce; base += TT) {
     for (unsigned t = 0; t < 2u; t++) {
       const unsigned row = row0 + t;
+      const unsigned qg = qg_t[t];
+      const unsigned item_base = qg_item[t] * cf;
+      const unsigned q_base = qg_q[t];
+      const unsigned r2 = base + row;
+      unsigned k2, o2;
+      feral_split_k_ch(r2, co, ks, &k2, &o2);
       for (unsigned h = 0; h < 2u; h++) {
         const unsigned col = lc + h * 16u;
-        const unsigned qg = blockIdx.y * TT + row;
         const unsigned rr = base + col;
-        const unsigned k = rr / co, o = rr % co;
-        const int p = (int)(qg % cf) - ((int)k - (int)(ks / 2u)) * (int)d;
+        unsigned k, o;
+        feral_split_k_ch(rr, co, ks, &k, &o);
+        const int p = (int)q_base - ((int)k - (int)(ks / 2u)) * (int)d;
         zs[row][col] = (qg < total && rr < reduce && p >= 0 && p < (int)cf)
-                           ? dz[((qg / cf) * cf + (unsigned)p) * co + o]
+                           ? dz[(item_base + (unsigned)p) * co + o]
                            : 0.f;
-        const unsigned r2 = base + row, k2 = r2 / co, o2 = r2 % co;
         const unsigned i = blockIdx.x * TT + col;
         ws[row][col] = (r2 < reduce && i < ci) ? w[wo + (o2 * ks + k2) * ci + i] : 0.f;
       }
@@ -184,10 +218,10 @@ extern "C" __global__ void feral_input_grad(
 
 #pragma unroll
   for (unsigned ra = 0; ra < 2u; ra++) {
-    const unsigned qg = q0 + ra;
-    const float v0 = ra ? a10 : a00, v1 = ra ? a11 : a01;
+    const unsigned qg = qg_t[ra];
     if (qg >= total) continue;
-    const unsigned item = qg / cf, q = qg % cf;
+    const float v0 = ra ? a10 : a00, v1 = ra ? a11 : a01;
+    const unsigned item = qg_item[ra], q = qg_q[ra];
     const unsigned count = min(scale, frames - q * scale);
 #pragma unroll
     for (unsigned cb = 0; cb < 2u; cb++) {

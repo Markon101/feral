@@ -17,6 +17,11 @@ pub struct Acoustic {
     pub log_spectral_l1: f64,
     pub coarse_mse: Vec<f64>,
 }
+fn hann_window(size: usize) -> Vec<f32> {
+    (0..size)
+        .map(|j| 0.5 - 0.5 * (std::f32::consts::TAU * j as f32 / size as f32).cos())
+        .collect()
+}
 /// Multiresolution Hann STFT log(1+|FFT|) distance, FFT sizes 128/512/2048,
 /// hop=N/4. Tail frames are zero padded. Paired signal metric, not a MOS estimate.
 pub fn acoustic(reference: &[f32], estimate: &[f32]) -> Acoustic {
@@ -56,23 +61,17 @@ pub fn acoustic(reference: &[f32], estimate: &[f32]) -> Acoustic {
     let mut spectral = 0.;
     for size in [128, 512, 2048] {
         let fft = planner.plan_fft_forward(size);
+        let window = hann_window(size);
+        let mut a = vec![Complex::new(0f32, 0f32); size];
+        let mut b = vec![Complex::new(0f32, 0f32); size];
         let mut sum = 0.;
         let mut count = 0;
         for start in (0..reference.len()).step_by(size / 4) {
-            let windowed = |signal: &[f32]| {
-                (0..size)
-                    .map(|j| {
-                        Complex::new(
-                            signal.get(start + j).copied().unwrap_or(0.)
-                                * (0.5
-                                    - 0.5 * (std::f32::consts::TAU * j as f32 / size as f32).cos()),
-                            0.,
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            };
-            let mut a = windowed(reference);
-            let mut b = windowed(estimate);
+            for j in 0..size {
+                let w = window[j];
+                a[j] = Complex::new(reference.get(start + j).copied().unwrap_or(0.) * w, 0.);
+                b[j] = Complex::new(estimate.get(start + j).copied().unwrap_or(0.) * w, 0.);
+            }
             fft.process(&mut a);
             fft.process(&mut b);
             for (a, b) in a[..=size / 2].iter().zip(&b[..=size / 2]) {
@@ -102,7 +101,13 @@ pub struct Probe {
     pub noisy_input: Acoustic,
 }
 /// Explicit tasks and known intervals make comparisons independent of architecture/RNG use.
-pub fn probe<M: Velocity>(model: &M, clean: &[f32], noise: &[f32], task: usize, t: f32) -> Probe {
+pub fn probe<M: Velocity + ?Sized>(
+    model: &M,
+    clean: &[f32],
+    noise: &[f32],
+    task: usize,
+    t: f32,
+) -> Probe {
     let n = clean.len();
     let mut mask = vec![0.; n];
     let name = match task {
@@ -189,10 +194,31 @@ pub fn nearest_correlation(query: &[f32], reference: &[f32], stride: usize) -> f
         v
     }
     let q = normalized(query);
+    let mut r_buf = vec![0f64; q.len()];
     let mut best = 0f64;
     for start in (0..=reference.len() - query.len()).step_by(stride.max(1)) {
-        let r = normalized(&reference[start..start + query.len()]);
-        let c = q.iter().zip(r).map(|(a, b)| a * b).sum::<f64>().abs();
+        let mut sum = 0f64;
+        for (dst, &src) in r_buf
+            .iter_mut()
+            .zip(reference[start..start + query.len()].iter().step_by(4))
+        {
+            let v = src as f64;
+            *dst = v;
+            sum += v;
+        }
+        let mean = sum / r_buf.len() as f64;
+        let mut norm_sq = 0f64;
+        for a in &mut r_buf {
+            *a -= mean;
+            norm_sq += *a * *a;
+        }
+        let norm = norm_sq.sqrt().max(1e-15);
+        let c = q
+            .iter()
+            .zip(&r_buf)
+            .map(|(a, b)| a * (*b / norm))
+            .sum::<f64>()
+            .abs();
         best = best.max(c);
     }
     best
@@ -204,8 +230,22 @@ pub fn evaluate(
     crops: usize,
     seed: u64,
 ) -> Result<()> {
+    evaluate_with_backend(checkpoint, input, output, crops, seed, "cpu")
+}
+pub fn evaluate_with_backend(
+    checkpoint: &Path,
+    input: &Path,
+    output: &Path,
+    crops: usize,
+    seed: u64,
+    backend: &str,
+) -> Result<()> {
     ensure!((1..=32).contains(&crops), "evaluation crops must be 1..32");
     ensure!(!output.exists(), "evaluation output already exists");
+    ensure!(
+        ["cpu", "cuda"].contains(&backend),
+        "evaluation backend must be cpu or cuda, got {backend}"
+    );
     let start = Instant::now();
     let ck = Checkpoint::load(checkpoint)?;
     let p = Preprocess {
@@ -215,6 +255,20 @@ pub fn evaluate(
         ..Default::default()
     };
     let dataset = Dataset::load(input, p, ck.crop_samples)?;
+    let device_field = match backend {
+        "cpu" => None,
+        "cuda" => Some(crate::sampler::DeviceVelocity::from_cuda(
+            &ck.model,
+            ck.adam.lr,
+            &ck.flow,
+            ck.crop_samples,
+        )?),
+        other => anyhow::bail!("evaluation backend must be cpu or cuda, got {other}"),
+    };
+    let field: &dyn Velocity = match &device_field {
+        Some(f) => f,
+        None => &ck.velocity(),
+    };
     let mut rng = Rng::new(seed);
     let mut rows = vec![];
     for _ in 0..crops {
@@ -227,7 +281,7 @@ pub fn evaluate(
             .collect();
         for task in 0..4 {
             for t in [0.1, 0.5, 0.9] {
-                let mut row = probe(&ck.velocity(), clean, &noise, task, t);
+                let mut row = probe(field, clean, &noise, task, t);
                 row.source_index = source;
                 row.crop_start = at;
                 ensure!(row.velocity_mse.is_finite(), "nonfinite evaluation");
@@ -241,7 +295,7 @@ pub fn evaluate(
     }
     runtime::write_json(
         output,
-        &serde_json::json!({"checkpoint":checkpoint,"checkpoint_sha256":data::hash_file(checkpoint)?,"dataset":dataset.identity,"seed":seed,"crops":crops,"crop_samples":ck.crop_samples,"training_steps":ck.completed_steps,"flow":ck.flow,"parameters":ck.model.count(),"architecture":ck.model.architecture,"context_samples":ck.model.architecture.context_samples(),"mean_velocity_mse":mean,"rows":rows,"elapsed_ms":start.elapsed().as_secs_f64()*1000.,"note":"same-recording held-out probes are not cross-recording or perceptual quality evidence; endpoint estimates are paired denoising, not generated samples"}),
+        &serde_json::json!({"checkpoint":checkpoint,"checkpoint_sha256":data::hash_file(checkpoint)?,"dataset":dataset.identity,"seed":seed,"crops":crops,"crop_samples":ck.crop_samples,"training_steps":ck.completed_steps,"flow":ck.flow,"parameters":ck.model.count(),"architecture":ck.model.architecture,"context_samples":ck.model.architecture.context_samples(),"evaluation_backend":backend,"mean_velocity_mse":mean,"rows":rows,"elapsed_ms":start.elapsed().as_secs_f64()*1000.,"note":"same-recording held-out probes are not cross-recording or perceptual quality evidence; endpoint estimates are paired denoising, not generated samples"}),
     )?;
     eprintln!(
         "evaluation {} | {} probes | mean velocity MSE {:.6}",
@@ -263,18 +317,14 @@ pub fn describe(x: &[f32], sample_rate: u32) -> serde_json::Value {
         .sqrt();
     let mut planner = FftPlanner::new();
     let fft = planner.plan_fft_forward(512);
+    let window = hann_window(512);
+    let mut frame = vec![Complex::new(0f32, 0f32); 512];
     let mut spectrum = vec![0f64; 256];
     let mut frames = 0f64;
     for start in (0..x.len()).step_by(256) {
-        let mut frame: Vec<_> = (0..512)
-            .map(|j| {
-                Complex::new(
-                    x.get(start + j).copied().unwrap_or(0.)
-                        * (0.5 - 0.5 * (std::f32::consts::TAU * j as f32 / 512.).cos()),
-                    0.,
-                )
-            })
-            .collect();
+        for j in 0..512 {
+            frame[j] = Complex::new(x.get(start + j).copied().unwrap_or(0.) * window[j], 0.);
+        }
         fft.process(&mut frame);
         for (p, c) in spectrum.iter_mut().zip(&frame[1..257]) {
             *p += c.norm_sqr() as f64;

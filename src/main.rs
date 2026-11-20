@@ -60,6 +60,9 @@ enum Commands {
         crops: usize,
         #[arg(long, default_value_t = 7001)]
         seed: u64,
+        /// Velocity-field backend for probes: cpu (reference) or cuda (device).
+        #[arg(long, default_value = "cpu")]
+        backend: String,
     },
     /// Signal descriptors and bounded copying screen with shuffled/noise/copy controls.
     Analyze {
@@ -152,7 +155,7 @@ struct TrainArgs {
     /// baseline preserves v1; pyramid pools residual branches at scales 1/4/16/64.
     #[arg(long, default_value="baseline", value_parser=["baseline", "pyramid"])]
     network: String,
-    /// Hidden channels; 32..256 in multiples of 16. Width changes require fresh weights.
+    /// Hidden channels; 32..512 in multiples of 16. Width changes require fresh weights.
     #[arg(long, default_value_t = 64, value_parser = parse_width)]
     width: usize,
     #[arg(long)]
@@ -391,8 +394,16 @@ fn main() -> Result<()> {
             output,
             crops,
             seed,
+            backend,
         } => {
-            feral::evaluate::evaluate(&checkpoint, &input, &output, crops, seed)?;
+            feral::evaluate::evaluate_with_backend(
+                &checkpoint,
+                &input,
+                &output,
+                crops,
+                seed,
+                &backend,
+            )?;
         }
         Commands::Analyze {
             input,

@@ -35,6 +35,14 @@ pub struct Crop {
     pub attempts: usize,
     pub silence_rejections: usize,
 }
+/// Provenance metadata for a crop written directly into a caller-supplied buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CropTrace {
+    pub source_index: usize,
+    pub start_sample: usize,
+    pub attempts: usize,
+    pub silence_rejections: usize,
+}
 pub struct Dataset {
     pub audio: Vec<Vec<f32>>,
     pub identity: DatasetIdentity,
@@ -156,14 +164,32 @@ impl Dataset {
     /// As with `crop`, callers must use the crop length validated by `load` (or a
     /// smaller length). Sixteen rejected silent candidates return `None`.
     pub fn crop_traced(&self, n: usize, rng: &mut Rng) -> Option<Crop> {
+        let mut samples = Vec::with_capacity(n);
+        let trace = self.crop_traced_into(n, rng, &mut samples)?;
+        Some(Crop {
+            samples,
+            source_index: trace.source_index,
+            start_sample: trace.start_sample,
+            attempts: trace.attempts,
+            silence_rejections: trace.silence_rejections,
+        })
+    }
+
+    /// Append a traced non-silent crop into `dst` without intermediate allocations.
+    pub fn crop_traced_into(
+        &self,
+        n: usize,
+        rng: &mut Rng,
+        dst: &mut Vec<f32>,
+    ) -> Option<CropTrace> {
         for attempts in 1..=16 {
             let source_index = rng.index(self.audio.len());
             let a = &self.audio[source_index];
             let start_sample = rng.index(a.len() - n + 1);
             let x = &a[start_sample..start_sample + n];
             if audio::rms(x) >= self.identity.preprocess.silence_rms {
-                return Some(Crop {
-                    samples: x.to_vec(),
+                dst.extend_from_slice(x);
+                return Some(CropTrace {
                     source_index,
                     start_sample,
                     attempts,
