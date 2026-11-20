@@ -142,6 +142,7 @@ pub fn audit(checkpoint: &Path, output: &Path, steps: usize, make: &Factory<'_>)
             dilations: vec![1, 2],
             scales: vec![1, 2],
             sample_conv: 0,
+            block_style: crate::model::BlockStyle::Tanh,
         },
         7,
     );

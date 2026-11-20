@@ -40,6 +40,7 @@ fn full_gpu_training_and_checkpoint_roundtrip() {
             dilations: vec![1, 2],
             scales: vec![1, 2],
             sample_conv: 0,
+            block_style: feral::model::BlockStyle::Tanh,
         },
         flow: FlowConfig::Preconditioned {
             data_scale: 0.1,
@@ -74,6 +75,7 @@ fn gpu_reports_optimizer_overflow() {
             dilations: vec![1, 2],
             scales: vec![1, 2],
             sample_conv: 0,
+            block_style: feral::model::BlockStyle::Tanh,
         },
         7,
     );

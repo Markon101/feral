@@ -3,7 +3,7 @@
 
 use feral::{
     backend::Resident,
-    model::{Architecture, Model},
+    model::{Architecture, BlockStyle, Model},
     parameterization::{self, FlowConfig},
     runtime::Adam,
 };
@@ -16,6 +16,7 @@ fn tiny() -> Model {
             dilations: vec![1, 2],
             scales: vec![1, 2],
             sample_conv: 0,
+            block_style: BlockStyle::Tanh,
         },
         7,
     )
@@ -209,6 +210,7 @@ fn large_frame_and_wide_dilation_parity() {
             dilations: vec![1, 2, 4, 8, 16, 32, 64, 128],
             scales: vec![],
             sample_conv: 0,
+            block_style: BlockStyle::Tanh,
         },
         7,
     );
@@ -383,6 +385,7 @@ fn repeated_trainer_creation_stays_valid() {
             dilations: vec![1, 2, 4, 8],
             scales: vec![],
             sample_conv: 0,
+            block_style: BlockStyle::Tanh,
         },
         7,
     );
@@ -421,6 +424,7 @@ fn mixed_size_trainer_sequence() {
             dilations: vec![1, 2, 4, 8],
             scales: vec![],
             sample_conv: 0,
+            block_style: BlockStyle::Tanh,
         },
         7,
     );
@@ -649,6 +653,7 @@ fn cuda_train_and_evaluate_match_cpu_with_batched_preconditioned_flow() {
             dilations: vec![1, 2],
             scales: vec![1, 2],
             sample_conv: 0,
+            block_style: BlockStyle::Tanh,
         },
         flow: FlowConfig::Preconditioned {
             data_scale: 0.16,
@@ -726,6 +731,7 @@ fn sample_conv_and_spectral_loss_cuda_match_cpu_batched() {
         dilations: vec![1, 2],
         scales: vec![1, 2],
         sample_conv: 7,
+        block_style: BlockStyle::Tanh,
     };
     let model = Model::new(arch, 11);
     let adam = Adam::new(model.count(), 0.0003);
@@ -885,6 +891,7 @@ fn cuda_e2e_train_with_all_new_features_matches_cpu() {
             dilations: vec![1, 2],
             scales: vec![1, 2],
             sample_conv: 5,
+            block_style: BlockStyle::Tanh,
         },
         flow: FlowConfig::Preconditioned {
             data_scale: 0.16,
@@ -964,5 +971,229 @@ fn cuda_e2e_train_with_all_new_features_matches_cpu() {
             "evaluate ({tag}) parity: cpu {mse_a} cuda {mse_b}"
         );
     }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn gated_film_symmetric_and_gpu_stft_cuda_match_cpu_batched() {
+    use feral::model::Velocity as _;
+    use feral::spectral::SpectralEngine;
+
+    // Exercise N=128, N=512, and N=2048 STFT frames with partial tails + GatedFilm + scales + sample_conv.
+    let n = 2304usize;
+    let items = 2usize;
+    let arch = Architecture {
+        block: 16,
+        width: 8,
+        dilations: vec![1, 2, 4, 2, 1],
+        scales: vec![1, 2, 1, 2, 1],
+        sample_conv: 7,
+        block_style: BlockStyle::GatedFilm,
+    };
+    let model = Model::new(arch, 17);
+    let adam = Adam::new(model.count(), 0.0003);
+    let flow = FlowConfig::Preconditioned {
+        data_scale: 0.16,
+        prior_std: 0.16,
+    };
+    let clean: Vec<f32> = (0..items * n)
+        .map(|i| 0.16 * (i as f32 * 0.073).sin() + 0.06 * (i as f32 * 0.19).cos())
+        .collect();
+    let noise: Vec<f32> = (0..items * n)
+        .map(|i| 0.16 * (((i * 17 % 23) as f32 - 11.) / 11.))
+        .collect();
+    let mut mask = vec![0f32; items * n];
+    mask[..256].fill(1.);
+    mask[n + 400..n + 800].fill(1.);
+    let t = [0.28f32, 0.74f32];
+    let engine = SpectralEngine::new();
+
+    let mut device = feral::cuda::CudaTrainer::new(&model, &adam, n, items, flow.clone())
+        .expect("CUDA device unavailable");
+    device.set_detail(0.5);
+    device.set_spectral(0.35);
+
+    let mut cpu_model = model.clone();
+    let mut cpu_adam = adam.clone();
+    let mut cpu_loss = 0f32;
+    let mut cpu_grad = vec![0f32; model.count()];
+    let mut cpu_preds = Vec::with_capacity(items * n);
+    for (item, &ti) in t.iter().enumerate() {
+        let row = item * n..(item + 1) * n;
+        let (li, gi) = parameterization::loss_gradient_with_spectral(
+            &cpu_model,
+            &flow,
+            &clean[row.clone()],
+            &mask[row.clone()],
+            &noise[row.clone()],
+            ti,
+            0.5,
+            0.35,
+            &engine,
+        );
+        cpu_loss += li / items as f32;
+        for (dst, src) in cpu_grad.iter_mut().zip(&gi) {
+            *dst += src / items as f32;
+        }
+        let x_t: Vec<f32> = clean[row.clone()]
+            .iter()
+            .zip(&noise[row.clone()])
+            .zip(&mask[row.clone()])
+            .map(|((&y, &z), &m)| if m == 1. { y } else { (1. - ti) * z + ti * y })
+            .collect();
+        let (_, _, cin) = flow.coefficients(ti);
+        let k: Vec<f32> = clean[row.clone()].iter().map(|v| v / 0.16).collect();
+        let xx: Vec<f32> = x_t
+            .iter()
+            .zip(&k)
+            .zip(&mask[row.clone()])
+            .map(|((&x, &known), &m)| if m == 1. { known } else { x * cin })
+            .collect();
+        cpu_preds.extend(cpu_model.velocity(&xx, &k, &mask[row], ti));
+    }
+
+    let step = device
+        .step(&clean, &mask, &noise, &t, true)
+        .expect("gated-film + gpu stft step");
+    let gpu_grad = device.read_gradients().expect("read gradients");
+    let gpu_pred = device.read_prediction().expect("read prediction");
+
+    assert!(
+        (cpu_loss - step.loss).abs() <= 2e-4 + 1e-3 * cpu_loss.abs(),
+        "gated-film + GPU STFT loss parity: cpu {cpu_loss} gpu {}",
+        step.loss
+    );
+    let pred_max = cpu_preds
+        .iter()
+        .zip(&gpu_pred)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(pred_max <= 1e-4, "gated-film pred parity: {pred_max}");
+    let grad_max = cpu_grad
+        .iter()
+        .zip(&gpu_grad)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(
+        grad_max <= 3e-4,
+        "gated-film + GPU STFT grad parity: {grad_max}"
+    );
+
+    cpu_adam
+        .update(&mut cpu_model, &cpu_grad)
+        .expect("cpu update");
+    let mut dev_model = model.clone();
+    let mut dev_adam = adam.clone();
+    device.sync(&mut dev_model, &mut dev_adam).expect("sync");
+    let param_max = cpu_model
+        .parameters()
+        .iter()
+        .zip(dev_model.parameters())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(param_max <= 5e-5, "gated-film param parity: {param_max}");
+
+    // Verify GPU STFT + GatedFilm is bit-exact deterministic on a fresh trainer with same inputs.
+    let mut device2 = feral::cuda::CudaTrainer::new(&model, &adam, n, items, flow)
+        .expect("CUDA device unavailable");
+    device2.set_detail(0.5);
+    device2.set_spectral(0.35);
+    device2
+        .step(&clean, &mask, &noise, &t, true)
+        .expect("second deterministic step");
+    let mut dev_model2 = model.clone();
+    let mut dev_adam2 = adam.clone();
+    device2
+        .sync(&mut dev_model2, &mut dev_adam2)
+        .expect("sync2");
+    assert_eq!(
+        dev_model.parameters(),
+        dev_model2.parameters(),
+        "GPU STFT + GatedFilm update must be bit-exact deterministic"
+    );
+}
+
+#[test]
+fn cuda_e2e_train_gated_film_and_resume_matches_cpu() {
+    use feral::{
+        audio::{self, Preprocess},
+        parameterization::{LrSchedule, TimeSampling},
+        runtime::{self, Checkpoint, TrainConfig},
+    };
+    let root = std::env::temp_dir().join(format!("feral-cuda-gated-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir(&root).unwrap();
+    audio::synthetic(&root.join("corpus"), 16000).unwrap();
+
+    let make = |run_name: &str, backend: &str, steps: usize, resume| TrainConfig {
+        input: root.join("corpus"),
+        run: root.join(run_name),
+        backend: backend.into(),
+        steps,
+        seed: 37,
+        crop_seconds: 0.032,
+        preprocess: Preprocess::default(),
+        lr: 0.0005,
+        preview_every: 2,
+        checkpoint_every: 2,
+        resume,
+        weights_only: false,
+        grow_crop: false,
+        architecture: Architecture {
+            block: 4,
+            width: 6,
+            dilations: vec![1, 2, 4, 2, 1],
+            scales: vec![],
+            sample_conv: 5,
+            block_style: BlockStyle::GatedFilm,
+        },
+        flow: FlowConfig::Preconditioned {
+            data_scale: 0.16,
+            prior_std: 0.16,
+        },
+        detail: 0.5,
+        spectral_weight: 0.25,
+        time_sampling: TimeSampling::LogitNormal { mean: 0., std: 1. },
+        lr_schedule: LrSchedule::Cosine {
+            warmup_steps: 2,
+            total_steps: 6,
+            min_lr: 1e-4,
+        },
+        ema_decay: 0.9,
+        batch: 2,
+        validation: Some(root.join("corpus")),
+        validation_every: 2,
+    };
+
+    let cpu_all = runtime::train(make("cpu-all", "cpu", 4, None)).expect("cpu train");
+    let cuda_all = runtime::train(make("cuda-all", "cuda", 4, None)).expect("cuda train");
+    let cuda_first = runtime::train(make("cuda-first", "cuda", 2, None)).expect("cuda first");
+    let cuda_resumed =
+        runtime::train(make("cuda-resumed", "cuda", 2, Some(cuda_first))).expect("cuda resume");
+
+    let c = Checkpoint::load(&cpu_all).unwrap();
+    let g = Checkpoint::load(&cuda_all).unwrap();
+    let r = Checkpoint::load(&cuda_resumed).unwrap();
+    let max_param = c
+        .model
+        .parameters()
+        .iter()
+        .zip(g.model.parameters())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(max_param <= 5e-5, "gated-film CPU/CUDA drift: {max_param}");
+    let max_ema = c
+        .ema_weights
+        .iter()
+        .zip(&g.ema_weights)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(max_ema <= 5e-5, "gated-film EMA CPU/CUDA drift: {max_ema}");
+    assert_eq!(
+        g.model.parameters(),
+        r.model.parameters(),
+        "CUDA gated-film + GPU STFT resume must be bit-exact"
+    );
+    assert_eq!(g.ema_weights, r.ema_weights);
     std::fs::remove_dir_all(root).unwrap();
 }

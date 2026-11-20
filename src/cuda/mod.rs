@@ -8,10 +8,9 @@
 //! launch or numerical failure is returned as an error.
 use crate::{
     backend::Step,
-    model::{Model, SAMPLE_CONV_CHANNELS},
+    model::{BlockStyle, Model, SAMPLE_CONV_CHANNELS},
     parameterization::FlowConfig,
     runtime::Adam,
-    spectral::SpectralEngine,
 };
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
@@ -255,7 +254,6 @@ struct Kernels {
     dx: CuFunction,
     stats: CuFunction,
     adam: CuFunction,
-    add_spectral: CuFunction,
     ema: CuFunction,
     unpack_stem_in: CuFunction,
     apply_stem_residual: CuFunction,
@@ -264,6 +262,17 @@ struct Kernels {
     sample_conv_fwd: CuFunction,
     sample_conv_dx: CuFunction,
     sample_conv_dw: CuFunction,
+    time_embed_proj_fwd: CuFunction,
+    rmsnorm_film_fwd: CuFunction,
+    gated_residual_fwd: CuFunction,
+    gated_activation_grad: CuFunction,
+    rmsnorm_film_dx: CuFunction,
+    rmsnorm_film_dfilm: CuFunction,
+    time_proj_dw: CuFunction,
+    zero_buf: CuFunction,
+    stft_frame: CuFunction,
+    stft_accum: CuFunction,
+    add_loss_sum: CuFunction,
 }
 
 #[derive(Clone, Copy)]
@@ -300,9 +309,17 @@ pub struct CudaTrainer {
     dh: Vec<Buf>,
     dz: Vec<Buf>,
     specs: Vec<Spec>,
+    time_proj_specs: Vec<Spec>,
     stem_specs: Vec<Spec>,
     head_specs: Vec<Spec>,
     has_sample_conv: bool,
+    has_gated_film: bool,
+    width: u32,
+    norm_acts: Vec<Buf>,
+    inv_rms: Vec<Buf>,
+    films: Vec<Buf>,
+    d_film: Buf,
+    d_norm: Buf,
     stem_in: Buf,
     stem_a0: Buf,
     stem_a1: Buf,
@@ -321,10 +338,8 @@ pub struct CudaTrainer {
     detail: f32,
     /// Multiresolution STFT log-magnitude L1 endpoint loss weight; 0 disables it.
     spectral_weight: f32,
-    spectral: SpectralEngine,
-    pred_host: Vec<f32>,
-    dy_spec_host: Vec<f32>,
-    dy_spec_buf: Buf,
+    spec_overlap_buf: Buf,
+    spec_loss_buf: Buf,
     ema_decay: f32,
     ema_buf: Buf,
     pub step: usize,
@@ -477,7 +492,6 @@ impl CudaTrainer {
             dx: load("feral_input_grad")?,
             stats: load("feral_statistics")?,
             adam: load("feral_adam")?,
-            add_spectral: load("feral_add_spectral")?,
             ema: load("feral_ema")?,
             unpack_stem_in: load("feral_unpack_stem_in")?,
             apply_stem_residual: load("feral_apply_stem_residual")?,
@@ -486,8 +500,21 @@ impl CudaTrainer {
             sample_conv_fwd: load("feral_sample_conv_fwd")?,
             sample_conv_dx: load("feral_sample_conv_dx")?,
             sample_conv_dw: load("feral_sample_conv_dw")?,
+            time_embed_proj_fwd: load("feral_time_embed_proj_fwd")?,
+            rmsnorm_film_fwd: load("feral_rmsnorm_film_fwd")?,
+            gated_residual_fwd: load("feral_gated_residual_fwd")?,
+            gated_activation_grad: load("feral_gated_activation_grad")?,
+            rmsnorm_film_dx: load("feral_rmsnorm_film_dx")?,
+            rmsnorm_film_dfilm: load("feral_rmsnorm_film_dfilm")?,
+            time_proj_dw: load("feral_time_proj_dw")?,
+            zero_buf: load("feral_zero_buf")?,
+            stft_frame: load("feral_stft_frame")?,
+            stft_accum: load("feral_stft_accum")?,
+            add_loss_sum: load("feral_add_loss_sum")?,
         };
         let frames = n / model.architecture.block;
+        let has_gated_film = model.architecture.block_style == BlockStyle::GatedFilm;
+        let width = model.architecture.width;
         let mut specs = Vec::with_capacity(model.layers.len());
         let mut offset = 0;
         for (j, l) in model.layers.iter().enumerate() {
@@ -502,6 +529,19 @@ impl CudaTrainer {
                 k: l.kernel as u32,
                 d: l.dilation as u32,
                 s: s as u32,
+                w: offset as u32,
+                b: (offset + l.w.len()) as u32,
+            });
+            offset += l.w.len() + l.b.len();
+        }
+        let mut time_proj_specs = Vec::with_capacity(model.time_proj.len());
+        for l in &model.time_proj {
+            time_proj_specs.push(Spec {
+                ci: l.input as u32,
+                co: l.output as u32,
+                k: l.kernel as u32,
+                d: l.dilation as u32,
+                s: 1,
                 w: offset as u32,
                 b: (offset + l.w.len()) as u32,
             });
@@ -569,10 +609,12 @@ impl CudaTrainer {
         let mut pooled = Vec::with_capacity(specs.len());
         let mut z = Vec::with_capacity(specs.len());
         let mut dz = Vec::with_capacity(specs.len());
-        for s in &specs {
+        for (j, s) in specs.iter().enumerate() {
             let cf = frames.div_ceil(s.s as usize);
-            acts.push(alloc(items * frames * s.co as usize)?);
-            dh.push(alloc(items * frames * s.co as usize)?);
+            let is_gated_res = has_gated_film && j > 0 && j + 1 < specs.len();
+            let act_ch = if is_gated_res { width } else { s.co as usize };
+            acts.push(alloc(items * frames * act_ch)?);
+            dh.push(alloc(items * frames * act_ch)?);
             pooled.push(alloc(if s.s > 1 {
                 items * cf * s.ci as usize
             } else {
@@ -581,6 +623,19 @@ impl CudaTrainer {
             z.push(alloc(items * cf * s.co as usize)?);
             dz.push(alloc(items * cf * s.co as usize)?);
         }
+        let mut norm_acts = Vec::with_capacity(time_proj_specs.len());
+        let mut inv_rms = Vec::with_capacity(time_proj_specs.len());
+        let mut films = Vec::with_capacity(time_proj_specs.len());
+        let (d_film, d_norm) = if has_gated_film {
+            for _ in 0..time_proj_specs.len() {
+                norm_acts.push(alloc(items * frames * width)?);
+                inv_rms.push(alloc(items * frames)?);
+                films.push(alloc(items * 2 * width)?);
+            }
+            (alloc(items * 2 * width)?, alloc(items * frames * width)?)
+        } else {
+            (Buf::EMPTY, Buf::EMPTY)
+        };
         let (stem_in, stem_a0, stem_a1, head_a0, head_out, dy_head, dh_scratch, dz_sample) =
             if has_sample_conv {
                 let total = items * n;
@@ -662,9 +717,17 @@ impl CudaTrainer {
             dh,
             dz,
             specs,
+            time_proj_specs,
             stem_specs,
             head_specs,
             has_sample_conv,
+            has_gated_film,
+            width: width as u32,
+            norm_acts,
+            inv_rms,
+            films,
+            d_film,
+            d_norm,
             stem_in,
             stem_a0,
             stem_a1,
@@ -681,10 +744,8 @@ impl CudaTrainer {
             flow,
             detail: 0.,
             spectral_weight: 0.,
-            spectral: SpectralEngine::new(),
-            pred_host: Vec::new(),
-            dy_spec_host: Vec::new(),
-            dy_spec_buf: Buf::EMPTY,
+            spec_overlap_buf: Buf::EMPTY,
+            spec_loss_buf: Buf::EMPTY,
             ema_decay: 0.,
             ema_buf: Buf::EMPTY,
             step: adam.step,
@@ -1081,6 +1142,114 @@ impl CudaTrainer {
         }
         for (j, s) in self.specs.iter().enumerate() {
             let cf = (self.frames as usize).div_ceil(s.s as usize) as u32;
+            let residual = if j > 0 && j + 1 < self.specs.len() {
+                1i32
+            } else {
+                0
+            };
+            if residual != 0 && self.has_gated_film {
+                let block_idx = j - 1;
+                let tp = &self.time_proj_specs[block_idx];
+                let mut t_data = self.data.ptr;
+                let mut t_w = self.weights.ptr;
+                let mut t_film = self.films[block_idx].ptr;
+                let mut t_total = n;
+                let mut t_width = self.width;
+                let mut t_wo = tp.w;
+                let mut t_bo = tp.b;
+                let mut t_items = items;
+                self.launch(
+                    "time_embed_proj_fwd",
+                    self.k.time_embed_proj_fwd,
+                    ((2 * self.width).div_ceil(64), items, 1),
+                    (64, 1, 1),
+                    &mut kargs![t_data, t_w, t_film, t_total, t_width, t_wo, t_bo, t_items],
+                )?;
+                let mut rn_h = self.acts[j].ptr;
+                let mut rn_film = self.films[block_idx].ptr;
+                let mut rn_out = self.norm_acts[block_idx].ptr;
+                let mut rn_inv = self.inv_rms[block_idx].ptr;
+                let mut rn_frames = frames;
+                let mut rn_width = self.width;
+                let mut rn_items = items;
+                self.launch(
+                    "rmsnorm_film_fwd",
+                    self.k.rmsnorm_film_fwd,
+                    (items * frames, 1, 1),
+                    (BATCH_THREADS as u32, 1, 1),
+                    &mut kargs![rn_h, rn_film, rn_out, rn_inv, rn_frames, rn_width, rn_items],
+                )?;
+                if s.s > 1 {
+                    let mut b_x = self.norm_acts[block_idx].ptr;
+                    let mut b_y = self.pooled[j].ptr;
+                    let mut b_frames = frames;
+                    let mut b_ci = s.ci;
+                    let mut b_s = s.s;
+                    let mut b_items = items;
+                    let groups = cf as usize * self.items;
+                    self.launch(
+                        "pool",
+                        self.k.pool,
+                        (
+                            (groups * s.ci as usize).div_ceil(BATCH_THREADS) as u32,
+                            1,
+                            1,
+                        ),
+                        (BATCH_THREADS as u32, 1, 1),
+                        &mut kargs![b_x, b_y, b_frames, b_ci, b_s, b_items],
+                    )?;
+                }
+                let x = if s.s > 1 {
+                    self.pooled[j]
+                } else {
+                    self.norm_acts[block_idx]
+                };
+                // Run conv linearly with frames=cf, scale=1, y=z[j] so output stays within z[j]
+                // even when scale > 1, then fuse tanh*sigmoid + repeat + residual add below.
+                let mut c_x = x.ptr;
+                let mut c_w = self.weights.ptr;
+                let mut c_skip = self.z[j].ptr;
+                let mut c_z = self.z[j].ptr;
+                let mut c_y = self.z[j].ptr;
+                let mut c_frames = cf;
+                let mut c_ci = s.ci;
+                let mut c_co = s.co;
+                let mut c_k = s.k;
+                let mut c_d = s.d;
+                let mut c_wo = s.w;
+                let mut c_bo = s.b;
+                let mut c_scale = 1u32;
+                let mut c_act = 0i32;
+                let mut c_res = 0i32;
+                let mut c_items = items;
+                let grid_y = (self.items * cf as usize).div_ceil(TILE_OUT) as u32;
+                self.launch(
+                    "gated_conv",
+                    self.k.forward,
+                    (s.co.div_ceil(TILE_OUT as u32), grid_y, 1),
+                    (TILE as u32, TILE as u32, 1),
+                    &mut kargs![
+                        c_x, c_w, c_skip, c_z, c_y, c_frames, c_ci, c_co, c_k, c_d, c_wo, c_bo,
+                        c_scale, c_act, c_res, c_items
+                    ],
+                )?;
+                let mut g_z = self.z[j].ptr;
+                let mut g_skip = self.acts[j].ptr;
+                let mut g_y = self.acts[j + 1].ptr;
+                let mut g_frames = frames;
+                let mut g_width = self.width;
+                let mut g_scale = s.s;
+                let mut g_items = items;
+                let elems = self.items * cf as usize * self.width as usize;
+                self.launch(
+                    "gated_residual_fwd",
+                    self.k.gated_residual_fwd,
+                    (elems.div_ceil(BATCH_THREADS) as u32, 1, 1),
+                    (BATCH_THREADS as u32, 1, 1),
+                    &mut kargs![g_z, g_skip, g_y, g_frames, g_width, g_scale, g_items],
+                )?;
+                continue;
+            }
             if s.s > 1 {
                 let mut b_x = self.acts[j].ptr;
                 let mut b_y = self.pooled[j].ptr;
@@ -1107,11 +1276,6 @@ impl CudaTrainer {
                 self.acts[j]
             };
             let activation = if j + 1 < self.specs.len() { 1i32 } else { 0 };
-            let residual = if j > 0 && j + 1 < self.specs.len() {
-                1i32
-            } else {
-                0
-            };
             let mut c_x = x.ptr;
             let mut c_w = self.weights.ptr;
             let mut c_skip = self.acts[j].ptr;
@@ -1282,45 +1446,76 @@ impl CudaTrainer {
             ],
         )?;
         if self.spectral_weight > 0. {
-            if self.dy_spec_buf.len < total_samples {
-                self.dy_spec_buf = self.alloc_buf(total_samples)?;
+            // Resident GPU multiresolution STFT loss & gradient (zero PCIe sync, zero atomics).
+            let max_frames = self.n.div_ceil(crate::spectral::SIZES[0] / 4);
+            if self.spec_overlap_buf.len < 4 * total_samples {
+                self.spec_overlap_buf = self.alloc_buf(4 * total_samples)?;
             }
-            self.pred_host.resize(total_samples, 0.);
-            self.dy_spec_host.resize(total_samples, 0.);
-            Self::download(
-                &self.driver,
-                pred_buf,
-                &mut self.pred_host,
-                "spectral prediction",
-            )?;
-            let spec_loss_sum = self.spectral.batch_endpoint_loss_gradient(
-                &self.flow,
-                clean,
-                mask,
-                noise,
-                &self.pred_host,
-                t,
-                self.spectral_weight,
-                &mut self.dy_spec_host,
-            );
-            Self::upload(
-                &self.driver,
-                self.dy_spec_buf,
-                &self.dy_spec_host,
-                "spectral gradient",
-            )?;
-            let mut s_dy = loss_dy_buf.ptr;
-            let mut s_spec = self.dy_spec_buf.ptr;
-            let mut s_parts = self.loss_parts.ptr;
-            let mut s_loss = spec_loss_sum;
-            let mut s_total = total_samples as u32;
-            self.launch(
-                "add_spectral",
-                self.k.add_spectral,
-                (parts, 1, 1),
-                (BATCH_THREADS as u32, 1, 1),
-                &mut kargs![s_dy, s_spec, s_parts, s_loss, s_total],
-            )?;
+            if self.spec_loss_buf.len < self.items * max_frames {
+                self.spec_loss_buf = self.alloc_buf(self.items * max_frames)?;
+            }
+            let num_res = crate::spectral::SIZES.len() as f32;
+            let overlap_elems = (4 * total_samples) as u32;
+            for &size in &crate::spectral::SIZES {
+                let hop = size / 4;
+                let log2_n = size.trailing_zeros();
+                let frame_count = self.n.div_ceil(hop);
+                let mut z_dst = self.spec_overlap_buf.ptr;
+                let mut z_total = overlap_elems;
+                self.launch(
+                    "zero_overlap",
+                    self.k.zero_buf,
+                    (overlap_elems.div_ceil(BATCH_THREADS as u32), 1, 1),
+                    (BATCH_THREADS as u32, 1, 1),
+                    &mut kargs![z_dst, z_total],
+                )?;
+                let mut f_pred = pred_buf.ptr;
+                let mut f_data = self.data.ptr;
+                let mut f_ov = self.spec_overlap_buf.ptr;
+                let mut f_fl = self.spec_loss_buf.ptr;
+                let mut f_n = self.n as u32;
+                let mut f_items = items;
+                let mut f_size = size as u32;
+                let mut f_log2 = log2_n;
+                let mut f_hop = hop as u32;
+                let mut f_fc = frame_count as u32;
+                let mut f_pre = pre;
+                let mut f_ds = data_scale;
+                let mut f_ps = prior_std;
+                let mut f_sw = self.spectral_weight;
+                let mut f_nr = num_res;
+                let threads = if size == 128 { 128u32 } else { 256u32 };
+                self.launch(
+                    "stft_frame",
+                    self.k.stft_frame,
+                    (frame_count as u32, items, 1),
+                    (threads, 1, 1),
+                    &mut kargs![
+                        f_pred, f_data, f_ov, f_fl, f_n, f_items, f_size, f_log2, f_hop, f_fc,
+                        f_pre, f_ds, f_ps, f_sw, f_nr
+                    ],
+                )?;
+                let mut a_dy = loss_dy_buf.ptr;
+                let mut a_ov = self.spec_overlap_buf.ptr;
+                let mut a_total = total_samples as u32;
+                self.launch(
+                    "stft_accum",
+                    self.k.stft_accum,
+                    (parts, 1, 1),
+                    (BATCH_THREADS as u32, 1, 1),
+                    &mut kargs![a_dy, a_ov, a_total],
+                )?;
+                let mut l_parts = self.loss_parts.ptr;
+                let mut l_fl = self.spec_loss_buf.ptr;
+                let mut l_count = (self.items * frame_count) as u32;
+                self.launch(
+                    "add_loss_sum",
+                    self.k.add_loss_sum,
+                    (1, 1, 1),
+                    (BATCH_THREADS as u32, 1, 1),
+                    &mut kargs![l_parts, l_fl, l_count],
+                )?;
+            }
         }
         let inv_batch = 1.0f32 / self.items as f32;
         if self.has_sample_conv {
@@ -1431,6 +1626,135 @@ impl CudaTrainer {
             let s = &self.specs[j];
             let cf = (self.frames as usize).div_ceil(s.s as usize) as u32;
             let residual = if j > 0 && j + 1 < last { 1i32 } else { 0 };
+            if residual != 0 && self.has_gated_film {
+                let block_idx = j - 1;
+                let mut e_dh = self.dh[j + 1].ptr;
+                let mut e_z = self.z[j].ptr;
+                let mut e_dz = self.dz[j].ptr;
+                let mut e_frames = frames;
+                let mut e_width = self.width;
+                let mut e_scale = s.s;
+                let mut e_items = items;
+                let elems = self.items * cf as usize * self.width as usize;
+                self.launch(
+                    "gated_activation_grad",
+                    self.k.gated_activation_grad,
+                    (elems.div_ceil(BATCH_THREADS) as u32, 1, 1),
+                    (BATCH_THREADS as u32, 1, 1),
+                    &mut kargs![e_dh, e_z, e_dz, e_frames, e_width, e_scale, e_items],
+                )?;
+                let x = if s.s > 1 {
+                    self.pooled[j]
+                } else {
+                    self.norm_acts[block_idx]
+                };
+                let mut f_x = x.ptr;
+                let mut f_dz = self.dz[j].ptr;
+                let mut f_grad = self.grad.ptr;
+                let mut f_frames = cf;
+                let mut f_ci = s.ci;
+                let mut f_co = s.co;
+                let mut f_k = s.k;
+                let mut f_d = s.d;
+                let mut f_wo = s.w;
+                let mut f_bo = s.b;
+                let mut f_inv = inv_batch;
+                let mut f_items = items;
+                self.launch(
+                    "gated_weight_grad",
+                    self.k.dw,
+                    (
+                        (s.ci * s.k).div_ceil(TILE_OUT as u32),
+                        s.co.div_ceil(TILE_OUT as u32),
+                        1,
+                    ),
+                    (TILE as u32, TILE as u32, 1),
+                    &mut kargs![
+                        f_x, f_dz, f_grad, f_frames, f_ci, f_co, f_k, f_d, f_wo, f_bo, f_inv,
+                        f_items
+                    ],
+                )?;
+                let mut g_dz = self.dz[j].ptr;
+                let mut g_w = self.weights.ptr;
+                let mut g_skip = self.d_norm.ptr;
+                let mut g_dx = self.d_norm.ptr;
+                let mut g_frames = frames;
+                let mut g_ci = s.ci;
+                let mut g_co = s.co;
+                let mut g_k = s.k;
+                let mut g_d = s.d;
+                let mut g_wo = s.w;
+                let mut g_scale = s.s;
+                let mut g_res = 0i32;
+                let mut g_items = items;
+                self.launch(
+                    "gated_input_grad",
+                    self.k.dx,
+                    (
+                        s.ci.div_ceil(TILE_OUT as u32),
+                        (self.items * cf as usize).div_ceil(TILE_OUT) as u32,
+                        1,
+                    ),
+                    (TILE as u32, TILE as u32, 1),
+                    &mut kargs![
+                        g_dz, g_w, g_skip, g_dx, g_frames, g_ci, g_co, g_k, g_d, g_wo, g_scale,
+                        g_res, g_items
+                    ],
+                )?;
+                let mut rx_du = self.d_norm.ptr;
+                let mut rx_h = self.acts[j].ptr;
+                let mut rx_inv = self.inv_rms[block_idx].ptr;
+                let mut rx_film = self.films[block_idx].ptr;
+                let mut rx_skip = self.dh[j + 1].ptr;
+                let mut rx_out = self.dh[j].ptr;
+                let mut rx_frames = frames;
+                let mut rx_width = self.width;
+                let mut rx_items = items;
+                self.launch(
+                    "rmsnorm_film_dx",
+                    self.k.rmsnorm_film_dx,
+                    (items * frames, 1, 1),
+                    (BATCH_THREADS as u32, 1, 1),
+                    &mut kargs![
+                        rx_du, rx_h, rx_inv, rx_film, rx_skip, rx_out, rx_frames, rx_width,
+                        rx_items
+                    ],
+                )?;
+                let mut rf_du = self.d_norm.ptr;
+                let mut rf_h = self.acts[j].ptr;
+                let mut rf_inv = self.inv_rms[block_idx].ptr;
+                let mut rf_df = self.d_film.ptr;
+                let mut rf_frames = frames;
+                let mut rf_width = self.width;
+                let mut rf_items = items;
+                self.launch(
+                    "rmsnorm_film_dfilm",
+                    self.k.rmsnorm_film_dfilm,
+                    (2 * self.width, items, 1),
+                    (BATCH_THREADS as u32, 1, 1),
+                    &mut kargs![rf_du, rf_h, rf_inv, rf_df, rf_frames, rf_width, rf_items],
+                )?;
+                let tp = &self.time_proj_specs[block_idx];
+                let mut tp_data = self.data.ptr;
+                let mut tp_df = self.d_film.ptr;
+                let mut tp_grad = self.grad.ptr;
+                let mut tp_total = total_samples as u32;
+                let mut tp_width = self.width;
+                let mut tp_wo = tp.w;
+                let mut tp_bo = tp.b;
+                let mut tp_inv = inv_batch;
+                let mut tp_items = items;
+                self.launch(
+                    "time_proj_dw",
+                    self.k.time_proj_dw,
+                    (2 * self.width, 1, 1),
+                    (32, 1, 1),
+                    &mut kargs![
+                        tp_data, tp_df, tp_grad, tp_total, tp_width, tp_wo, tp_bo, tp_inv, tp_items
+                    ],
+                )?;
+                continue;
+            }
             if j + 1 < last {
                 let mut e_dh = self.dh[j + 1].ptr;
                 let mut e_z = self.z[j].ptr;

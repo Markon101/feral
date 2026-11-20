@@ -3,7 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use feral::{
     audio::{self, Preprocess},
     flow::Sampling,
-    model::Architecture,
+    model::{Architecture, BlockStyle},
     parameterization::{FlowConfig, LrSchedule, TimeSampling},
     runtime::{self, Mode, RenderConfig, TrainConfig},
 };
@@ -132,6 +132,14 @@ struct TrainArgs {
     /// Residual branch count for --network baseline (dilations 1,2,4,...; max 10).
     #[arg(long, default_value_t = 4, value_parser = parse_blocks)]
     blocks: usize,
+    /// Dilation schedule for --network baseline: ascending (legacy), symmetric (U-Net coarse-to-fine),
+    /// or cycles (two full ascending dilation passes).
+    #[arg(long, default_value = "ascending", value_parser = ["ascending", "symmetric", "cycles"])]
+    dilation_pattern: String,
+    /// Residual block style: tanh (legacy) or gated-film (pre-RMSNorm + per-block FiLM time
+    /// conditioning + WaveNet gated activation; CPU and CUDA backends only).
+    #[arg(long, default_value = "tanh", value_parser = ["tanh", "gated-film"])]
+    block_style: String,
     /// Samples per frame before the first convolution (16/32/64/128). Larger frames are cheaper
     /// per sample and multiply the receptive field by the same factor.
     #[arg(long, default_value_t = 32, value_parser = parse_frame_samples)]
@@ -442,16 +450,21 @@ fn main() -> Result<()> {
                 validation_every: a.validation_every,
                 architecture: (if a.network == "pyramid" {
                     ensure!(
-                        a.blocks == 4,
-                        "--blocks does not apply to --network pyramid"
+                        a.blocks == 4 && a.dilation_pattern == "ascending",
+                        "--blocks and --dilation-pattern do not apply to --network pyramid"
                     );
                     Architecture::pyramid()
                 } else {
-                    Architecture::default().with_blocks(a.blocks)?
+                    Architecture::default().with_dilation_pattern(a.blocks, &a.dilation_pattern)?
                 })
                 .with_width(a.width)?
                 .with_frame_samples(a.block)?
-                .with_sample_conv(a.sample_conv)?,
+                .with_sample_conv(a.sample_conv)?
+                .with_block_style(if a.block_style == "gated-film" {
+                    BlockStyle::GatedFilm
+                } else {
+                    BlockStyle::Tanh
+                })?,
             })?;
         }
         Commands::Generate(a) => runtime::render(a.config(Mode::Generate))?,

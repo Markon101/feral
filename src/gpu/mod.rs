@@ -87,6 +87,10 @@ impl OpenClTrainer {
             "sample-level conv stem/head is implemented on the CPU and CUDA backends only"
         );
         ensure!(
+            model.architecture.block_style.is_tanh(),
+            "gated-film residual blocks are implemented on the CPU and CUDA backends only"
+        );
+        ensure!(
             n > 0 && n <= 160000 && n.is_multiple_of(model.architecture.block),
             "invalid GPU crop size"
         );

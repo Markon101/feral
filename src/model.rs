@@ -9,6 +9,39 @@ use serde::{Deserialize, Serialize};
 pub const MAX_WINDOW_SAMPLES: usize = 512_000;
 /// Hidden channels in the optional sample-level residual stem and head convolutions.
 pub const SAMPLE_CONV_CHANNELS: usize = 16;
+/// Dimension of the deterministic multi-harmonic sinusoidal time embedding for `GatedFilm` blocks.
+pub const TIME_EMBED_DIM: usize = 32;
+/// Epsilon inside pre-RMSNorm for `GatedFilm` residual blocks.
+pub const RMS_NORM_EPS: f32 = 1e-5;
+
+/// Residual block nonlinearity and conditioning style.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BlockStyle {
+    /// Legacy v1-v3 residual block: `h + 0.5 * tanh(Conv1d(h))`.
+    #[default]
+    Tanh,
+    /// Pre-RMSNorm + per-block FiLM time conditioning + WaveNet gated activation
+    /// `h + 0.5 * (tanh(a) * sigmoid(b))`.
+    GatedFilm,
+}
+impl BlockStyle {
+    pub fn is_tanh(&self) -> bool {
+        matches!(self, Self::Tanh)
+    }
+}
+
+/// Deterministic 32-dim log-spaced sinusoidal time embedding (16 frequencies from 1 to ~181 cycles).
+pub fn time_embedding(t: f32) -> [f32; TIME_EMBED_DIM] {
+    let mut out = [0f32; TIME_EMBED_DIM];
+    for k in 0..TIME_EMBED_DIM / 2 {
+        let freq = std::f32::consts::TAU * 2.0f32.powf(k as f32 * 0.5);
+        let ang = t * freq;
+        out[2 * k] = ang.sin();
+        out[2 * k + 1] = ang.cos();
+    }
+    out
+}
 
 fn is_zero_usize(v: &usize) -> bool {
     *v == 0
@@ -24,6 +57,9 @@ pub struct Architecture {
     /// sample-domain stem and head convolutions around the frame stack).
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub sample_conv: usize,
+    /// Residual block style (`tanh` legacy default, or `gated-film` with pre-RMSNorm + FiLM + gate).
+    #[serde(default, skip_serializing_if = "BlockStyle::is_tanh")]
+    pub block_style: BlockStyle,
 }
 impl Default for Architecture {
     fn default() -> Self {
@@ -33,6 +69,7 @@ impl Default for Architecture {
             dilations: vec![1, 2, 4, 8],
             scales: vec![],
             sample_conv: 0,
+            block_style: BlockStyle::Tanh,
         }
     }
 }
@@ -62,16 +99,49 @@ impl Architecture {
     }
     /// Rebuild the baseline residual stack with `blocks` power-of-two dilations. The default
     /// four blocks are the v1 baseline; five at width 256 is the ~1.02M-parameter configuration.
-    pub fn with_blocks(mut self, blocks: usize) -> Result<Self> {
+    pub fn with_blocks(self, blocks: usize) -> Result<Self> {
+        self.with_dilation_pattern(blocks, "ascending")
+    }
+    /// Build power-of-two dilations using `ascending` (`1..2^(b-1)`), `symmetric`
+    /// (`1..2^(b-1)..1`, U-Net coarse-to-fine refinement), or `cycles` (two full `1..2^(b-1)` passes).
+    pub fn with_dilation_pattern(mut self, blocks: usize, pattern: &str) -> Result<Self> {
         ensure!(
             (1..=10).contains(&blocks),
             "block count must be 1..10 (dilations up to 512)"
         );
         ensure!(
             self.dilations.len() == Self::default().dilations.len() && self.scales.is_empty(),
-            "with_blocks only applies to the unscaled baseline residual stack"
+            "dilation patterns only apply to the unscaled baseline residual stack"
         );
-        self.dilations = (0..blocks).map(|i| 1 << i).collect();
+        let up: Vec<usize> = (0..blocks).map(|i| 1 << i).collect();
+        self.dilations = match pattern {
+            "ascending" => up,
+            "symmetric" => {
+                ensure!(
+                    blocks >= 2,
+                    "symmetric dilation pattern requires blocks >= 2"
+                );
+                let mut d = up;
+                for i in (0..blocks - 1).rev() {
+                    d.push(1 << i);
+                }
+                d
+            }
+            "cycles" => {
+                let mut d = up.clone();
+                d.extend(up);
+                d
+            }
+            other => anyhow::bail!(
+                "dilation pattern must be ascending, symmetric or cycles, got {other}"
+            ),
+        };
+        self.validate()?;
+        Ok(self)
+    }
+    /// Select residual block style (`Tanh` legacy default or `GatedFilm`).
+    pub fn with_block_style(mut self, style: BlockStyle) -> Result<Self> {
+        self.block_style = style;
         self.validate()?;
         Ok(self)
     }
@@ -126,7 +196,7 @@ impl Architecture {
         );
         ensure!(
             !self.dilations.is_empty()
-                && self.dilations.len() <= 10
+                && self.dilations.len() <= 24
                 && self.dilations.iter().all(|d| (1..=512).contains(d)),
             "invalid dilations"
         );
@@ -195,6 +265,9 @@ pub struct Layer {
 pub struct Model {
     pub architecture: Architecture,
     pub layers: Vec<Layer>,
+    /// Per-block time-conditioning FiLM projections `32 -> 2*width` when `block_style == GatedFilm`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub time_proj: Vec<Layer>,
     /// Optional sample-domain residual stem `[Layer(3->16, k=K), Layer(16->1, k=K)]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stem: Vec<Layer>,
@@ -219,6 +292,10 @@ pub struct Tape {
     features: Vec<f32>,
     acts: Vec<Vec<f32>>,
     nonlinear: Vec<Vec<f32>>,
+    time_embed: [f32; TIME_EMBED_DIM],
+    films: Vec<Vec<f32>>,
+    inv_rms: Vec<Vec<f32>>,
+    normed: Vec<Vec<f32>>,
     stem_in: Vec<f32>,
     stem_a0: Vec<f32>,
     stem_a1: Vec<f32>,
@@ -291,11 +368,30 @@ impl Layer {
 impl Model {
     pub fn new(a: Architecture, seed: u64) -> Self {
         let mut rng = Rng::new(seed);
+        let gated = a.block_style == BlockStyle::GatedFilm;
+        let res_out = if gated { 2 * a.width } else { a.width };
         let mut layers = vec![Layer::new(3 * a.block + 4, a.width, 1, 1, &mut rng)];
         for &d in &a.dilations {
-            layers.push(Layer::new(a.width, a.width, 3, d, &mut rng));
+            layers.push(Layer::new(a.width, res_out, 3, d, &mut rng));
         }
         layers.push(Layer::new(a.width, a.block, 1, 1, &mut rng));
+        let time_proj = if gated {
+            let scale = 0.1 / (TIME_EMBED_DIM as f32).sqrt();
+            (0..a.dilations.len())
+                .map(|_| Layer {
+                    input: TIME_EMBED_DIM,
+                    output: 2 * a.width,
+                    kernel: 1,
+                    dilation: 1,
+                    w: (0..TIME_EMBED_DIM * 2 * a.width)
+                        .map(|_| rng.normal() * scale)
+                        .collect(),
+                    b: vec![0.; 2 * a.width],
+                })
+                .collect()
+        } else {
+            vec![]
+        };
         let (stem, head) = if a.sample_conv > 0 {
             let k = a.sample_conv;
             (
@@ -314,6 +410,7 @@ impl Model {
         Self {
             architecture: a,
             layers,
+            time_proj,
             stem,
             head,
         }
@@ -321,6 +418,7 @@ impl Model {
     pub fn count(&self) -> usize {
         self.layers
             .iter()
+            .chain(&self.time_proj)
             .chain(&self.stem)
             .chain(&self.head)
             .map(|l| l.w.len() + l.b.len())
@@ -329,6 +427,7 @@ impl Model {
     pub fn parameters(&self) -> Vec<f32> {
         self.layers
             .iter()
+            .chain(&self.time_proj)
             .chain(&self.stem)
             .chain(&self.head)
             .flat_map(|l| l.w.iter().chain(&l.b).copied())
@@ -339,6 +438,7 @@ impl Model {
         for l in self
             .layers
             .iter_mut()
+            .chain(&mut self.time_proj)
             .chain(&mut self.stem)
             .chain(&mut self.head)
         {
@@ -356,6 +456,7 @@ impl Model {
         assert_eq!(n, known.len());
         assert_eq!(n, mask.len());
         let frames = n / b;
+        let gated = self.architecture.block_style == BlockStyle::GatedFilm;
         let (x_eff, stem_in, stem_a0, stem_a1) = if !self.stem.is_empty() {
             let mut stem_in = Vec::with_capacity(3 * n);
             for i in 0..n {
@@ -389,9 +490,18 @@ impl Model {
                 (t * std::f32::consts::TAU).cos(),
             ]);
         }
+        let time_embed = if gated {
+            time_embedding(t)
+        } else {
+            [0.; TIME_EMBED_DIM]
+        };
         let mut acts = vec![];
         let mut nonlinear = vec![];
+        let mut films = vec![];
+        let mut inv_rms_all = vec![];
+        let mut normed_all = vec![];
         let mut h = features.clone();
+        let w = self.architecture.width;
         for (j, l) in self.layers.iter().enumerate() {
             let residual = j > 0 && j + 1 < self.layers.len();
             let scale = if residual {
@@ -399,6 +509,55 @@ impl Model {
             } else {
                 1
             };
+            if residual && gated {
+                let block_idx = j - 1;
+                let film = self.time_proj[block_idx].forward(&time_embed, 1);
+                let mut inv_rms = Vec::with_capacity(frames);
+                let mut normed = vec![0f32; frames * w];
+                for p in 0..frames {
+                    let row = &h[p * w..(p + 1) * w];
+                    let sq: f32 = row.iter().map(|&v| v * v).sum();
+                    let r = 1. / (sq / w as f32 + RMS_NORM_EPS).sqrt();
+                    inv_rms.push(r);
+                    for c in 0..w {
+                        normed[p * w + c] = (1. + film[c]) * (row[c] * r) + film[w + c];
+                    }
+                }
+                let conv_in = if scale > 1 {
+                    pool(&normed, frames, w, scale)
+                } else {
+                    normed.clone()
+                };
+                let cf = frames.div_ceil(scale);
+                let pre = l.forward(&conv_in, cf);
+                let mut nl = vec![0f32; cf * 2 * w];
+                let mut gated_act = vec![0f32; cf * w];
+                for q in 0..cf {
+                    for c in 0..w {
+                        let a = pre[q * 2 * w + c].tanh();
+                        let s = 1. / (1. + (-pre[q * 2 * w + w + c]).exp());
+                        nl[q * 2 * w + c] = a;
+                        nl[q * 2 * w + w + c] = s;
+                        gated_act[q * w + c] = a * s;
+                    }
+                }
+                nonlinear.push(nl);
+                let rep = if scale > 1 {
+                    repeat(&gated_act, frames, w, scale)
+                } else {
+                    gated_act
+                };
+                let mut next = vec![0f32; frames * w];
+                for i in 0..frames * w {
+                    next[i] = h[i] + 0.5 * rep[i];
+                }
+                films.push(film);
+                inv_rms_all.push(inv_rms);
+                normed_all.push(normed);
+                acts.push(next.clone());
+                h = next;
+                continue;
+            }
             let pooled = if scale > 1 {
                 pool(&h, frames, l.input, scale)
             } else {
@@ -439,6 +598,10 @@ impl Model {
                 features,
                 acts,
                 nonlinear,
+                time_embed,
+                films,
+                inv_rms: inv_rms_all,
+                normed: normed_all,
                 stem_in,
                 stem_a0,
                 stem_a1,
@@ -446,11 +609,13 @@ impl Model {
             },
         )
     }
-    /// Exact reverse-mode derivatives for the specialized convolution/tanh/residual graph.
+    /// Exact reverse-mode derivatives for the specialized convolution/tanh/gated-FiLM/residual graph.
     pub fn backward(&self, tape: &Tape, dy: &[f32]) -> Vec<f32> {
         let b = self.architecture.block;
+        let w = self.architecture.width;
         let n = dy.len();
         let frames = n / b;
+        let gated = self.architecture.block_style == BlockStyle::GatedFilm;
         let (mut dh, head_grads) = if !self.head.is_empty() {
             let dh1: Vec<f32> = dy.iter().map(|&g| 0.5 * g).collect();
             let (d_h0, dw_h1, db_h1) = self.head[1].backward(&tape.head_a0, &dh1, n);
@@ -473,6 +638,7 @@ impl Model {
             (dy.to_vec(), Vec::new())
         };
         let mut grads = vec![Vec::new(); self.layers.len()];
+        let mut time_proj_grads = vec![Vec::new(); self.time_proj.len()];
         for j in (0..self.layers.len()).rev() {
             let residual = j > 0 && j + 1 < self.layers.len();
             let layer = &self.layers[j];
@@ -481,6 +647,66 @@ impl Model {
             } else {
                 1
             };
+            if residual && gated {
+                let block_idx = j - 1;
+                let cf = frames.div_ceil(scale);
+                let g_rep = if scale > 1 {
+                    repeat_transpose(&dh, frames, w, scale)
+                } else {
+                    dh.clone()
+                };
+                let nl = &tape.nonlinear[j];
+                let mut dz = vec![0f32; cf * 2 * w];
+                for q in 0..cf {
+                    for c in 0..w {
+                        let g = 0.5 * g_rep[q * w + c];
+                        let ta = nl[q * 2 * w + c];
+                        let sb = nl[q * 2 * w + w + c];
+                        dz[q * 2 * w + c] = g * sb * (1. - ta * ta);
+                        dz[q * 2 * w + w + c] = g * ta * sb * (1. - sb);
+                    }
+                }
+                let conv_in = if scale > 1 {
+                    pool(&tape.normed[block_idx], frames, w, scale)
+                } else {
+                    tape.normed[block_idx].clone()
+                };
+                let (d_conv_in, dw, db) = layer.backward(&conv_in, &dz, cf);
+                let du = if scale > 1 {
+                    pool_transpose(&d_conv_in, frames, w, scale)
+                } else {
+                    d_conv_in
+                };
+                let h_in = &tape.acts[j - 1];
+                let inv_rms = &tape.inv_rms[block_idx];
+                let film = &tape.films[block_idx];
+                let mut d_film = vec![0f32; 2 * w];
+                let mut dx = vec![0f32; frames * w];
+                for p in 0..frames {
+                    let r = inv_rms[p];
+                    let mut dot = 0f32;
+                    for c in 0..w {
+                        let xh = h_in[p * w + c] * r;
+                        let duv = du[p * w + c];
+                        let gt = (1. + film[c]) * duv;
+                        dot += gt * xh;
+                        d_film[c] += duv * xh;
+                        d_film[w + c] += duv;
+                    }
+                    dot /= w as f32;
+                    for c in 0..w {
+                        let xh = h_in[p * w + c] * r;
+                        let gt = (1. + film[c]) * du[p * w + c];
+                        dx[p * w + c] = r * (gt - xh * dot) + dh[p * w + c];
+                    }
+                }
+                let (_, dw_tp, db_tp) =
+                    self.time_proj[block_idx].backward(&tape.time_embed, &d_film, 1);
+                time_proj_grads[block_idx] = dw_tp.into_iter().chain(db_tp).collect();
+                grads[j] = dw.into_iter().chain(db).collect();
+                dh = dx;
+                continue;
+            }
             let mut dz = if scale > 1 {
                 repeat_transpose(&dh, frames, layer.output, scale)
             } else {
@@ -515,7 +741,7 @@ impl Model {
             grads[j] = dw.into_iter().chain(db).collect();
             dh = dx;
         }
-        let mut out: Vec<f32> = grads.into_iter().flatten().collect();
+        let mut out: Vec<f32> = grads.into_iter().chain(time_proj_grads).flatten().collect();
         if !self.stem.is_empty() {
             let stride = 3 * b + 4;
             let mut dz_s1 = Vec::with_capacity(n);
@@ -572,6 +798,7 @@ impl Model {
             Ok(())
         };
         check(&self.layers, &reference.layers, "frame")?;
+        check(&self.time_proj, &reference.time_proj, "time_proj")?;
         check(&self.stem, &reference.stem, "stem")?;
         check(&self.head, &reference.head, "head")?;
         ensure!(

@@ -372,3 +372,369 @@ extern "C" __global__ void feral_sample_conv_dw(
     }
   }
 }
+
+// ============================================================================
+// Gated-FiLM residual block kernels (pre-RMSNorm + per-block FiLM + tanh*sigmoid)
+// ============================================================================
+
+extern "C" __global__ void feral_time_embed_proj_fwd(
+    const float *__restrict__ data, const float *__restrict__ weights, float *__restrict__ film,
+    unsigned total_samples, unsigned width, unsigned wo, unsigned bo, unsigned items) {
+  unsigned two_w = 2u * width;
+  unsigned o = blockIdx.x * blockDim.x + threadIdx.x;
+  unsigned item = blockIdx.y;
+  if (o >= two_w || item >= items) return;
+  float t = data[3u * total_samples + 4u * item];
+  float sum = weights[bo + o];
+  for (unsigned k = 0u; k < 16u; k++) {
+    float freq = 6.2831853071795864769f * powf(2.0f, (float)k * 0.5f);
+    float ang = t * freq;
+    sum += weights[wo + o * 32u + 2u * k] * sinf(ang) +
+           weights[wo + o * 32u + 2u * k + 1u] * cosf(ang);
+  }
+  film[item * two_w + o] = sum;
+}
+
+extern "C" __global__ void feral_rmsnorm_film_fwd(
+    const float *__restrict__ h, const float *__restrict__ film, float *__restrict__ normed,
+    float *__restrict__ inv_rms_out, unsigned frames, unsigned width, unsigned items) {
+  unsigned pf = blockIdx.x;
+  if (pf >= items * frames) return;
+  unsigned item = pf / frames;
+  unsigned lane = threadIdx.x;
+  __shared__ float scratch[256];
+  const float *row = h + pf * width;
+  float sq = 0.0f;
+  for (unsigned c = lane; c < width; c += 256u) {
+    float v = row[c];
+    sq += v * v;
+  }
+  scratch[lane] = sq;
+  __syncthreads();
+  for (unsigned step = 128u; step > 0u; step >>= 1) {
+    if (lane < step) scratch[lane] += scratch[lane + step];
+    __syncthreads();
+  }
+  float inv_rms = 1.0f / sqrtf(scratch[0] / (float)width + 1e-5f);
+  if (lane == 0u) inv_rms_out[pf] = inv_rms;
+  const float *f = film + item * 2u * width;
+  float *dst = normed + pf * width;
+  for (unsigned c = lane; c < width; c += 256u) {
+    dst[c] = (1.0f + f[c]) * (row[c] * inv_rms) + f[width + c];
+  }
+}
+
+extern "C" __global__ void feral_gated_residual_fwd(
+    float *__restrict__ z, const float *__restrict__ skip, float *__restrict__ y, unsigned frames,
+    unsigned width, unsigned scale, unsigned items) {
+  unsigned cf = (frames + scale - 1u) / scale;
+  unsigned total = items * cf * width;
+  unsigned id = blockIdx.x * blockDim.x + threadIdx.x;
+  if (id >= total) return;
+  unsigned c = id % width;
+  unsigned pg = id / width;
+  unsigned item = pg / cf;
+  unsigned q = pg % cf;
+  unsigned base = pg * 2u * width;
+  float ta = tanhf(z[base + c]);
+  float sb = 1.0f / (1.0f + expf(-z[base + width + c]));
+  z[base + c] = ta;
+  z[base + width + c] = sb;
+  float act = ta * sb;
+  unsigned count = min(scale, frames - q * scale);
+  for (unsigned r = 0u; r < count; r++) {
+    unsigned at = (item * frames + q * scale + r) * width + c;
+    y[at] = skip[at] + 0.5f * act;
+  }
+}
+
+extern "C" __global__ void feral_gated_activation_grad(
+    const float *__restrict__ dh, const float *__restrict__ z, float *__restrict__ dz,
+    unsigned frames, unsigned width, unsigned scale, unsigned items) {
+  unsigned cf = (frames + scale - 1u) / scale;
+  unsigned total = items * cf * width;
+  unsigned id = blockIdx.x * blockDim.x + threadIdx.x;
+  if (id >= total) return;
+  unsigned c = id % width;
+  unsigned pg = id / width;
+  unsigned item = pg / cf;
+  unsigned q = pg % cf;
+  unsigned count = min(scale, frames - q * scale);
+  float g = 0.0f;
+  for (unsigned r = 0u; r < count; r++) {
+    g += dh[(item * frames + q * scale + r) * width + c];
+  }
+  g *= 0.5f;
+  unsigned base = pg * 2u * width;
+  float ta = z[base + c];
+  float sb = z[base + width + c];
+  dz[base + c] = g * sb * (1.0f - ta * ta);
+  dz[base + width + c] = g * ta * sb * (1.0f - sb);
+}
+
+extern "C" __global__ void feral_rmsnorm_film_dx(
+    const float *__restrict__ du, const float *__restrict__ h, const float *__restrict__ inv_rms,
+    const float *__restrict__ film, const float *__restrict__ dh_skip, float *__restrict__ dh_out,
+    unsigned frames, unsigned width, unsigned items) {
+  unsigned pf = blockIdx.x;
+  if (pf >= items * frames) return;
+  unsigned item = pf / frames;
+  unsigned lane = threadIdx.x;
+  __shared__ float scratch[256];
+  float r = inv_rms[pf];
+  const float *h_row = h + pf * width;
+  const float *du_row = du + pf * width;
+  const float *f = film + item * 2u * width;
+  float dot_acc = 0.0f;
+  for (unsigned c = lane; c < width; c += 256u) {
+    float xh = h_row[c] * r;
+    float gt = (1.0f + f[c]) * du_row[c];
+    dot_acc += gt * xh;
+  }
+  scratch[lane] = dot_acc;
+  __syncthreads();
+  for (unsigned step = 128u; step > 0u; step >>= 1) {
+    if (lane < step) scratch[lane] += scratch[lane + step];
+    __syncthreads();
+  }
+  float dot = scratch[0] / (float)width;
+  const float *skip_row = dh_skip + pf * width;
+  float *out_row = dh_out + pf * width;
+  for (unsigned c = lane; c < width; c += 256u) {
+    float xh = h_row[c] * r;
+    float gt = (1.0f + f[c]) * du_row[c];
+    out_row[c] = r * (gt - xh * dot) + skip_row[c];
+  }
+}
+
+extern "C" __global__ void feral_rmsnorm_film_dfilm(
+    const float *__restrict__ du, const float *__restrict__ h, const float *__restrict__ inv_rms,
+    float *__restrict__ d_film, unsigned frames, unsigned width, unsigned items) {
+  unsigned o = blockIdx.x;
+  unsigned item = blockIdx.y;
+  if (o >= 2u * width || item >= items) return;
+  unsigned lane = threadIdx.x;
+  __shared__ float scratch[256];
+  float acc = 0.0f;
+  unsigned base_f = item * frames;
+  if (o < width) {
+    for (unsigned p = lane; p < frames; p += 256u) {
+      unsigned pf = base_f + p;
+      acc += du[pf * width + o] * h[pf * width + o] * inv_rms[pf];
+    }
+  } else {
+    unsigned c = o - width;
+    for (unsigned p = lane; p < frames; p += 256u) {
+      unsigned pf = base_f + p;
+      acc += du[pf * width + c];
+    }
+  }
+  scratch[lane] = acc;
+  __syncthreads();
+  for (unsigned step = 128u; step > 0u; step >>= 1) {
+    if (lane < step) scratch[lane] += scratch[lane + step];
+    __syncthreads();
+  }
+  if (lane == 0u) d_film[item * 2u * width + o] = scratch[0];
+}
+
+extern "C" __global__ void feral_time_proj_dw(
+    const float *__restrict__ data, const float *__restrict__ d_film, float *__restrict__ grad,
+    unsigned total_samples, unsigned width, unsigned wo, unsigned bo, float inv_batch,
+    unsigned items) {
+  unsigned o = blockIdx.x;
+  unsigned i = threadIdx.x;
+  if (o >= 2u * width || i >= 32u) return;
+  unsigned k = i >> 1;
+  float freq = 6.2831853071795864769f * powf(2.0f, (float)k * 0.5f);
+  float w_acc = 0.0f;
+  float b_acc = 0.0f;
+  for (unsigned item = 0u; item < items; item++) {
+    float t = data[3u * total_samples + 4u * item];
+    float te_i = (i & 1u) ? cosf(t * freq) : sinf(t * freq);
+    float df = d_film[item * 2u * width + o];
+    w_acc += df * te_i;
+    if (i == 0u) b_acc += df;
+  }
+  grad[wo + o * 32u + i] = w_acc * inv_batch;
+  if (i == 0u) grad[bo + o] = b_acc * inv_batch;
+}
+
+// ============================================================================
+// GPU-resident multiresolution STFT log-magnitude Charbonnier L1 endpoint loss
+// Zero PCIe sync, zero atomics (4 non-overlapping hop=N/4 slots -> bit-exact).
+// ============================================================================
+
+extern "C" __global__ void feral_zero_buf(float *__restrict__ dst, unsigned total) {
+  unsigned id = blockIdx.x * blockDim.x + threadIdx.x;
+  if (id < total) dst[id] = 0.0f;
+}
+
+__device__ __forceinline__ void feral_radix2_fft(float *s_re, float *s_im, unsigned size,
+                                                 float sign) {
+  unsigned tid = threadIdx.x;
+  unsigned nthreads = blockDim.x;
+  unsigned half_total = size >> 1;
+  for (unsigned len = 2u; len <= size; len <<= 1) {
+    unsigned half = len >> 1;
+    float angle_step = sign * 6.2831853071795864769f / (float)len;
+    for (unsigned b = tid; b < half_total; b += nthreads) {
+      unsigned group = b / half;
+      unsigned k = b - group * half;
+      unsigned i0 = group * len + k;
+      unsigned i1 = i0 + half;
+      float ang = angle_step * (float)k;
+      float wr = cosf(ang);
+      float wi = sinf(ang);
+      float u_re = s_re[i0], u_im = s_im[i0];
+      float v_re = s_re[i1] * wr - s_im[i1] * wi;
+      float v_im = s_re[i1] * wi + s_im[i1] * wr;
+      s_re[i0] = u_re + v_re;
+      s_im[i0] = u_im + v_im;
+      s_re[i1] = u_re - v_re;
+      s_im[i1] = u_im - v_im;
+    }
+    __syncthreads();
+  }
+}
+
+extern "C" __global__ void feral_stft_frame(
+    const float *__restrict__ pred, const float *__restrict__ data, float *__restrict__ overlap,
+    float *__restrict__ frame_losses, unsigned n, unsigned items, unsigned size, unsigned log2_n,
+    unsigned hop, unsigned frame_count, int pre, float data_scale, float prior_std,
+    float spectral_weight, float num_resolutions) {
+  unsigned frame_idx = blockIdx.x;
+  unsigned item = blockIdx.y;
+  if (frame_idx >= frame_count || item >= items) return;
+  unsigned tid = threadIdx.x;
+  unsigned nthreads = blockDim.x;
+  unsigned total = items * n;
+  float t = data[3u * total + 4u * item];
+  if (spectral_weight <= 0.0f || t <= 0.0f || t >= 1.0f) {
+    if (tid == 0u) frame_losses[item * frame_count + frame_idx] = 0.0f;
+    return;
+  }
+
+  __shared__ float s_re[2048];
+  __shared__ float s_im[2048];
+  __shared__ float s_loss[256];
+
+  float cskip = 0.0f, cout = 1.0f;
+  if (pre) feral_precond_coeffs(t, data_scale, prior_std, &cskip, &cout);
+  float omt = 1.0f - t;
+  unsigned start = frame_idx * hop;
+  unsigned len = (start < n) ? min(size, n - start) : 0u;
+  float inv_size_tau = 6.2831853071795864769f / (float)size;
+
+  // Pack real yhat_w into Re and real clean_w into Im (exact 1-FFT real-pair transform).
+  for (unsigned j = tid; j < size; j += nthreads) {
+    float yhw = 0.0f, yw = 0.0f;
+    if (j < len) {
+      unsigned idx = item * n + start + j;
+      float y = data[idx], z = data[total + idx], m = data[2u * total + idx];
+      float yh;
+      if (m == 1.0f) {
+        yh = y;
+      } else {
+        float xt = omt * z + t * y;
+        float v = cskip * xt + cout * pred[idx];
+        yh = xt + omt * v;
+      }
+      float w = 0.5f - 0.5f * cosf(inv_size_tau * (float)j);
+      yhw = yh * w;
+      yw = y * w;
+    }
+    unsigned br = __brev(j) >> (32u - log2_n);
+    s_re[br] = yhw;
+    s_im[br] = yw;
+  }
+  __syncthreads();
+
+  feral_radix2_fft(s_re, s_im, size, -1.0f);
+
+  unsigned bins = (size >> 1) + 1u;
+  float scale = 1.0f / (num_resolutions * (float)(frame_count * bins));
+  const float eps_sq = 1e-10f;
+  const float delta = 1e-5f;
+  const float delta_sq = 1e-10f;
+  float g_re[5], g_im[5];
+  float local_loss = 0.0f;
+  unsigned idx_local = 0u;
+  for (unsigned k = tid; k < bins; k += nthreads, idx_local++) {
+    unsigned km = (k == 0u) ? 0u : (size - k);
+    float zk_re = s_re[k], zk_im = s_im[k];
+    float zm_re = s_re[km], zm_im = s_im[km];
+    float a_re = 0.5f * (zk_re + zm_re);
+    float a_im = 0.5f * (zk_im - zm_im);
+    float b_re = 0.5f * (zk_im + zm_im);
+    float b_im = 0.5f * (zm_re - zk_re);
+    float mag_a = sqrtf(a_re * a_re + a_im * a_im + eps_sq);
+    float mag_b = sqrtf(b_re * b_re + b_im * b_im + eps_sq);
+    float diff = log1pf(mag_a) - log1pf(mag_b);
+    float rho = sqrtf(diff * diff + delta_sq);
+    local_loss += (rho - delta);
+    float coeff = scale * (diff / rho) / ((1.0f + mag_a) * mag_a);
+    g_re[idx_local] = a_re * coeff;
+    g_im[idx_local] = a_im * coeff;
+  }
+  __syncthreads();
+
+  idx_local = 0u;
+  for (unsigned k = tid; k < size; k += nthreads, idx_local++) {
+    unsigned br = __brev(k) >> (32u - log2_n);
+    if (k < bins) {
+      s_re[br] = g_re[idx_local];
+      s_im[br] = g_im[idx_local];
+    } else {
+      s_re[br] = 0.0f;
+      s_im[br] = 0.0f;
+    }
+  }
+  __syncthreads();
+
+  feral_radix2_fft(s_re, s_im, size, 1.0f);
+
+  float weight = spectral_weight * t;
+  float grad_scale = weight * omt * cout;
+  unsigned slot_base = (frame_idx & 3u) * total + item * n + start;
+  for (unsigned j = tid; j < len; j += nthreads) {
+    unsigned idx = item * n + start + j;
+    if (data[2u * total + idx] == 0.0f) {
+      float w = 0.5f - 0.5f * cosf(inv_size_tau * (float)j);
+      overlap[slot_base + j] = w * s_re[j] * grad_scale;
+    }
+  }
+
+  s_loss[tid] = local_loss;
+  __syncthreads();
+  for (unsigned step = nthreads >> 1; step > 0u; step >>= 1) {
+    if (tid < step) s_loss[tid] += s_loss[tid + step];
+    __syncthreads();
+  }
+  if (tid == 0u) frame_losses[item * frame_count + frame_idx] = s_loss[0] * scale * weight;
+}
+
+extern "C" __global__ void feral_stft_accum(float *__restrict__ dy,
+                                            const float *__restrict__ overlap, unsigned total) {
+  unsigned id = blockIdx.x * blockDim.x + threadIdx.x;
+  if (id < total) {
+    dy[id] += overlap[id] + overlap[total + id] + overlap[2u * total + id] +
+              overlap[3u * total + id];
+  }
+}
+
+extern "C" __global__ void feral_add_loss_sum(float *__restrict__ loss_parts,
+                                              const float *__restrict__ frame_losses,
+                                              unsigned count) {
+  unsigned lane = threadIdx.x;
+  __shared__ float scratch[256];
+  float acc = 0.0f;
+  for (unsigned i = lane; i < count; i += 256u) acc += frame_losses[i];
+  scratch[lane] = acc;
+  __syncthreads();
+  for (unsigned step = 128u; step > 0u; step >>= 1) {
+    if (lane < step) scratch[lane] += scratch[lane + step];
+    __syncthreads();
+  }
+  if (lane == 0u) loss_parts[0] += scratch[0];
+}

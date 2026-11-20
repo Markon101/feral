@@ -30,6 +30,7 @@ fn tiny() -> Model {
             dilations: vec![1, 2],
             scales: vec![],
             sample_conv: 0,
+            block_style: feral::model::BlockStyle::Tanh,
         },
         7,
     )
@@ -277,6 +278,7 @@ fn config(root: &Path, run: &str, steps: usize, resume: Option<PathBuf>) -> Trai
             dilations: vec![1, 2],
             scales: vec![],
             sample_conv: 0,
+            block_style: feral::model::BlockStyle::Tanh,
         },
     }
 }
@@ -406,6 +408,7 @@ fn pyramid_gradients_shapes_and_partial_pool_groups() {
         dilations: vec![1, 2, 4],
         scales: vec![1, 2, 4],
         sample_conv: 0,
+        block_style: feral::model::BlockStyle::Tanh,
     };
     a.validate().unwrap();
     let mut m = Model::new(a, 7);
@@ -882,6 +885,7 @@ fn sample_conv_gradients_match_finite_differences_and_no_leakage() {
         dilations: vec![1, 2],
         scales: vec![1, 2],
         sample_conv: 0,
+        block_style: feral::model::BlockStyle::Tanh,
     };
     let sc_arch = base_arch.clone().with_sample_conv(7).unwrap();
     assert_eq!(
@@ -1040,5 +1044,144 @@ fn logit_normal_cosine_ema_and_sample_conv_full_resume() {
             serde_json::from_slice(&fs::read(out.with_extension("json")).unwrap()).unwrap();
         assert_eq!(meta["using_ema"], use_ema);
     }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn gated_film_symmetric_dilations_match_finite_differences_and_resume() {
+    use feral::model::BlockStyle;
+    use feral::parameterization::{self, FlowConfig, LrSchedule, TimeSampling};
+    use feral::spectral::SpectralEngine;
+
+    let sym = Architecture::default()
+        .with_dilation_pattern(4, "symmetric")
+        .unwrap();
+    assert_eq!(sym.dilations, vec![1, 2, 4, 8, 4, 2, 1]);
+    let cyc = Architecture::default()
+        .with_dilation_pattern(3, "cycles")
+        .unwrap();
+    assert_eq!(cyc.dilations, vec![1, 2, 4, 1, 2, 4]);
+
+    // Legacy Tanh serialization omits block_style and time_proj.
+    let legacy = Model::new(Architecture::default(), 7);
+    let legacy_json = serde_json::to_value(&legacy).unwrap();
+    assert!(legacy_json["architecture"].get("block_style").is_none());
+    assert!(legacy_json.get("time_proj").is_none());
+
+    // Finite-difference gradient verification across ALL layers: frame, time_proj, stem, head.
+    let arch = Architecture {
+        block: 4,
+        width: 6,
+        dilations: vec![1, 2, 1],
+        scales: vec![1, 2, 1],
+        sample_conv: 5,
+        block_style: BlockStyle::GatedFilm,
+    };
+    arch.validate().unwrap();
+    let mut m = Model::new(arch, 13);
+    m.validate().unwrap();
+    let p = m.parameters();
+    let (y, z_raw, mask) = vectors(68);
+    let z: Vec<f32> = z_raw.into_iter().map(|v| v * 0.16).collect();
+    let flow = FlowConfig::Preconditioned {
+        data_scale: 0.16,
+        prior_std: 0.16,
+    };
+    let engine = SpectralEngine::new();
+    let t = 0.43f32;
+    let (loss, g) = parameterization::loss_gradient_with_spectral(
+        &m, &flow, &y, &mask, &z, t, 0.5, 0.25, &engine,
+    );
+    assert!(loss.is_finite() && g.iter().all(|v| v.is_finite()));
+
+    let mut offset = 0;
+    let mut indices = vec![];
+    for l in m
+        .layers
+        .iter()
+        .chain(&m.time_proj)
+        .chain(&m.stem)
+        .chain(&m.head)
+    {
+        indices.extend([
+            offset,
+            offset + l.w.len() / 2,
+            offset + l.w.len() - 1,
+            offset + l.w.len(),
+            offset + l.w.len() + l.b.len() - 1,
+        ]);
+        offset += l.w.len() + l.b.len();
+    }
+    assert_eq!(offset, p.len());
+    for i in indices {
+        let eps = 1e-3f32;
+        let mut q = p.clone();
+        q[i] += eps;
+        m.set_parameters(&q);
+        let hi = parameterization::loss_gradient_with_spectral(
+            &m, &flow, &y, &mask, &z, t, 0.5, 0.25, &engine,
+        )
+        .0;
+        q[i] -= 2. * eps;
+        m.set_parameters(&q);
+        let lo = parameterization::loss_gradient_with_spectral(
+            &m, &flow, &y, &mask, &z, t, 0.5, 0.25, &engine,
+        )
+        .0;
+        let fd = (hi - lo) / (2. * eps);
+        assert!(
+            (fd - g[i]).abs() < 1e-3 + 0.03 * fd.abs(),
+            "gated-film grad[{i}]: analytic={} fd={fd}",
+            g[i]
+        );
+    }
+    m.set_parameters(&p);
+
+    // Zero leakage of unknown clean audio.
+    let mut altered = y.clone();
+    for (v, &k) in altered.iter_mut().zip(&mask) {
+        if k == 0. {
+            *v += 50.;
+        }
+    }
+    assert_eq!(
+        m.velocity(&z, &y, &mask, 0.5),
+        m.velocity(&z, &altered, &mask, 0.5)
+    );
+
+    // Full deterministic resume with GatedFilm + symmetric + sample_conv + spectral + EMA.
+    let dir = temp();
+    audio::synthetic(&dir.join("corpus"), 16000).unwrap();
+    let make = |name: &str, steps: usize, resume: Option<PathBuf>| {
+        let mut c = config(&dir, name, steps, resume);
+        c.flow = flow.clone();
+        c.architecture = Architecture {
+            block: 4,
+            width: 6,
+            dilations: vec![1, 2, 1],
+            scales: vec![],
+            sample_conv: 5,
+            block_style: BlockStyle::GatedFilm,
+        };
+        c.spectral_weight = 0.25;
+        c.time_sampling = TimeSampling::LogitNormal { mean: 0., std: 1. };
+        c.lr_schedule = LrSchedule::Cosine {
+            warmup_steps: 2,
+            total_steps: 6,
+            min_lr: 1e-4,
+        };
+        c.ema_decay = 0.9;
+        c
+    };
+    let all = runtime::train(make("all", 4, None)).unwrap();
+    let first = runtime::train(make("first", 2, None)).unwrap();
+    let resumed = runtime::train(make("resumed", 2, Some(first))).unwrap();
+    let a = Checkpoint::load(&all).unwrap();
+    let b = Checkpoint::load(&resumed).unwrap();
+    assert_eq!(a.model.parameters(), b.model.parameters());
+    assert_eq!(a.ema_weights, b.ema_weights);
+    assert_eq!(a.adam.m, b.adam.m);
+    assert_eq!(a.adam.v, b.adam.v);
+    assert_eq!(a.rng.state, b.rng.state);
     fs::remove_dir_all(dir).unwrap();
 }

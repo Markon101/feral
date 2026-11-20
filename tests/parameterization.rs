@@ -30,6 +30,7 @@ fn tiny() -> Architecture {
         dilations: vec![1, 2],
         scales: vec![1, 2],
         sample_conv: 0,
+        block_style: feral::model::BlockStyle::Tanh,
     }
 }
 #[test]
