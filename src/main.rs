@@ -4,7 +4,7 @@ use feral::{
     audio::{self, Preprocess},
     flow::Sampling,
     model::Architecture,
-    parameterization::FlowConfig,
+    parameterization::{FlowConfig, LrSchedule, TimeSampling},
     runtime::{self, Mode, RenderConfig, TrainConfig},
 };
 use std::{fs, path::PathBuf};
@@ -39,7 +39,7 @@ enum Commands {
         audio: AudioArgs,
     },
     /// Train unconditional and masked conditional rectified flow on unlabeled audio.
-    Train(TrainArgs),
+    Train(Box<TrainArgs>),
     /// Generate a new waveform from seeded noise and learned weights.
     Generate(RenderArgs),
     /// Append new audio using a protected prefix; original canonical samples are retained.
@@ -63,6 +63,9 @@ enum Commands {
         /// Velocity-field backend for probes: cpu (reference) or cuda (device).
         #[arg(long, default_value = "cpu")]
         backend: String,
+        /// Evaluate raw optimizer weights instead of EMA weights when EMA is present.
+        #[arg(long)]
+        no_ema: bool,
     },
     /// Signal descriptors and bounded copying screen with shuffled/noise/copy controls.
     Analyze {
@@ -152,6 +155,39 @@ struct TrainArgs {
     /// 0 is the plain waveform residual MSE. Checkpointed; CPU and CUDA backends only.
     #[arg(long, default_value_t = 0.)]
     detail_weight: f32,
+    /// Weight of the t-weighted multiresolution STFT log-magnitude L1 loss on the predicted clean
+    /// endpoint `y_hat`. 0 disables it. Checkpointed; CPU and CUDA backends only.
+    #[arg(long, default_value_t = 0.)]
+    spectral_weight: f32,
+    /// Flow-time distribution during training: uniform (legacy) or logit-normal.
+    #[arg(long, default_value = "uniform", value_parser = ["uniform", "logit-normal"])]
+    time_sampling: String,
+    /// Logit-normal mean when `--time-sampling logit-normal` is selected (-4..4).
+    #[arg(long, default_value_t = 0., allow_hyphen_values = true)]
+    time_mean: f32,
+    /// Logit-normal std when `--time-sampling logit-normal` is selected (0.1..4).
+    #[arg(long, default_value_t = 1.)]
+    time_std: f32,
+    /// Optimizer learning-rate schedule: constant (legacy) or cosine.
+    #[arg(long, default_value = "constant", value_parser = ["constant", "cosine"])]
+    lr_schedule: String,
+    /// Linear warmup steps before cosine decay when `--lr-schedule cosine` is selected.
+    #[arg(long, default_value_t = 0)]
+    warmup_steps: usize,
+    /// Final floor learning rate when `--lr-schedule cosine` is selected.
+    #[arg(long, default_value_t = 1e-5)]
+    min_lr: f32,
+    /// Total schedule horizon in steps for `--lr-schedule cosine` (defaults to `--steps`).
+    #[arg(long)]
+    schedule_steps: Option<usize>,
+    /// Exponential moving average decay for inference weights (0 disables; e.g. 0.999).
+    /// Checkpointed; CPU and CUDA backends only.
+    #[arg(long, default_value_t = 0.)]
+    ema_decay: f32,
+    /// Optional odd sample-level 1D conv kernel size around the frame stack (0 disables; odd 3..=15).
+    /// Bridges frame boundaries with shift-equivariant sample context; CPU and CUDA backends only.
+    #[arg(long, default_value_t = 0, value_parser = parse_sample_conv)]
+    sample_conv: usize,
     /// baseline preserves v1; pyramid pools residual branches at scales 1/4/16/64.
     #[arg(long, default_value="baseline", value_parser=["baseline", "pyramid"])]
     network: String,
@@ -224,6 +260,9 @@ struct RenderArgs {
     /// Velocity-field backend for sampling: cpu (reference) or cuda (same field on device).
     #[arg(long, default_value = "cpu")]
     backend: String,
+    /// Render with raw optimizer weights instead of EMA weights when EMA is present.
+    #[arg(long)]
+    no_ema: bool,
 }
 impl RenderArgs {
     fn config(self, mode: Mode) -> RenderConfig {
@@ -236,6 +275,7 @@ impl RenderArgs {
             start: self.start,
             end: self.end,
             backend: self.backend,
+            use_ema: !self.no_ema,
             sampling: Sampling {
                 seed: self.seed,
                 steps: self.flow_steps,
@@ -246,6 +286,14 @@ impl RenderArgs {
             },
             mode,
         }
+    }
+}
+fn parse_sample_conv(value: &str) -> std::result::Result<usize, String> {
+    let k = value.parse::<usize>().map_err(|e| e.to_string())?;
+    if k == 0 || ((3..=15).contains(&k) && k % 2 == 1) {
+        Ok(k)
+    } else {
+        Err("sample-conv must be 0 (disabled) or an odd kernel size in 3..=15".into())
     }
 }
 fn parse_blocks(value: &str) -> std::result::Result<usize, String> {
@@ -345,6 +393,23 @@ fn main() -> Result<()> {
                 a.parameterization != "velocity" || a.prior_std == 1.,
                 "velocity reference fixes prior std=1; use preconditioned for a calibrated prior"
             );
+            let time_sampling = if a.time_sampling == "logit-normal" {
+                TimeSampling::LogitNormal {
+                    mean: a.time_mean,
+                    std: a.time_std,
+                }
+            } else {
+                TimeSampling::Uniform
+            };
+            let lr_schedule = if a.lr_schedule == "cosine" {
+                LrSchedule::Cosine {
+                    warmup_steps: a.warmup_steps,
+                    total_steps: a.schedule_steps.unwrap_or(a.steps),
+                    min_lr: a.min_lr,
+                }
+            } else {
+                LrSchedule::Constant
+            };
             runtime::train(TrainConfig {
                 flow: if a.parameterization == "preconditioned" {
                     FlowConfig::Preconditioned {
@@ -355,6 +420,10 @@ fn main() -> Result<()> {
                     FlowConfig::Velocity
                 },
                 detail: a.detail_weight,
+                spectral_weight: a.spectral_weight,
+                time_sampling,
+                lr_schedule,
+                ema_decay: a.ema_decay,
                 backend: a.backend,
                 input: a.input,
                 run: a.run,
@@ -381,7 +450,8 @@ fn main() -> Result<()> {
                     Architecture::default().with_blocks(a.blocks)?
                 })
                 .with_width(a.width)?
-                .with_frame_samples(a.block)?,
+                .with_frame_samples(a.block)?
+                .with_sample_conv(a.sample_conv)?,
             })?;
         }
         Commands::Generate(a) => runtime::render(a.config(Mode::Generate))?,
@@ -395,14 +465,16 @@ fn main() -> Result<()> {
             crops,
             seed,
             backend,
+            no_ema,
         } => {
-            feral::evaluate::evaluate_with_backend(
+            feral::evaluate::evaluate_with_options(
                 &checkpoint,
                 &input,
                 &output,
                 crops,
                 seed,
                 &backend,
+                !no_ema,
             )?;
         }
         Commands::Analyze {
@@ -478,6 +550,10 @@ fn main() -> Result<()> {
             runtime::train(TrainConfig {
                 flow: FlowConfig::Velocity,
                 detail: 0.,
+                spectral_weight: 0.,
+                time_sampling: TimeSampling::Uniform,
+                lr_schedule: LrSchedule::Constant,
+                ema_decay: 0.,
                 backend: "cpu".into(),
                 input: corpus,
                 run: run.join("training"),

@@ -3,7 +3,7 @@
 use feral::{
     audio::{self, Preprocess},
     model::Architecture,
-    parameterization::FlowConfig,
+    parameterization::{FlowConfig, LrSchedule, TimeSampling},
     runtime::{self, TrainConfig},
 };
 #[test]
@@ -25,14 +25,21 @@ fn full_gpu_training_and_checkpoint_roundtrip() {
         checkpoint_every: 100,
         resume,
         weights_only: false,
+        grow_crop: false,
         batch: 1,
         validation: None,
         validation_every: 10,
+        detail: 0.,
+        spectral_weight: 0.,
+        time_sampling: TimeSampling::Uniform,
+        lr_schedule: LrSchedule::Constant,
+        ema_decay: 0.,
         architecture: Architecture {
             block: 4,
             width: 5,
             dilations: vec![1, 2],
             scales: vec![1, 2],
+            sample_conv: 0,
         },
         flow: FlowConfig::Preconditioned {
             data_scale: 0.1,
@@ -66,6 +73,7 @@ fn gpu_reports_optimizer_overflow() {
             width: 5,
             dilations: vec![1, 2],
             scales: vec![1, 2],
+            sample_conv: 0,
         },
         7,
     );

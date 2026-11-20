@@ -5,7 +5,7 @@ use crate::{
     data::{self, Dataset, DatasetIdentity},
     flow::{self, Sampling},
     model::{Architecture, Model},
-    parameterization::{self, ConfiguredVelocity, FlowConfig},
+    parameterization::{self, ConfiguredVelocity, FlowConfig, LrSchedule, TimeSampling},
     rng::Rng,
 };
 use anyhow::{ensure, Context, Result};
@@ -83,10 +83,15 @@ impl Adam {
         }
     }
     pub fn update(&mut self, model: &mut Model, grad: &[f32]) -> Result<f32> {
+        let lr = self.lr;
+        self.update_with_lr(model, grad, lr)
+    }
+    pub fn update_with_lr(&mut self, model: &mut Model, grad: &[f32], lr: f32) -> Result<f32> {
         ensure!(
             grad.len() == self.m.len() && grad.iter().all(|g| g.is_finite()),
             "nonfinite or invalid gradients"
         );
+        ensure!(lr.is_finite() && lr >= 0., "invalid step learning rate");
         let norm = grad.iter().map(|g| (*g as f64).powi(2)).sum::<f64>().sqrt() as f32;
         let scale = 1. / norm.max(1.);
         self.step += 1;
@@ -97,7 +102,7 @@ impl Adam {
             let g = grad[i] * scale;
             self.m[i] = 0.9 * self.m[i] + 0.1 * g;
             self.v[i] = 0.999 * self.v[i] + 0.001 * g * g;
-            p[i] -= self.lr * (self.m[i] / c1) / ((self.v[i] / c2).sqrt() + 1e-8);
+            p[i] -= lr * (self.m[i] / c1) / ((self.v[i] / c2).sqrt() + 1e-8);
         }
         ensure!(
             p.iter().all(|v| v.is_finite()),
@@ -106,6 +111,9 @@ impl Adam {
         model.set_parameters(&p);
         Ok(norm)
     }
+}
+fn is_zero_f32(v: &f32) -> bool {
+    *v == 0.
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Checkpoint {
@@ -116,6 +124,21 @@ pub struct Checkpoint {
     /// the objective the weights belong to; older checkpoints default to 0 (the plain objective).
     #[serde(default)]
     pub detail: f32,
+    /// Weight of the multiresolution STFT log-magnitude L1 endpoint loss; 0 disables it.
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub spectral_weight: f32,
+    /// Flow-time distribution used during training; older checkpoints default to Uniform.
+    #[serde(default, skip_serializing_if = "TimeSampling::is_uniform")]
+    pub time_sampling: TimeSampling,
+    /// Optimizer learning-rate schedule; older checkpoints default to Constant.
+    #[serde(default, skip_serializing_if = "LrSchedule::is_constant")]
+    pub lr_schedule: LrSchedule,
+    /// Exponential moving average decay for inference weights; 0 disables EMA.
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub ema_decay: f32,
+    /// Checkpointed EMA parameter shadow (empty when `ema_decay == 0`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ema_weights: Vec<f32>,
     pub model: Model,
     pub adam: Adam,
     pub rng: Rng,
@@ -172,6 +195,18 @@ impl Checkpoint {
             config: &self.flow,
         }
     }
+    pub fn has_ema(&self) -> bool {
+        !self.ema_weights.is_empty()
+    }
+    /// Returns the model to use for inference, previews, and validation: EMA weights when
+    /// `use_ema` is true and EMA weights are present, otherwise raw optimizer weights.
+    pub fn sampling_model(&self, use_ema: bool) -> Model {
+        let mut m = self.model.clone();
+        if use_ema && !self.ema_weights.is_empty() {
+            m.set_parameters(&self.ema_weights);
+        }
+        m
+    }
     pub fn save(&mut self, path: &Path) -> Result<()> {
         self.model_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&self.model)?));
         write_json_compact(path, self)
@@ -193,6 +228,16 @@ impl Checkpoint {
             "invalid detail weight"
         );
         ensure!(
+            c.spectral_weight.is_finite() && (0. ..=100.).contains(&c.spectral_weight),
+            "invalid spectral weight"
+        );
+        c.time_sampling.validate()?;
+        c.lr_schedule.validate(c.adam.lr)?;
+        ensure!(
+            c.ema_decay.is_finite() && c.ema_decay >= 0. && c.ema_decay < 1.,
+            "invalid EMA decay"
+        );
+        ensure!(
             c.format_version == c.flow.format_version(),
             "checkpoint format/flow configuration mismatch"
         );
@@ -204,6 +249,15 @@ impl Checkpoint {
                 && c.adam.m.iter().chain(&c.adam.v).all(|v| v.is_finite())
                 && c.adam.v.iter().all(|&v| v >= 0.),
             "invalid optimizer state"
+        );
+        ensure!(
+            if c.ema_decay > 0. {
+                c.ema_weights.len() == n && c.ema_weights.iter().all(|v| v.is_finite())
+            } else {
+                c.ema_weights.is_empty()
+                    || (c.ema_weights.len() == n && c.ema_weights.iter().all(|v| v.is_finite()))
+            },
+            "invalid EMA weights in checkpoint"
         );
         ensure!(
             c.adam.lr.is_finite()
@@ -247,6 +301,14 @@ pub struct TrainConfig {
     pub flow: FlowConfig,
     /// Weight of the detail term, `<r,r> + detail * <dr,dr>`, in the objective.
     pub detail: f32,
+    /// Weight of the multiresolution STFT log-magnitude L1 endpoint loss; 0 disables it.
+    pub spectral_weight: f32,
+    /// Training flow-time distribution (`Uniform` or `LogitNormal`).
+    pub time_sampling: TimeSampling,
+    /// Optimizer learning-rate schedule (`Constant` or `Cosine`).
+    pub lr_schedule: LrSchedule,
+    /// Exponential moving average decay for inference weights; 0 disables EMA.
+    pub ema_decay: f32,
     /// Crops per optimizer step. The loss and gradients are averaged over the batch.
     pub batch: usize,
     /// Optional held-out corpus for periodic validation. Unset means train-set probes only.
@@ -277,10 +339,12 @@ fn make_cuda_velocity(
     ck: &Checkpoint,
     n: usize,
 ) -> Result<crate::sampler::DeviceVelocity<'static>> {
-    crate::sampler::DeviceVelocity::from_cuda(&ck.model, ck.adam.lr, &ck.flow, n)
+    let model = ck.sampling_model(true);
+    crate::sampler::DeviceVelocity::from_cuda(&model, ck.adam.lr, &ck.flow, n)
 }
-/// Evaluates the fixed probes against the checkpoint's *current* weights, reusing a cached CUDA
-/// device field when supplied so periodic validation does not rebuild the context each interval.
+/// Evaluates the fixed probes against the checkpoint's *current* sampling weights (EMA when
+/// enabled), reusing a cached CUDA device field when supplied so periodic validation does not
+/// rebuild the context each interval.
 fn evaluate_checkpoint(
     ck: &Checkpoint,
     backend: &str,
@@ -288,17 +352,24 @@ fn evaluate_checkpoint(
     n: usize,
     cached: Option<&crate::sampler::DeviceVelocity<'_>>,
 ) -> Result<f32> {
+    let model = ck.sampling_model(true);
     match backend {
         "cuda" => {
             let field = cached.context("missing cached CUDA evaluation field")?;
-            field.load_weights(&ck.model)?;
+            field.load_weights(&model)?;
             Ok(evaluation(field, &ck.flow, dataset, n))
         }
-        _ => Ok(evaluation(&ck.velocity(), &ck.flow, dataset, n)),
+        _ => {
+            let field = ConfiguredVelocity {
+                model: &model,
+                config: &ck.flow,
+            };
+            Ok(evaluation(&field, &ck.flow, dataset, n))
+        }
     }
 }
 /// Previews and the final take use the same backend as training, reusing a cached CUDA field so
-/// only updated weights upload per preview instead of recreating contexts and allocations.
+/// only updated sampling weights (EMA when enabled) upload per preview.
 fn preview_sample(
     ck: &Checkpoint,
     c: &TrainConfig,
@@ -307,14 +378,21 @@ fn preview_sample(
     cached: Option<&crate::sampler::DeviceVelocity<'_>>,
 ) -> Result<Vec<f32>> {
     let zeros = vec![0.; n];
+    let model = ck.sampling_model(true);
     match c.backend.as_str() {
         "cuda" => {
             let field = cached.context("missing cached CUDA preview field")?;
-            field.load_weights(&ck.model)?;
+            field.load_weights(&model)?;
             flow::sample(field, &zeros, &zeros, sampling)
         }
         // cpu, and opencl which has no sampled field of its own: the reference path.
-        _ => flow::sample(&ck.velocity(), &zeros, &zeros, sampling),
+        _ => {
+            let field = ConfiguredVelocity {
+                model: &model,
+                config: &ck.flow,
+            };
+            flow::sample(&field, &zeros, &zeros, sampling)
+        }
     }
 }
 /// Fixed probe and held-out validation window, in seconds of audio.
@@ -338,8 +416,8 @@ pub fn probe_window_samples(sample_rate: u32, crop_samples: usize, block: usize)
 
 pub fn train(c: TrainConfig) -> Result<PathBuf> {
     ensure!(
-        (1..=100000).contains(&c.steps),
-        "training steps must be 1..100000"
+        (1..=10_000_000).contains(&c.steps),
+        "training steps must be 1..10000000"
     );
     // Crops beyond 1 s were measured to cost the same per sample on the resident backends, so the
     // bound is a memory/context guard rather than a speed limit: 4 s at 16 kHz is 64k samples per
@@ -354,6 +432,20 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     ensure!(
         c.lr.is_finite() && c.lr > 0. && c.lr <= 0.01,
         "learning rate must be >0 and <=0.01"
+    );
+    ensure!(
+        c.detail.is_finite() && (0. ..=100.).contains(&c.detail),
+        "detail weight must be finite and 0..100"
+    );
+    ensure!(
+        c.spectral_weight.is_finite() && (0. ..=100.).contains(&c.spectral_weight),
+        "spectral weight must be finite and 0..100"
+    );
+    c.time_sampling.validate()?;
+    c.lr_schedule.validate(c.lr)?;
+    ensure!(
+        c.ema_decay.is_finite() && c.ema_decay >= 0. && c.ema_decay < 1.,
+        "EMA decay must be finite and in [0, 1)"
     );
     c.architecture.validate()?;
     c.flow.validate()?;
@@ -417,6 +509,16 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
             ck.completed_steps = 0;
             ck.dataset = dataset.identity.clone();
             ck.initial_seed = c.seed;
+            ck.detail = c.detail;
+            ck.spectral_weight = c.spectral_weight;
+            ck.time_sampling = c.time_sampling;
+            ck.lr_schedule = c.lr_schedule;
+            ck.ema_decay = c.ema_decay;
+            ck.ema_weights = if c.ema_decay > 0. {
+                ck.model.parameters()
+            } else {
+                vec![]
+            };
         } else {
             ensure!(
                 ck.dataset.manifest_hash == dataset.identity.manifest_hash,
@@ -432,15 +534,45 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
                 ck.detail,
                 c.detail
             );
+            ensure!(
+                ck.spectral_weight == c.spectral_weight,
+                "full resume requires the same spectral weight ({} vs {}); it is part of the objective",
+                ck.spectral_weight,
+                c.spectral_weight
+            );
+            ensure!(
+                ck.time_sampling == c.time_sampling,
+                "full resume requires the same time sampling configuration"
+            );
+            ensure!(
+                ck.lr_schedule == c.lr_schedule,
+                "full resume requires the same lr schedule configuration"
+            );
+            ensure!(
+                ck.ema_decay == c.ema_decay,
+                "full resume requires the same EMA decay ({} vs {})",
+                ck.ema_decay,
+                c.ema_decay
+            );
         }
         ck
     } else {
         let model = Model::new(c.architecture.clone(), c.seed);
         let adam = Adam::new(model.count(), c.lr);
+        let ema_weights = if c.ema_decay > 0. {
+            model.parameters()
+        } else {
+            vec![]
+        };
         Checkpoint {
             format_version: c.flow.format_version(),
             flow: c.flow.clone(),
             detail: c.detail,
+            spectral_weight: c.spectral_weight,
+            time_sampling: c.time_sampling,
+            lr_schedule: c.lr_schedule,
+            ema_decay: c.ema_decay,
+            ema_weights,
             model,
             adam,
             rng: Rng::new(c.seed ^ 0x464552414c),
@@ -453,19 +585,30 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
             git_dirty: !git(&["status", "--porcelain"]).is_empty(),
             source_hash: source_hash()?,
             objective: {
-                let base = if c.flow.is_legacy() {
-                    "conditional rectified flow, unknown-sample MSE, uniform t, N(0,1) noise"
+                let mut desc = if c.flow.is_legacy() {
+                    "conditional rectified flow, unknown-sample MSE, N(0,1) noise".to_string()
                 } else {
-                    "conditional rectified flow, Gaussian residual preconditioning, residual MSE (=velocity MSE/out^2), uniform t, checkpointed Gaussian prior"
+                    "conditional rectified flow, Gaussian residual preconditioning, residual MSE (=velocity MSE/out^2), checkpointed Gaussian prior".to_string()
                 };
-                if c.detail > 0. {
-                    format!(
-                        "{base} + {} x mean squared first difference of the residual",
-                        c.detail
-                    )
-                } else {
-                    base.into()
+                match c.time_sampling {
+                    TimeSampling::Uniform => desc.push_str(", uniform t"),
+                    TimeSampling::LogitNormal { mean, std } => {
+                        desc.push_str(&format!(", logit-normal t(mean={mean}, std={std})"));
+                    }
                 }
+                if c.detail > 0. {
+                    desc.push_str(&format!(
+                        " + {} x mean squared first difference of the residual",
+                        c.detail
+                    ));
+                }
+                if c.spectral_weight > 0. {
+                    desc.push_str(&format!(
+                        " + {} x t-weighted multiresolution STFT log-magnitude L1 on y_hat",
+                        c.spectral_weight
+                    ));
+                }
+                desc
             },
             representation: "f32 mono waveform; lossless time-major blocks".into(),
             model_hash: String::new(),
@@ -473,6 +616,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         }
     };
     let mut trainer = Trainer::new(&c.backend, &ck.model, &ck.adam, n, &ck.flow, c.batch)?;
+    trainer.configure_ema(ck.ema_decay, &ck.ema_weights)?;
     if let Some(parent) = c.run.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -485,7 +629,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     let current_source = source_hash()?;
     write_json(
         &c.run.join("run.json"),
-        &serde_json::json!({"git_commit":git(&["rev-parse","HEAD"]),"git_dirty":!git(&["status","--porcelain"]).is_empty(),"source_hash":current_source,"dataset":dataset.identity,"parameters":ck.model.count(),"architecture":ck.model.architecture,"crop_samples":n,"batch":c.batch,"samples_per_step":n*c.batch,"validation_input":c.validation,"sample_rate":ck.sample_rate,"additional_steps":c.steps,"seed":c.seed,"lr":ck.adam.lr,"optimizer":"Adam beta1=.9 beta2=.999 eps=1e-8 global gradient clip=1","resume":c.resume,"weights_only":c.weights_only,"backend":trainer.name(),"backend_info":trainer.info(),"objective":ck.objective,"representation":ck.representation,"flow":ck.flow,"detail":ck.detail}),
+        &serde_json::json!({"git_commit":git(&["rev-parse","HEAD"]),"git_dirty":!git(&["status","--porcelain"]).is_empty(),"source_hash":current_source,"dataset":dataset.identity,"parameters":ck.model.count(),"architecture":ck.model.architecture,"crop_samples":n,"batch":c.batch,"samples_per_step":n*c.batch,"validation_input":c.validation,"sample_rate":ck.sample_rate,"additional_steps":c.steps,"seed":c.seed,"lr":ck.adam.lr,"lr_schedule":ck.lr_schedule,"time_sampling":ck.time_sampling,"ema_decay":ck.ema_decay,"spectral_weight":ck.spectral_weight,"optimizer":"Adam beta1=.9 beta2=.999 eps=1e-8 global gradient clip=1","resume":c.resume,"weights_only":c.weights_only,"backend":trainer.name(),"backend_info":trainer.info(),"objective":ck.objective,"representation":ck.representation,"flow":ck.flow,"detail":ck.detail}),
     )?;
     ck.save(&c.run.join("initial.json"))?;
     let cached_eval = if c.backend == "cuda" {
@@ -599,7 +743,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
             let mark = Instant::now();
             noise_batch.extend((0..n).map(|_| ck.rng.normal() * ck.flow.prior_std()));
             t_noise += mark.elapsed().as_secs_f64() * 1000.;
-            t_batch.push(ck.rng.uniform());
+            t_batch.push(ck.time_sampling.sample(&mut ck.rng));
             batch_tasks.push(task);
             batch_sources.push(crop.source_index);
             batch_starts.push(crop.start_sample);
@@ -613,6 +757,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         }
         let task = batch_tasks[0];
         let t = t_batch[0];
+        let step_lr = ck.lr_schedule.lr_at(ck.adam.lr, ck.completed_steps + 1);
         let result = trainer.step(
             &mut ck.model,
             &mut ck.adam,
@@ -623,8 +768,18 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
                 noise: &noise_batch,
                 t: &t_batch,
                 detail: ck.detail,
+                spectral: ck.spectral_weight,
+                lr: step_lr,
             },
         )?;
+        if c.backend == "cpu" && ck.ema_decay > 0. {
+            let decay = ck.ema_decay;
+            let one_minus = 1. - decay;
+            let params = ck.model.parameters();
+            for (e, &w) in ck.ema_weights.iter_mut().zip(&params) {
+                *e = decay * *e + one_minus * w;
+            }
+        }
         let loss = result.loss;
         let norm = result.norm;
         neural_ms += result.neural_ms;
@@ -636,17 +791,18 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         writeln!(
             log,
             "{}",
-            serde_json::json!({"step":ck.completed_steps,"loss":loss,"gradient_norm":norm,"task":task,"t":t,"milliseconds":ms,"rng_state":ck.rng.state,"batch_items":items,"batch_sources":batch_sources,"batch_start_samples":batch_starts,"batch_tasks":batch_tasks,"batch_t":t_batch})
+            serde_json::json!({"step":ck.completed_steps,"loss":loss,"gradient_norm":norm,"lr":step_lr,"task":task,"t":t,"milliseconds":ms,"rng_state":ck.rng.state,"batch_items":items,"batch_sources":batch_sources,"batch_start_samples":batch_starts,"batch_tasks":batch_tasks,"batch_t":t_batch})
         )?;
         if local == 1 || local % 10 == 0 || local == c.steps {
             eprintln!(
-                "step {} | loss {:.6} | grad {:.4} | {:.2} ms",
-                ck.completed_steps, loss, norm, ms
+                "step {} | loss {:.6} | grad {:.4} | lr {:.2e} | {:.2} ms",
+                ck.completed_steps, loss, norm, step_lr, ms
             );
             log.flush()?;
         }
         let synced = if local % c.validation_every == 0 {
             trainer.sync(&mut ck.model, &mut ck.adam)?;
+            trainer.sync_ema(&mut ck.ema_weights)?;
             let v = val_loss(&ck)?;
             ensure!(v.is_finite(), "nonfinite validation loss");
             let entry = serde_json::json!({
@@ -667,6 +823,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         };
         if !synced && (local % c.preview_every == 0 || local % c.checkpoint_every == 0) {
             trainer.sync(&mut ck.model, &mut ck.adam)?;
+            trainer.sync_ema(&mut ck.ema_weights)?;
         }
         if local % c.preview_every == 0 {
             let now = Instant::now();
@@ -687,6 +844,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     }
     let training_wall_ms = training_start.elapsed().as_secs_f64() * 1000.;
     trainer.sync(&mut ck.model, &mut ck.adam)?;
+    trainer.sync_ema(&mut ck.ema_weights)?;
     let final_eval = evaluate_checkpoint(&ck, &c.backend, &dataset, eval_n, cached_eval.as_ref())?;
     let final_val = val_loss(&ck)?;
     ensure!(final_val.is_finite(), "nonfinite final validation loss");
@@ -718,10 +876,18 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     let out = c.run.join("checkpoint.json");
     ck.save(&out)?;
     step_ms.sort_by(|a, b| a.total_cmp(b));
-    write_json(
-        &c.run.join("metrics.json"),
-        &serde_json::json!({"backend":trainer.name(),"backend_info":trainer.info(),"timing_scope":match c.backend.as_str(){"cpu"=>"CPU wall operations","cuda"=>"host wall time around synchronized CUDA kernel groups; includes payload upload",_=>"GPU event operation totals; step wall includes transfers, enqueue and sync"},"flow":ck.flow,"detail":ck.detail,"loss_units":if ck.flow.is_legacy(){"waveform velocity MSE"}else{"normalized Gaussian-residual MSE"},"parameters":ck.model.count(),"steps":c.steps,"total_steps":ck.completed_steps,"preprocessing_ms":preprocessing_ms,"neural_forward_backward_ms":neural_ms,"optimizer_ms":optimizer_ms,"training_wall_ms_with_previews":training_wall_ms,"step_mean_ms":step_ms.iter().sum::<f64>()/step_ms.len() as f64,"step_median_ms":step_ms[step_ms.len()/2],"step_max_ms":step_ms.last(),"final_sampling_ms":final_sampling_ms,"other_sampling_ms":sampling_ms,"sampling":sample_config,"sampling_backend":c.backend,"batch":c.batch,"samples_per_step":n*c.batch,"steps_per_second":c.steps as f64/(training_wall_ms/1000.).max(1e-9),"validation_input":c.validation,"validation_initial_loss":initial_val,"validation_final_loss":final_val,"validation_curve":val_curve,"peak_rss_kib":peak_rss_kib(),"fixed_probe_initial_loss":initial_eval,"fixed_probe_final_loss":final_eval,"same_noise_output_mse_change":delta,"generated_rms":audio::rms(&final_audio),"task_counts":task_counts,"source_counts":source_counts,"silence_retries":silence_retries,"crop_sampling":"uniform file then uniform start; retry silent crops","quality_claim":"pipeline verification only; no perceptual quality or generalization established"}),
-    )?;
+    let mut metrics = serde_json::json!({"backend":trainer.name(),"backend_info":trainer.info(),"timing_scope":match c.backend.as_str(){"cpu"=>"CPU wall operations","cuda"=>"host wall time around synchronized CUDA kernel groups; includes payload upload",_=>"GPU event operation totals; step wall includes transfers, enqueue and sync"},"flow":ck.flow,"detail":ck.detail,"loss_units":if ck.flow.is_legacy(){"waveform velocity MSE"}else{"normalized Gaussian-residual MSE"},"parameters":ck.model.count(),"steps":c.steps,"total_steps":ck.completed_steps,"preprocessing_ms":preprocessing_ms,"neural_forward_backward_ms":neural_ms,"optimizer_ms":optimizer_ms,"training_wall_ms_with_previews":training_wall_ms,"step_mean_ms":step_ms.iter().sum::<f64>()/step_ms.len() as f64,"step_median_ms":step_ms[step_ms.len()/2],"step_max_ms":step_ms.last(),"final_sampling_ms":final_sampling_ms,"other_sampling_ms":sampling_ms,"sampling":sample_config,"sampling_backend":c.backend,"batch":c.batch,"samples_per_step":n*c.batch,"steps_per_second":c.steps as f64/(training_wall_ms/1000.).max(1e-9),"validation_input":c.validation,"validation_initial_loss":initial_val,"validation_final_loss":final_val,"validation_curve":val_curve,"peak_rss_kib":peak_rss_kib(),"fixed_probe_initial_loss":initial_eval,"fixed_probe_final_loss":final_eval,"same_noise_output_mse_change":delta,"generated_rms":audio::rms(&final_audio),"task_counts":task_counts,"source_counts":source_counts,"silence_retries":silence_retries,"crop_sampling":"uniform file then uniform start; retry silent crops","quality_claim":"pipeline verification only; no perceptual quality or generalization established"});
+    if let Some(obj) = metrics.as_object_mut() {
+        obj.insert(
+            "spectral_weight".into(),
+            serde_json::json!(ck.spectral_weight),
+        );
+        obj.insert("time_sampling".into(), serde_json::json!(ck.time_sampling));
+        obj.insert("lr_schedule".into(), serde_json::json!(ck.lr_schedule));
+        obj.insert("ema_decay".into(), serde_json::json!(ck.ema_decay));
+        obj.insert("using_ema".into(), serde_json::json!(ck.has_ema()));
+    }
+    write_json(&c.run.join("metrics.json"), &metrics)?;
     eprintln!(
         "checkpoint {} | probe {:.6} -> {:.6} | output delta MSE {:.6}",
         out.display(),
@@ -751,6 +917,8 @@ pub struct RenderConfig {
     /// Velocity-field backend for sampling: `cpu` is the reference, `cuda` evaluates the same
     /// field on the device. Never a silent fallback - an unavailable backend is a hard error.
     pub backend: String,
+    /// Use EMA shadow weights when present in the checkpoint (default true).
+    pub use_ema: bool,
 }
 /// Enforces the protected-sample contract for a conditioned render.
 ///
@@ -887,13 +1055,21 @@ pub fn render(c: RenderConfig) -> Result<()> {
             }
         }
     }
+    let active_model = ck.sampling_model(c.use_ema);
+    let using_ema = c.use_ema && ck.has_ema();
     let mut output = match c.backend.as_str() {
-        "cpu" => flow::sample(&ck.velocity(), &known, &mask, &c.sampling)?,
+        "cpu" => {
+            let field = ConfiguredVelocity {
+                model: &active_model,
+                config: &ck.flow,
+            };
+            flow::sample(&field, &known, &mask, &c.sampling)?
+        }
         "cuda" => {
             // One resident trainer for the whole trajectory: the weights upload once, and each
             // field evaluation is a forward pass on the device.
             let field =
-                crate::sampler::DeviceVelocity::from_cuda(&ck.model, ck.adam.lr, &ck.flow, n)?;
+                crate::sampler::DeviceVelocity::from_cuda(&active_model, ck.adam.lr, &ck.flow, n)?;
             flow::sample(&field, &known, &mask, &c.sampling)?
         }
         other => anyhow::bail!("sampling backend must be cpu or cuda, got {other}"),
@@ -917,7 +1093,7 @@ pub fn render(c: RenderConfig) -> Result<()> {
     audio::write_wav(&c.output, &all, sr)?;
     write_json(
         &c.output.with_extension("json"),
-        &serde_json::json!({"project":"FERAL","mode":match c.mode{Mode::Generate=>"generate",Mode::Continue=>"continue",Mode::Inpaint=>"inpaint",Mode::Variation=>"variation-masked-anchors"},"checkpoint":c.checkpoint,"checkpoint_sha256":data::hash_file(&c.checkpoint)?,"model_hash":ck.model_hash,"flow":ck.flow,"training_steps":ck.completed_steps,"git_commit":git(&["rev-parse","HEAD"]),"input":c.input,"input_sha256":input_hash,"preprocess":p,"sampling":c.sampling,"sampling_backend":c.backend,"sample_rate":sr,"output_samples":all.len(),"window_offset_samples":offset,"inpaint_start":c.start,"inpaint_end":c.end,"preprocessing_ms":preprocess_ms,"sampling_ms":sampling_ms,"peak_rss_kib":peak_rss_kib(),"protected_samples_exact":preserved,"boundary_jumps":jumps,"rms":audio::rms(&all),"output_sha256":data::hash_file(&c.output)?}),
+        &serde_json::json!({"project":"FERAL","mode":match c.mode{Mode::Generate=>"generate",Mode::Continue=>"continue",Mode::Inpaint=>"inpaint",Mode::Variation=>"variation-masked-anchors"},"checkpoint":c.checkpoint,"checkpoint_sha256":data::hash_file(&c.checkpoint)?,"model_hash":ck.model_hash,"flow":ck.flow,"training_steps":ck.completed_steps,"git_commit":git(&["rev-parse","HEAD"]),"input":c.input,"input_sha256":input_hash,"preprocess":p,"sampling":c.sampling,"sampling_backend":c.backend,"using_ema":using_ema,"sample_rate":sr,"output_samples":all.len(),"window_offset_samples":offset,"inpaint_start":c.start,"inpaint_end":c.end,"preprocessing_ms":preprocess_ms,"sampling_ms":sampling_ms,"peak_rss_kib":peak_rss_kib(),"protected_samples_exact":preserved,"boundary_jumps":jumps,"rms":audio::rms(&all),"output_sha256":data::hash_file(&c.output)?}),
     )?;
     eprintln!(
         "wrote {} | {:.1} ms sampling | protected exact={}",

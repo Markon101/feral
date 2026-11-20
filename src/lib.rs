@@ -8,6 +8,7 @@ pub mod parameterization;
 pub mod rng;
 pub mod runtime;
 pub mod sampler;
+pub mod spectral;
 
 #[cfg(feature = "opencl")]
 pub mod gpu;

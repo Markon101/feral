@@ -3,6 +3,7 @@ use crate::{
     model::Model,
     parameterization::{self, FlowConfig},
     runtime::Adam,
+    spectral::SpectralEngine,
 };
 use anyhow::{bail, ensure, Result};
 use serde_json::{json, Value};
@@ -16,6 +17,10 @@ pub struct Batch<'a> {
     pub t: &'a [f32],
     /// Weight of the detail term in the loss; 0 is the plain objective.
     pub detail: f32,
+    /// Weight of the multiresolution STFT log-magnitude L1 endpoint loss; 0 disables it.
+    pub spectral: f32,
+    /// Learning rate for this optimizer step (allows scheduled decay without mutating base lr).
+    pub lr: f32,
 }
 impl Batch<'_> {
     pub fn items(&self) -> usize {
@@ -42,6 +47,10 @@ pub trait Resident {
     /// Weight of the detail term in the loss. Backends without it keep the plain objective; a
     /// caller that asks for a non-zero weight on such a backend gets an error from `step`.
     fn set_detail(&mut self, _detail: f32) {}
+    /// Weight of the multiresolution STFT endpoint loss.
+    fn set_spectral(&mut self, _weight: f32) {}
+    /// Override the learning rate used by subsequent optimizer steps.
+    fn set_lr(&mut self, _lr: f32) {}
     /// Forward-only field evaluation. A backend without a cheaper path stays correct by running a
     /// full step without an update; the CUDA resident skips the backward pass instead.
     fn predict(&mut self, x: &[f32], mask: &[f32], t: f32) -> Result<Vec<f32>> {
@@ -63,7 +72,7 @@ pub trait Resident {
     fn completed_steps(&self) -> usize;
 }
 pub enum Trainer {
-    Cpu,
+    Cpu(Box<SpectralEngine>),
     #[cfg(feature = "opencl")]
     OpenCl(Box<crate::gpu::OpenClTrainer>),
     #[cfg(feature = "cuda")]
@@ -80,7 +89,7 @@ impl Trainer {
     ) -> Result<Self> {
         ensure!((1..=64).contains(&batch), "batch size must be 1..64");
         match name {
-            "cpu" => Ok(Self::Cpu),
+            "cpu" => Ok(Self::Cpu(Box::default())),
             "opencl" => {
                 #[cfg(feature = "opencl")]
                 {
@@ -121,9 +130,29 @@ impl Trainer {
             _ => bail!("backend must be cpu, opencl or cuda"),
         }
     }
+    /// Configure optional EMA weight tracking on resident GPU trainers (CPU tracks EMA in host
+    /// memory directly after each step).
+    pub fn configure_ema(&mut self, decay: f32, initial: &[f32]) -> Result<()> {
+        if decay <= 0. {
+            return Ok(());
+        }
+        match self {
+            Self::Cpu(_) => {
+                let _ = initial;
+                Ok(())
+            }
+            #[cfg(feature = "opencl")]
+            Self::OpenCl(_) => {
+                let _ = initial;
+                bail!("EMA weight tracking is implemented on the CPU and CUDA backends only")
+            }
+            #[cfg(feature = "cuda")]
+            Self::Cuda(g) => g.configure_ema(decay, initial),
+        }
+    }
     pub fn name(&self) -> &'static str {
         match self {
-            Self::Cpu => "cpu-f32",
+            Self::Cpu(_) => "cpu-f32",
             #[cfg(feature = "opencl")]
             Self::OpenCl(_) => "opencl-f32-resident",
             #[cfg(feature = "cuda")]
@@ -132,7 +161,7 @@ impl Trainer {
     }
     pub fn info(&self) -> Value {
         match self {
-            Self::Cpu => {
+            Self::Cpu(_) => {
                 json!({"backend":"cpu-f32","precision":"fp32","training":"CPU reference"})
             }
             #[cfg(feature = "opencl")]
@@ -149,7 +178,7 @@ impl Trainer {
         batch: Batch<'_>,
     ) -> Result<Step> {
         match self {
-            Self::Cpu => {
+            Self::Cpu(spectral) => {
                 let items = batch.items();
                 ensure!(
                     items > 0 && batch.clean.len().is_multiple_of(items),
@@ -166,7 +195,7 @@ impl Trainer {
                         "invalid CPU batch shape"
                     );
                     let row = i * n..(i + 1) * n;
-                    let (item_loss, g) = parameterization::loss_gradient_detailed(
+                    let (item_loss, g) = parameterization::loss_gradient_with_spectral(
                         model,
                         flow,
                         &batch.clean[row.clone()],
@@ -174,6 +203,8 @@ impl Trainer {
                         &batch.noise[row.clone()],
                         batch.t[i],
                         batch.detail,
+                        batch.spectral,
+                        spectral,
                     );
                     loss += item_loss;
                     for (dst, src) in accumulated.iter_mut().zip(&g) {
@@ -185,7 +216,7 @@ impl Trainer {
                 }
                 let neural_ms = neural.elapsed().as_secs_f64() * 1000.;
                 let optimizer = Instant::now();
-                let norm = adam.update(model, &accumulated)?;
+                let norm = adam.update_with_lr(model, &accumulated, batch.lr)?;
                 Ok(Step {
                     loss: loss / items as f32,
                     norm,
@@ -203,6 +234,11 @@ impl Trainer {
                     batch.detail == 0.,
                     "detail weighting is implemented on the CPU and CUDA backends only"
                 );
+                ensure!(
+                    batch.spectral == 0.,
+                    "spectral loss is implemented on the CPU and CUDA backends only"
+                );
+                g.set_lr(batch.lr);
                 let s = g.train_step(
                     batch.clean,
                     batch.mask,
@@ -220,6 +256,8 @@ impl Trainer {
             #[cfg(feature = "cuda")]
             Self::Cuda(g) => {
                 g.set_detail(batch.detail);
+                g.set_spectral(batch.spectral);
+                g.set_lr(batch.lr);
                 let s = g.train_step(batch.clean, batch.mask, batch.noise, batch.t)?;
                 adam.step = g.step;
                 Ok(Step {
@@ -233,7 +271,7 @@ impl Trainer {
     }
     pub fn sync(&self, model: &mut Model, adam: &mut Adam) -> Result<()> {
         match self {
-            Self::Cpu => {
+            Self::Cpu(_) => {
                 let _ = (model, adam);
                 Ok(())
             }
@@ -241,6 +279,19 @@ impl Trainer {
             Self::OpenCl(g) => g.sync(model, adam),
             #[cfg(feature = "cuda")]
             Self::Cuda(g) => g.sync(model, adam),
+        }
+    }
+    /// Download resident EMA weights from GPU trainers when EMA is enabled; no-op on CPU.
+    pub fn sync_ema(&self, ema: &mut [f32]) -> Result<()> {
+        if ema.is_empty() {
+            return Ok(());
+        }
+        match self {
+            Self::Cpu(_) => Ok(()),
+            #[cfg(feature = "opencl")]
+            Self::OpenCl(_) => Ok(()),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(g) => g.sync_ema(ema),
         }
     }
 }

@@ -186,3 +186,30 @@ are measured. Ten-millisecond envelopes, modulation and normalized overlap
 correlations describe time variation. The surrogate never enters the neural
 training path or replaces learned generation. Phase-null differences are not
 proof of music, pitch competence, useful memory or generalization.
+
+## Optional spectral objective, schedules, EMA and sample-domain stem/head
+
+All four additions are opt-in and omitted from checkpoint JSON when at their legacy defaults
+(`spectral_weight = 0`, `time_sampling = uniform`, `lr_schedule = constant`, `ema_decay = 0`,
+`sample_conv = 0`), preserving v1–v3 model hashes, serialization and numerical behavior bit for bit.
+
+* `spectral`: differentiable multiresolution Hann STFT (`N = 128, 512, 2048`, `hop = N/4`)
+  log-magnitude Charbonnier smooth-L1 loss on `y_hat = m*y + (1-m)*(x_t + (1-t)*v_pred)`, scaled
+  by `spectral_weight * t`. Reverse-mode gradients use the exact one-sided real-DFT transpose via
+  `rustfft` inverse FFT and are masked to zero on protected samples. On CUDA, predictions download
+  only when `spectral_weight > 0`, per-item FFT gradients run in parallel on the host, and
+  `feral_add_spectral` folds the gradient and batch loss sum back into the device backward pass.
+* `parameterization::TimeSampling` and `LrSchedule`: optional logit-normal `t` sampling
+  (`sigmoid(mean + std * N(0, 1))`, clamped to `[1e-5, 1 - 1e-5]`) and linear-warmup cosine LR
+  decay (`lr_at(base_lr, step)`). Both are checkpointed and validated on full resume.
+* EMA shadow weights (`Checkpoint::ema_weights`): updated after each optimizer step
+  (`ema = decay * ema + (1 - decay) * w`) on CPU and via `feral_ema` on CUDA, synced on
+  checkpoints/previews/validation, and selected by default for inference and evaluation (`--no-ema`
+  selects raw weights).
+* Sample-level residual 1D conv stem and head (`Architecture::sample_conv = K`, odd `3..=15`):
+  adds `stem` (`3 -> 16 -> 1`, tanh, `x_eff = x + 0.5 * s1`) before frame packing and `head`
+  (`1 -> 16 -> 1`, tanh then linear, `out = h_raw + 0.5 * h1`) after frame unpacking, adding
+  `4 * (K - 1)` samples of shift-equivariant context across frame boundaries. Parameters append
+  after `layers` (`layers`, `stem`, `head`). Unknown clean audio stays masked to zero in `stem`'s
+  context channel (`known * mask`), and CPU finite differences plus batched CUDA parity tests
+  verify every stem, frame and head parameter.

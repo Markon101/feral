@@ -141,6 +141,7 @@ pub fn audit(checkpoint: &Path, output: &Path, steps: usize, make: &Factory<'_>)
             width: 5,
             dilations: vec![1, 2],
             scales: vec![1, 2],
+            sample_conv: 0,
         },
         7,
     );

@@ -2,7 +2,9 @@ use feral::{
     audio::{self, Preprocess},
     flow::{self, Sampling},
     model::{Architecture, Model, Velocity},
-    parameterization::{self, ConfiguredVelocity, FlowConfig, GaussianReference},
+    parameterization::{
+        self, ConfiguredVelocity, FlowConfig, GaussianReference, LrSchedule, TimeSampling,
+    },
     rng::Rng,
     runtime::{self, Checkpoint, TrainConfig},
 };
@@ -27,6 +29,7 @@ fn tiny() -> Architecture {
         width: 5,
         dilations: vec![1, 2],
         scales: vec![1, 2],
+        sample_conv: 0,
     }
 }
 #[test]
@@ -157,6 +160,10 @@ fn legacy_adapter_is_bit_exact_and_invalid_config_rejected() {
 fn config(root: &Path, name: &str, steps: usize, resume: Option<PathBuf>) -> TrainConfig {
     TrainConfig {
         detail: 0.,
+        spectral_weight: 0.,
+        time_sampling: TimeSampling::Uniform,
+        lr_schedule: LrSchedule::Constant,
+        ema_decay: 0.,
         backend: "cpu".into(),
         input: root.join("corpus"),
         run: root.join(name),

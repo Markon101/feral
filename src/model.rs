@@ -7,6 +7,12 @@ use serde::{Deserialize, Serialize};
 /// Largest window any backend may be asked to hold: 32 s at 16 kHz. Crops, render windows and
 /// previews all refer to this, so a checkpoint cannot describe a window that training rejects.
 pub const MAX_WINDOW_SAMPLES: usize = 512_000;
+/// Hidden channels in the optional sample-level residual stem and head convolutions.
+pub const SAMPLE_CONV_CHANNELS: usize = 16;
+
+fn is_zero_usize(v: &usize) -> bool {
+    *v == 0
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Architecture {
     pub block: usize,
@@ -14,6 +20,10 @@ pub struct Architecture {
     pub dilations: Vec<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scales: Vec<usize>,
+    /// Optional odd sample-level 1D conv kernel size (0 disables; 3..=15 odd enables residual
+    /// sample-domain stem and head convolutions around the frame stack).
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub sample_conv: usize,
 }
 impl Default for Architecture {
     fn default() -> Self {
@@ -22,6 +32,7 @@ impl Default for Architecture {
             width: 64,
             dilations: vec![1, 2, 4, 8],
             scales: vec![],
+            sample_conv: 0,
         }
     }
 }
@@ -64,6 +75,17 @@ impl Architecture {
         self.validate()?;
         Ok(self)
     }
+    /// Enable (odd 3..=15) or disable (0) residual sample-domain 1D convolutions around the
+    /// frame stack to bridge frame boundaries with shift-equivariant sample context.
+    pub fn with_sample_conv(mut self, kernel: usize) -> Result<Self> {
+        ensure!(
+            kernel == 0 || ((3..=15).contains(&kernel) && kernel % 2 == 1),
+            "sample_conv must be 0 (disabled) or an odd kernel size in 3..=15"
+        );
+        self.sample_conv = kernel;
+        self.validate()?;
+        Ok(self)
+    }
     pub fn pyramid() -> Self {
         Self {
             scales: vec![1, 4, 16, 64],
@@ -74,10 +96,10 @@ impl Architecture {
     pub fn scale(&self, layer: usize) -> usize {
         self.scales.get(layer).copied().unwrap_or(1)
     }
-    /// Structural interior support, including aligned average-pooling groups.
+    /// Structural interior support, including aligned average-pooling groups and any sample convs.
     pub fn context_samples(&self) -> usize {
         let period = self.scales.iter().copied().max().unwrap_or(1);
-        (0..period)
+        let frame_support = (0..period)
             .map(|p| {
                 let (mut lo, mut hi) = (p as isize, p as isize);
                 for j in (0..self.dilations.len()).rev() {
@@ -89,7 +111,13 @@ impl Architecture {
                 (hi - lo + 1) as usize * self.block
             })
             .max()
-            .unwrap_or(self.block)
+            .unwrap_or(self.block);
+        let sample_extra = if self.sample_conv > 0 {
+            4 * (self.sample_conv - 1)
+        } else {
+            0
+        };
+        frame_support + sample_extra
     }
     pub fn validate(&self) -> Result<()> {
         ensure!(
@@ -110,6 +138,11 @@ impl Architecture {
                         .iter()
                         .all(|s| [1, 2, 4, 8, 16, 32, 64].contains(s))),
             "invalid residual scales"
+        );
+        ensure!(
+            self.sample_conv == 0
+                || ((3..=15).contains(&self.sample_conv) && self.sample_conv % 2 == 1),
+            "invalid sample_conv kernel size (must be 0 or odd 3..=15)"
         );
         Ok(())
     }
@@ -162,6 +195,12 @@ pub struct Layer {
 pub struct Model {
     pub architecture: Architecture,
     pub layers: Vec<Layer>,
+    /// Optional sample-domain residual stem `[Layer(3->16, k=K), Layer(16->1, k=K)]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stem: Vec<Layer>,
+    /// Optional sample-domain residual head `[Layer(1->16, k=K), Layer(16->1, k=K)]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub head: Vec<Layer>,
 }
 /// CPU-independent boundary for flow and conditioning; another backend can own buffers.
 pub trait Velocity {
@@ -180,6 +219,10 @@ pub struct Tape {
     features: Vec<f32>,
     acts: Vec<Vec<f32>>,
     nonlinear: Vec<Vec<f32>>,
+    stem_in: Vec<f32>,
+    stem_a0: Vec<f32>,
+    stem_a1: Vec<f32>,
+    head_a0: Vec<f32>,
 }
 impl Layer {
     fn new(input: usize, output: usize, kernel: usize, dilation: usize, rng: &mut Rng) -> Self {
@@ -253,23 +296,52 @@ impl Model {
             layers.push(Layer::new(a.width, a.width, 3, d, &mut rng));
         }
         layers.push(Layer::new(a.width, a.block, 1, 1, &mut rng));
+        let (stem, head) = if a.sample_conv > 0 {
+            let k = a.sample_conv;
+            (
+                vec![
+                    Layer::new(3, SAMPLE_CONV_CHANNELS, k, 1, &mut rng),
+                    Layer::new(SAMPLE_CONV_CHANNELS, 1, k, 1, &mut rng),
+                ],
+                vec![
+                    Layer::new(1, SAMPLE_CONV_CHANNELS, k, 1, &mut rng),
+                    Layer::new(SAMPLE_CONV_CHANNELS, 1, k, 1, &mut rng),
+                ],
+            )
+        } else {
+            (vec![], vec![])
+        };
         Self {
             architecture: a,
             layers,
+            stem,
+            head,
         }
     }
     pub fn count(&self) -> usize {
-        self.layers.iter().map(|l| l.w.len() + l.b.len()).sum()
+        self.layers
+            .iter()
+            .chain(&self.stem)
+            .chain(&self.head)
+            .map(|l| l.w.len() + l.b.len())
+            .sum()
     }
     pub fn parameters(&self) -> Vec<f32> {
         self.layers
             .iter()
+            .chain(&self.stem)
+            .chain(&self.head)
             .flat_map(|l| l.w.iter().chain(&l.b).copied())
             .collect()
     }
     pub fn set_parameters(&mut self, p: &[f32]) {
         let mut offset = 0;
-        for l in &mut self.layers {
+        for l in self
+            .layers
+            .iter_mut()
+            .chain(&mut self.stem)
+            .chain(&mut self.head)
+        {
             for v in l.w.iter_mut().chain(&mut l.b) {
                 *v = p[offset];
                 offset += 1;
@@ -279,13 +351,35 @@ impl Model {
     }
     pub fn forward(&self, x: &[f32], known: &[f32], mask: &[f32], t: f32) -> (Vec<f32>, Tape) {
         let b = self.architecture.block;
-        assert_eq!(x.len() % b, 0);
-        assert_eq!(x.len(), known.len());
-        assert_eq!(x.len(), mask.len());
-        let frames = x.len() / b;
+        let n = x.len();
+        assert_eq!(n % b, 0);
+        assert_eq!(n, known.len());
+        assert_eq!(n, mask.len());
+        let frames = n / b;
+        let (x_eff, stem_in, stem_a0, stem_a1) = if !self.stem.is_empty() {
+            let mut stem_in = Vec::with_capacity(3 * n);
+            for i in 0..n {
+                stem_in.push(x[i]);
+                stem_in.push(known[i] * mask[i]);
+                stem_in.push(mask[i]);
+            }
+            let mut s0 = self.stem[0].forward(&stem_in, n);
+            for v in &mut s0 {
+                *v = v.tanh();
+            }
+            let mut s1 = self.stem[1].forward(&s0, n);
+            for v in &mut s1 {
+                *v = v.tanh();
+            }
+            let x_eff: Vec<f32> = x.iter().zip(&s1).map(|(&xi, &si)| xi + 0.5 * si).collect();
+            (x_eff, stem_in, s0, s1)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        };
+        let x_src = if x_eff.is_empty() { x } else { &x_eff };
         let mut features = Vec::with_capacity(frames * (3 * b + 4));
         for p in 0..frames {
-            features.extend_from_slice(&x[p * b..(p + 1) * b]);
+            features.extend_from_slice(&x_src[p * b..(p + 1) * b]);
             features.extend((p * b..(p + 1) * b).map(|i| known[i] * mask[i]));
             features.extend_from_slice(&mask[p * b..(p + 1) * b]);
             features.extend([
@@ -328,19 +422,56 @@ impl Model {
             acts.push(z.clone());
             h = z;
         }
+        let (out, head_a0) = if !self.head.is_empty() {
+            let mut h0 = self.head[0].forward(&h, n);
+            for v in &mut h0 {
+                *v = v.tanh();
+            }
+            let h1 = self.head[1].forward(&h0, n);
+            let out: Vec<f32> = h.iter().zip(&h1).map(|(&hi, &ri)| hi + 0.5 * ri).collect();
+            (out, h0)
+        } else {
+            (h, Vec::new())
+        };
         (
-            h,
+            out,
             Tape {
                 features,
                 acts,
                 nonlinear,
+                stem_in,
+                stem_a0,
+                stem_a1,
+                head_a0,
             },
         )
     }
     /// Exact reverse-mode derivatives for the specialized convolution/tanh/residual graph.
     pub fn backward(&self, tape: &Tape, dy: &[f32]) -> Vec<f32> {
-        let frames = dy.len() / self.architecture.block;
-        let mut dh = dy.to_vec();
+        let b = self.architecture.block;
+        let n = dy.len();
+        let frames = n / b;
+        let (mut dh, head_grads) = if !self.head.is_empty() {
+            let dh1: Vec<f32> = dy.iter().map(|&g| 0.5 * g).collect();
+            let (d_h0, dw_h1, db_h1) = self.head[1].backward(&tape.head_a0, &dh1, n);
+            let dz_h0: Vec<f32> = d_h0
+                .iter()
+                .zip(&tape.head_a0)
+                .map(|(&g, &a)| g * (1. - a * a))
+                .collect();
+            let h_raw = tape.acts.last().expect("frame activations");
+            let (d_hraw, dw_h0, db_h0) = self.head[0].backward(h_raw, &dz_h0, n);
+            let dh_frame: Vec<f32> = dy.iter().zip(&d_hraw).map(|(&a, &b)| a + b).collect();
+            let hg: Vec<f32> = dw_h0
+                .into_iter()
+                .chain(db_h0)
+                .chain(dw_h1)
+                .chain(db_h1)
+                .collect();
+            (dh_frame, hg)
+        } else {
+            (dy.to_vec(), Vec::new())
+        };
         let mut grads = vec![Vec::new(); self.layers.len()];
         for j in (0..self.layers.len()).rev() {
             let residual = j > 0 && j + 1 < self.layers.len();
@@ -384,35 +515,65 @@ impl Model {
             grads[j] = dw.into_iter().chain(db).collect();
             dh = dx;
         }
-        grads.into_iter().flatten().collect()
+        let mut out: Vec<f32> = grads.into_iter().flatten().collect();
+        if !self.stem.is_empty() {
+            let stride = 3 * b + 4;
+            let mut dz_s1 = Vec::with_capacity(n);
+            for p in 0..frames {
+                for c in 0..b {
+                    let i = p * b + c;
+                    let a = tape.stem_a1[i];
+                    dz_s1.push(dh[p * stride + c] * 0.5 * (1. - a * a));
+                }
+            }
+            let (d_s0, dw_s1, db_s1) = self.stem[1].backward(&tape.stem_a0, &dz_s1, n);
+            let dz_s0: Vec<f32> = d_s0
+                .iter()
+                .zip(&tape.stem_a0)
+                .map(|(&g, &a)| g * (1. - a * a))
+                .collect();
+            let (_, dw_s0, db_s0) = self.stem[0].backward(&tape.stem_in, &dz_s0, n);
+            out.extend(dw_s0);
+            out.extend(db_s0);
+            out.extend(dw_s1);
+            out.extend(db_s1);
+            out.extend(head_grads);
+        }
+        out
     }
     pub fn validate(&self) -> Result<()> {
         self.architecture.validate()?;
         let reference = Self::new(self.architecture.clone(), 0);
-        ensure!(
-            self.layers.len() == reference.layers.len(),
-            "checkpoint layer count mismatch"
-        );
-        for (a, b) in self.layers.iter().zip(reference.layers) {
+        let check = |actual: &[Layer], expected: &[Layer], kind: &str| -> Result<()> {
             ensure!(
-                (
-                    a.input,
-                    a.output,
-                    a.kernel,
-                    a.dilation,
-                    a.w.len(),
-                    a.b.len()
-                ) == (
-                    b.input,
-                    b.output,
-                    b.kernel,
-                    b.dilation,
-                    b.w.len(),
-                    b.b.len()
-                ),
-                "checkpoint layer shape mismatch"
+                actual.len() == expected.len(),
+                "checkpoint {kind} layer count mismatch"
             );
-        }
+            for (a, b) in actual.iter().zip(expected) {
+                ensure!(
+                    (
+                        a.input,
+                        a.output,
+                        a.kernel,
+                        a.dilation,
+                        a.w.len(),
+                        a.b.len()
+                    ) == (
+                        b.input,
+                        b.output,
+                        b.kernel,
+                        b.dilation,
+                        b.w.len(),
+                        b.b.len()
+                    ),
+                    "checkpoint {kind} layer shape mismatch"
+                );
+            }
+            Ok(())
+        };
+        check(&self.layers, &reference.layers, "frame")?;
+        check(&self.stem, &reference.stem, "stem")?;
+        check(&self.head, &reference.head, "head")?;
         ensure!(
             self.parameters().iter().all(|v| v.is_finite()),
             "nonfinite checkpoint"

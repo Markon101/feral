@@ -29,6 +29,7 @@ fn tiny() -> Model {
             width: 5,
             dilations: vec![1, 2],
             scales: vec![],
+            sample_conv: 0,
         },
         7,
     )
@@ -250,6 +251,10 @@ fn config(root: &Path, run: &str, steps: usize, resume: Option<PathBuf>) -> Trai
     TrainConfig {
         flow: feral::parameterization::FlowConfig::Velocity,
         detail: 0.,
+        spectral_weight: 0.,
+        time_sampling: feral::parameterization::TimeSampling::Uniform,
+        lr_schedule: feral::parameterization::LrSchedule::Constant,
+        ema_decay: 0.,
         backend: "cpu".into(),
         input: root.join("corpus"),
         run: root.join(run),
@@ -271,6 +276,7 @@ fn config(root: &Path, run: &str, steps: usize, resume: Option<PathBuf>) -> Trai
             width: 5,
             dilations: vec![1, 2],
             scales: vec![],
+            sample_conv: 0,
         },
     }
 }
@@ -309,6 +315,7 @@ fn actual_training_checkpoint_reload_full_resume_and_determinism() {
             },
             mode,
             backend: "cpu".into(),
+            use_ema: true,
             max_input_seconds: 600.,
         })
         .unwrap();
@@ -398,6 +405,7 @@ fn pyramid_gradients_shapes_and_partial_pool_groups() {
         width: 5,
         dilations: vec![1, 2, 4],
         scales: vec![1, 2, 4],
+        sample_conv: 0,
     };
     a.validate().unwrap();
     let mut m = Model::new(a, 7);
@@ -648,6 +656,7 @@ fn protected_samples_are_asserted_exactly_and_violations_are_refused() {
         },
         mode: Mode::Continue,
         backend: "cpu".into(),
+        use_ema: true,
         max_input_seconds: 600.,
     })
     .unwrap();
@@ -750,6 +759,7 @@ fn variation_mode_retains_anchors_and_regenerates_gaps() {
         },
         mode: Mode::Variation,
         backend: "cpu".into(),
+        use_ema: true,
         max_input_seconds: 600.,
     })
     .unwrap();
@@ -775,5 +785,260 @@ fn variation_mode_retains_anchors_and_regenerates_gaps() {
         serde_json::from_slice(&fs::read(output.with_extension("json")).unwrap()).unwrap();
     assert_eq!(meta["mode"], "variation-masked-anchors");
     assert_eq!(meta["protected_samples_exact"], true);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn spectral_endpoint_loss_matches_finite_differences_and_respects_mask() {
+    use feral::parameterization::{self, FlowConfig};
+    use feral::spectral::SpectralEngine;
+
+    let engine = SpectralEngine::new();
+    let n = 192usize;
+    let (y, z, mut mask) = vectors(n);
+    mask[..48].fill(1.);
+    mask[48..].fill(0.);
+
+    // Direct finite-difference check on SpectralEngine::loss_and_yhat_grad (broadband difference
+    // so STFT bins are well away from the smooth-L1 corner at 0).
+    let mut rng = Rng::new(77);
+    let yhat: Vec<f32> = y.iter().map(|&v| v + 0.12 * rng.normal()).collect();
+    let (base_loss, dy_yhat) = engine.loss_and_yhat_grad(&y, &yhat);
+    assert!(base_loss.is_finite() && base_loss > 0.);
+    for i in [0, 7, 32, 95, 127, 191] {
+        let eps = 5e-4f32;
+        let mut hi = yhat.clone();
+        hi[i] += eps;
+        let mut lo = yhat.clone();
+        lo[i] -= eps;
+        let fd = (engine.loss_and_yhat_grad(&y, &hi).0 - engine.loss_and_yhat_grad(&y, &lo).0)
+            / (2. * eps);
+        assert!(
+            (fd - dy_yhat[i]).abs() < 1e-4 + 0.02 * fd.abs(),
+            "spectral yhat grad[{i}]: analytic={} fd={fd}",
+            dy_yhat[i]
+        );
+    }
+
+    // End-to-end finite-difference check on model parameters for both Velocity & Preconditioned.
+    for flow in [
+        FlowConfig::Velocity,
+        FlowConfig::Preconditioned {
+            data_scale: 0.16,
+            prior_std: 0.25,
+        },
+    ] {
+        let mut m = tiny();
+        let p = m.parameters();
+        let t = 0.62f32;
+        let (loss, g) = parameterization::loss_gradient_with_spectral(
+            &m, &flow, &y, &mask, &z, t, 0.5, 0.5, &engine,
+        );
+        assert!(loss.is_finite());
+        // Zero spectral weight reproduces loss_gradient_detailed bit-identically.
+        assert_eq!(
+            parameterization::loss_gradient_with_spectral(
+                &m, &flow, &y, &mask, &z, t, 0.5, 0., &engine
+            ),
+            parameterization::loss_gradient_detailed(&m, &flow, &y, &mask, &z, t, 0.5)
+        );
+        // Check gradient at protected samples is strictly zero in endpoint_loss_gradient.
+        let pred = vec![0.1; n];
+        let (_, dy_spec) = engine.endpoint_loss_gradient(&flow, &y, &mask, &z, &pred, t, 0.5);
+        assert!(dy_spec[..48].iter().all(|&v| v == 0.));
+        assert!(dy_spec[48..].iter().any(|&v| v.abs() > 1e-6));
+
+        for i in [0, 11, p.len() / 2, p.len() - 5, p.len() - 1] {
+            let eps = 2e-3f32;
+            let mut q = p.clone();
+            q[i] += eps;
+            m.set_parameters(&q);
+            let hi = parameterization::loss_gradient_with_spectral(
+                &m, &flow, &y, &mask, &z, t, 0.5, 0.5, &engine,
+            )
+            .0;
+            q[i] -= 2. * eps;
+            m.set_parameters(&q);
+            let lo = parameterization::loss_gradient_with_spectral(
+                &m, &flow, &y, &mask, &z, t, 0.5, 0.5, &engine,
+            )
+            .0;
+            let fd = (hi - lo) / (2. * eps);
+            assert!(
+                (fd - g[i]).abs() < 1e-3 + 0.03 * fd.abs(),
+                "spectral param grad ({flow:?}) [{i}]: analytic={} fd={fd}",
+                g[i]
+            );
+        }
+        m.set_parameters(&p);
+    }
+}
+
+#[test]
+fn sample_conv_gradients_match_finite_differences_and_no_leakage() {
+    let base_arch = Architecture {
+        block: 4,
+        width: 5,
+        dilations: vec![1, 2],
+        scales: vec![1, 2],
+        sample_conv: 0,
+    };
+    let sc_arch = base_arch.clone().with_sample_conv(7).unwrap();
+    assert_eq!(
+        sc_arch.context_samples(),
+        base_arch.context_samples() + 4 * 6
+    );
+    assert!(base_arch.clone().with_sample_conv(4).is_err());
+    assert!(base_arch.clone().with_sample_conv(1).is_err());
+    assert!(base_arch.clone().with_sample_conv(17).is_err());
+
+    // Legacy serialization omits sample_conv/stem/head when disabled.
+    let legacy_model = Model::new(base_arch, 7);
+    let legacy_json = serde_json::to_value(&legacy_model).unwrap();
+    assert!(legacy_json["architecture"].get("sample_conv").is_none());
+    assert!(legacy_json.get("stem").is_none());
+    assert!(legacy_json.get("head").is_none());
+
+    let mut m = Model::new(sc_arch, 7);
+    m.validate().unwrap();
+    let (y, z, mask) = vectors(68);
+    let p = m.parameters();
+    let (loss, g) = flow::loss_gradient(&m, &y, &mask, &z, 0.37);
+    assert!(loss.is_finite() && g.iter().all(|v| v.is_finite()));
+
+    let mut offset = 0;
+    let mut indices = vec![];
+    for l in m.layers.iter().chain(&m.stem).chain(&m.head) {
+        indices.extend([
+            offset,
+            offset + l.w.len() / 2,
+            offset + l.w.len() - 1,
+            offset + l.w.len(),
+            offset + l.w.len() + l.b.len() - 1,
+        ]);
+        offset += l.w.len() + l.b.len();
+    }
+    assert_eq!(offset, p.len());
+    for i in indices {
+        let eps = 2e-3f32;
+        let mut q = p.clone();
+        q[i] += eps;
+        m.set_parameters(&q);
+        let hi = flow::loss_gradient(&m, &y, &mask, &z, 0.37).0;
+        q[i] -= 2. * eps;
+        m.set_parameters(&q);
+        let lo = flow::loss_gradient(&m, &y, &mask, &z, 0.37).0;
+        let fd = (hi - lo) / (2. * eps);
+        assert!(
+            (fd - g[i]).abs() < 1e-3 + 0.03 * fd.abs(),
+            "sample_conv grad[{i}]: analytic={} fd={fd}",
+            g[i]
+        );
+    }
+    m.set_parameters(&p);
+
+    // Unknown clean audio must never leak through the sample-level stem.
+    let mut altered = y.clone();
+    for (v, &k) in altered.iter_mut().zip(&mask) {
+        if k == 0. {
+            *v += 50.;
+        }
+    }
+    assert_eq!(
+        m.velocity(&z, &y, &mask, 0.5),
+        m.velocity(&z, &altered, &mask, 0.5)
+    );
+}
+
+#[test]
+fn logit_normal_cosine_ema_and_sample_conv_full_resume() {
+    use feral::parameterization::{FlowConfig, LrSchedule, TimeSampling};
+
+    // Unit-check TimeSampling::LogitNormal and LrSchedule::Cosine.
+    let ts = TimeSampling::LogitNormal { mean: 0., std: 1. };
+    ts.validate().unwrap();
+    let mut rng = Rng::new(123);
+    let samples: Vec<f32> = (0..256).map(|_| ts.sample(&mut rng)).collect();
+    assert!(samples.iter().all(|&v| v > 0. && v < 1.));
+    let mean = samples.iter().sum::<f32>() / samples.len() as f32;
+    assert!((mean - 0.5).abs() < 0.1, "mean={mean}");
+
+    let sched = LrSchedule::Cosine {
+        warmup_steps: 2,
+        total_steps: 6,
+        min_lr: 1e-4,
+    };
+    sched.validate(1e-3).unwrap();
+    assert!((sched.lr_at(1e-3, 1) - 5e-4).abs() < 1e-7);
+    assert!((sched.lr_at(1e-3, 2) - 1e-3).abs() < 1e-7);
+    assert!((sched.lr_at(1e-3, 4) - 5.5e-4).abs() < 1e-6);
+    assert!((sched.lr_at(1e-3, 6) - 1e-4).abs() < 1e-7);
+    assert!((sched.lr_at(1e-3, 10) - 1e-4).abs() < 1e-7);
+
+    // Full deterministic resume with all new features enabled simultaneously.
+    let dir = temp();
+    audio::synthetic(&dir.join("corpus"), 16000).unwrap();
+    let make = |name: &str, steps: usize, resume: Option<PathBuf>| {
+        let mut c = config(&dir, name, steps, resume);
+        c.flow = FlowConfig::Preconditioned {
+            data_scale: 0.16,
+            prior_std: 0.25,
+        };
+        c.architecture = c.architecture.with_sample_conv(5).unwrap();
+        c.spectral_weight = 0.25;
+        c.time_sampling = ts;
+        c.lr_schedule = sched;
+        c.ema_decay = 0.9;
+        c
+    };
+    let all = runtime::train(make("all", 4, None)).unwrap();
+    let first = runtime::train(make("first", 2, None)).unwrap();
+    let resumed = runtime::train(make("resumed", 2, Some(first.clone()))).unwrap();
+    let a = Checkpoint::load(&all).unwrap();
+    let b = Checkpoint::load(&resumed).unwrap();
+    assert_eq!(a.model.parameters(), b.model.parameters());
+    assert_eq!(a.ema_weights, b.ema_weights);
+    assert_eq!(a.adam.m, b.adam.m);
+    assert_eq!(a.adam.v, b.adam.v);
+    assert_eq!(a.rng.state, b.rng.state);
+    assert!(a.has_ema());
+    assert_ne!(a.ema_weights, a.model.parameters());
+    assert_ne!(
+        a.sampling_model(true).parameters(),
+        a.sampling_model(false).parameters()
+    );
+
+    // Mismatched resume gates reject altered spectral_weight / ema_decay.
+    let mut bad_spec = make("bad-spec", 1, Some(first.clone()));
+    bad_spec.spectral_weight = 0.;
+    assert!(runtime::train(bad_spec).is_err());
+    let mut bad_ema = make("bad-ema", 1, Some(first));
+    bad_ema.ema_decay = 0.;
+    assert!(runtime::train(bad_ema).is_err());
+
+    // Render with EMA vs raw weights both succeed and record `using_ema`.
+    for (name, use_ema) in [("ema", true), ("raw", false)] {
+        let out = dir.join(format!("gen-{name}.wav"));
+        runtime::render(RenderConfig {
+            checkpoint: all.clone(),
+            input: None,
+            output: out.clone(),
+            seconds: 0.032,
+            start: 0.,
+            end: 0.,
+            sampling: Sampling {
+                steps: 3,
+                ..Default::default()
+            },
+            mode: Mode::Generate,
+            backend: "cpu".into(),
+            use_ema,
+            max_input_seconds: 600.,
+        })
+        .unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_slice(&fs::read(out.with_extension("json")).unwrap()).unwrap();
+        assert_eq!(meta["using_ema"], use_ema);
+    }
     fs::remove_dir_all(dir).unwrap();
 }

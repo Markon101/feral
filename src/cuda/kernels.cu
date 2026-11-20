@@ -201,3 +201,174 @@ extern "C" __global__ void feral_adam(float *__restrict__ weights, float *__rest
   weights[i] = p;
   if (!isfinite(p) || !isfinite(mm) || !isfinite(vv)) atomicOr((int *)&stats[3], 1);
 }
+
+// Add host-computed spectral endpoint gradient into dy and fold the batch spectral loss sum into
+// loss_parts[0] (which feral_statistics sums and divides by items).
+extern "C" __global__ void feral_add_spectral(float *__restrict__ dy,
+                                              const float *__restrict__ dy_spec,
+                                              float *__restrict__ loss_parts, float spec_loss_sum,
+                                              unsigned total) {
+  unsigned id = blockIdx.x * blockDim.x + threadIdx.x;
+  if (id < total) dy[id] += dy_spec[id];
+  if (id == 0u) loss_parts[0] += spec_loss_sum;
+}
+
+// Exponential moving average of weights: ema = decay * ema + (1 - decay) * weights.
+extern "C" __global__ void feral_ema(float *__restrict__ ema, const float *__restrict__ weights,
+                                     const float *__restrict__ stats, unsigned n, float decay) {
+  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n || !isfinite(stats[0]) || !isfinite(stats[1])) return;
+  ema[i] = decay * ema[i] + (1.0f - decay) * weights[i];
+}
+
+// Sample-level residual conv helpers (sample_conv = K odd in 3..=15).
+extern "C" __global__ void feral_unpack_stem_in(const float *__restrict__ x_features,
+                                                float *__restrict__ stem_in, unsigned frames,
+                                                unsigned block, unsigned items) {
+  unsigned total = items * frames * block;
+  unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  unsigned p = idx / block;
+  unsigned c = idx % block;
+  unsigned channels = 3u * block + 4u;
+  unsigned base = p * channels;
+  stem_in[idx * 3u + 0u] = x_features[base + c];
+  stem_in[idx * 3u + 1u] = x_features[base + block + c];
+  stem_in[idx * 3u + 2u] = x_features[base + 2u * block + c];
+}
+
+extern "C" __global__ void feral_apply_stem_residual(float *__restrict__ x_features,
+                                                     const float *__restrict__ stem_a1,
+                                                     unsigned frames, unsigned block,
+                                                     unsigned items) {
+  unsigned total = items * frames * block;
+  unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  unsigned p = idx / block;
+  unsigned c = idx % block;
+  unsigned channels = 3u * block + 4u;
+  x_features[p * channels + c] += 0.5f * stem_a1[idx];
+}
+
+extern "C" __global__ void feral_extract_stem_grad(const float *__restrict__ dh0,
+                                                   const float *__restrict__ stem_a1,
+                                                   float *__restrict__ dz_s1, unsigned frames,
+                                                   unsigned block, unsigned items) {
+  unsigned total = items * frames * block;
+  unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  unsigned p = idx / block;
+  unsigned c = idx % block;
+  unsigned channels = 3u * block + 4u;
+  float a = stem_a1[idx];
+  dz_s1[idx] = dh0[p * channels + c] * 0.5f * (1.0f - a * a);
+}
+
+extern "C" __global__ void feral_scale_half(const float *__restrict__ src,
+                                            float *__restrict__ dst, unsigned total) {
+  unsigned id = blockIdx.x * blockDim.x + threadIdx.x;
+  if (id < total) dst[id] = 0.5f * src[id];
+}
+
+extern "C" __global__ void feral_sample_conv_fwd(
+    const float *__restrict__ x, const float *__restrict__ weights, float *__restrict__ y,
+    unsigned n, unsigned ci, unsigned co, unsigned k, unsigned wo, unsigned bo, int act_tanh,
+    const float *__restrict__ skip, float skip_scale, unsigned items) {
+  unsigned total = items * n * co;
+  unsigned id = blockIdx.x * blockDim.x + threadIdx.x;
+  if (id >= total) return;
+  unsigned o = id % co;
+  unsigned tmp = id / co;
+  unsigned p = tmp % n;
+  unsigned item = tmp / n;
+  int half = (int)(k / 2u);
+  float sum = weights[bo + o];
+  for (unsigned kk = 0u; kk < k; kk++) {
+    int q = (int)p + (int)kk - half;
+    if (q < 0 || q >= (int)n) continue;
+    const float *row = weights + wo + (o * k + kk) * ci;
+    const float *xx = x + (item * n + (unsigned)q) * ci;
+    for (unsigned i = 0u; i < ci; i++) sum += row[i] * xx[i];
+  }
+  if (act_tanh) sum = tanhf(sum);
+  if (skip != nullptr) sum = skip[id] + skip_scale * sum;
+  y[id] = sum;
+}
+
+extern "C" __global__ void feral_sample_conv_dx(
+    const float *__restrict__ dz, const float *__restrict__ weights,
+    const float *__restrict__ a_prev, const float *__restrict__ skip_grad, float *__restrict__ dx,
+    unsigned n, unsigned ci, unsigned co, unsigned k, unsigned wo, int apply_tanh_deriv,
+    unsigned items) {
+  unsigned total = items * n * ci;
+  unsigned id = blockIdx.x * blockDim.x + threadIdx.x;
+  if (id >= total) return;
+  unsigned i = id % ci;
+  unsigned tmp = id / ci;
+  unsigned q = tmp % n;
+  unsigned item = tmp / n;
+  int half = (int)(k / 2u);
+  float sum = 0.0f;
+  for (unsigned kk = 0u; kk < k; kk++) {
+    int p = (int)q + half - (int)kk;
+    if (p < 0 || p >= (int)n) continue;
+    const float *zz = dz + (item * n + (unsigned)p) * co;
+    for (unsigned o = 0u; o < co; o++) {
+      sum += zz[o] * weights[wo + (o * k + kk) * ci + i];
+    }
+  }
+  if (apply_tanh_deriv) {
+    float a = a_prev[id];
+    sum *= (1.0f - a * a);
+  }
+  if (skip_grad != nullptr) sum += skip_grad[id];
+  dx[id] = sum;
+}
+
+extern "C" __global__ void feral_sample_conv_dw(
+    const float *__restrict__ x, const float *__restrict__ dz, float *__restrict__ grad,
+    unsigned n, unsigned ci, unsigned co, unsigned k, unsigned wo, unsigned bo, float inv_batch,
+    unsigned items) {
+  unsigned bid = blockIdx.x;
+  unsigned lane = threadIdx.x;
+  unsigned weight_count = co * k * ci;
+  __shared__ float scratch[256];
+  float acc = 0.0f;
+  unsigned total = items * n;
+  if (bid < weight_count) {
+    unsigned i = bid % ci;
+    unsigned tmp = bid / ci;
+    unsigned kk = tmp % k;
+    unsigned o = tmp / k;
+    int half = (int)(k / 2u);
+    for (unsigned idx = lane; idx < total; idx += 256u) {
+      unsigned item = idx / n;
+      unsigned p = idx % n;
+      int q = (int)p + (int)kk - half;
+      if (q >= 0 && q < (int)n) {
+        acc += dz[(item * n + p) * co + o] * x[(item * n + (unsigned)q) * ci + i];
+      }
+    }
+  } else {
+    unsigned o = bid - weight_count;
+    if (o < co) {
+      for (unsigned idx = lane; idx < total; idx += 256u) {
+        acc += dz[idx * co + o];
+      }
+    }
+  }
+  scratch[lane] = acc;
+  __syncthreads();
+  for (unsigned step = 128u; step > 0u; step >>= 1) {
+    if (lane < step) scratch[lane] += scratch[lane + step];
+    __syncthreads();
+  }
+  if (lane == 0u) {
+    if (bid < weight_count) {
+      grad[wo + bid] = scratch[0] * inv_batch;
+    } else {
+      unsigned o = bid - weight_count;
+      if (o < co) grad[bo + o] = scratch[0] * inv_batch;
+    }
+  }
+}

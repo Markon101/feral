@@ -83,6 +83,10 @@ impl OpenClTrainer {
         model.validate()?;
         flow.validate()?;
         ensure!(
+            model.architecture.sample_conv == 0,
+            "sample-level conv stem/head is implemented on the CPU and CUDA backends only"
+        );
+        ensure!(
             n > 0 && n <= 160000 && n.is_multiple_of(model.architecture.block),
             "invalid GPU crop size"
         );
@@ -258,6 +262,9 @@ impl OpenClTrainer {
         info["total_transfer_event_ms"] = self.total_transfer_ms.into();
         info["last_kernel_times_ms"] = json!(self.last_kernel_times);
         info
+    }
+    pub fn set_lr(&mut self, lr: f32) {
+        self.lr = lr;
     }
     pub fn gradients(
         &mut self,

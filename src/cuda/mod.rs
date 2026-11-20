@@ -6,7 +6,13 @@
 //! Adam state stay resident on the device; each step uploads one batched crop payload and
 //! reads back four statistics values. There is no automatic CPU fallback: any driver,
 //! launch or numerical failure is returned as an error.
-use crate::{backend::Step, model::Model, parameterization::FlowConfig, runtime::Adam};
+use crate::{
+    backend::Step,
+    model::{Model, SAMPLE_CONV_CHANNELS},
+    parameterization::FlowConfig,
+    runtime::Adam,
+    spectral::SpectralEngine,
+};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::{json, Value};
 use std::{
@@ -249,12 +255,24 @@ struct Kernels {
     dx: CuFunction,
     stats: CuFunction,
     adam: CuFunction,
+    add_spectral: CuFunction,
+    ema: CuFunction,
+    unpack_stem_in: CuFunction,
+    apply_stem_residual: CuFunction,
+    extract_stem_grad: CuFunction,
+    scale_half: CuFunction,
+    sample_conv_fwd: CuFunction,
+    sample_conv_dx: CuFunction,
+    sample_conv_dw: CuFunction,
 }
 
 #[derive(Clone, Copy)]
 struct Buf {
     ptr: CuDeviceptr,
     len: usize,
+}
+impl Buf {
+    const EMPTY: Self = Self { ptr: 0, len: 0 };
 }
 
 macro_rules! kargs {
@@ -282,6 +300,17 @@ pub struct CudaTrainer {
     dh: Vec<Buf>,
     dz: Vec<Buf>,
     specs: Vec<Spec>,
+    stem_specs: Vec<Spec>,
+    head_specs: Vec<Spec>,
+    has_sample_conv: bool,
+    stem_in: Buf,
+    stem_a0: Buf,
+    stem_a1: Buf,
+    head_a0: Buf,
+    head_out: Buf,
+    dy_head: Buf,
+    dh_scratch: Buf,
+    dz_sample: Buf,
     n: usize,
     items: usize,
     frames: u32,
@@ -290,6 +319,14 @@ pub struct CudaTrainer {
     flow: FlowConfig,
     /// Detail-term weight applied by the loss kernel; 0 reproduces the plain objective.
     detail: f32,
+    /// Multiresolution STFT log-magnitude L1 endpoint loss weight; 0 disables it.
+    spectral_weight: f32,
+    spectral: SpectralEngine,
+    pred_host: Vec<f32>,
+    dy_spec_host: Vec<f32>,
+    dy_spec_buf: Buf,
+    ema_decay: f32,
+    ema_buf: Buf,
     pub step: usize,
     lr: f32,
     info: Value,
@@ -440,6 +477,15 @@ impl CudaTrainer {
             dx: load("feral_input_grad")?,
             stats: load("feral_statistics")?,
             adam: load("feral_adam")?,
+            add_spectral: load("feral_add_spectral")?,
+            ema: load("feral_ema")?,
+            unpack_stem_in: load("feral_unpack_stem_in")?,
+            apply_stem_residual: load("feral_apply_stem_residual")?,
+            extract_stem_grad: load("feral_extract_stem_grad")?,
+            scale_half: load("feral_scale_half")?,
+            sample_conv_fwd: load("feral_sample_conv_fwd")?,
+            sample_conv_dx: load("feral_sample_conv_dx")?,
+            sample_conv_dw: load("feral_sample_conv_dw")?,
         };
         let frames = n / model.architecture.block;
         let mut specs = Vec::with_capacity(model.layers.len());
@@ -461,6 +507,33 @@ impl CudaTrainer {
             });
             offset += l.w.len() + l.b.len();
         }
+        let mut stem_specs = Vec::with_capacity(model.stem.len());
+        for l in &model.stem {
+            stem_specs.push(Spec {
+                ci: l.input as u32,
+                co: l.output as u32,
+                k: l.kernel as u32,
+                d: l.dilation as u32,
+                s: 1,
+                w: offset as u32,
+                b: (offset + l.w.len()) as u32,
+            });
+            offset += l.w.len() + l.b.len();
+        }
+        let mut head_specs = Vec::with_capacity(model.head.len());
+        for l in &model.head {
+            head_specs.push(Spec {
+                ci: l.input as u32,
+                co: l.output as u32,
+                k: l.kernel as u32,
+                d: l.dilation as u32,
+                s: 1,
+                w: offset as u32,
+                b: (offset + l.w.len()) as u32,
+            });
+            offset += l.w.len() + l.b.len();
+        }
+        let has_sample_conv = !stem_specs.is_empty();
         let mut allocated = 0usize;
         let mut alloc = |len: usize| -> Result<Buf> {
             let bytes = len
@@ -488,7 +561,11 @@ impl CudaTrainer {
         let parts = (items * n).div_ceil(BATCH_THREADS);
         let loss_parts = alloc(parts)?;
         let mut acts = vec![alloc(items * frames * model.layers[0].input)?];
-        let mut dh = vec![alloc(1)?];
+        let mut dh = vec![alloc(if has_sample_conv {
+            items * frames * model.layers[0].input
+        } else {
+            1
+        })?];
         let mut pooled = Vec::with_capacity(specs.len());
         let mut z = Vec::with_capacity(specs.len());
         let mut dz = Vec::with_capacity(specs.len());
@@ -504,6 +581,31 @@ impl CudaTrainer {
             z.push(alloc(items * cf * s.co as usize)?);
             dz.push(alloc(items * cf * s.co as usize)?);
         }
+        let (stem_in, stem_a0, stem_a1, head_a0, head_out, dy_head, dh_scratch, dz_sample) =
+            if has_sample_conv {
+                let total = items * n;
+                (
+                    alloc(total * 3)?,
+                    alloc(total * SAMPLE_CONV_CHANNELS)?,
+                    alloc(total)?,
+                    alloc(total * SAMPLE_CONV_CHANNELS)?,
+                    alloc(total)?,
+                    alloc(total)?,
+                    alloc(total)?,
+                    alloc(total * SAMPLE_CONV_CHANNELS)?,
+                )
+            } else {
+                (
+                    Buf::EMPTY,
+                    Buf::EMPTY,
+                    Buf::EMPTY,
+                    Buf::EMPTY,
+                    Buf::EMPTY,
+                    Buf::EMPTY,
+                    Buf::EMPTY,
+                    Buf::EMPTY,
+                )
+            };
         let p = model.parameters();
         Self::upload(&driver, weights, &p, "parameters")?;
         Self::upload(&driver, m, &adam.m, "adam m")?;
@@ -560,6 +662,17 @@ impl CudaTrainer {
             dh,
             dz,
             specs,
+            stem_specs,
+            head_specs,
+            has_sample_conv,
+            stem_in,
+            stem_a0,
+            stem_a1,
+            head_a0,
+            head_out,
+            dy_head,
+            dh_scratch,
+            dz_sample,
             n,
             items,
             frames: frames as u32,
@@ -567,6 +680,13 @@ impl CudaTrainer {
             count: offset,
             flow,
             detail: 0.,
+            spectral_weight: 0.,
+            spectral: SpectralEngine::new(),
+            pred_host: Vec::new(),
+            dy_spec_host: Vec::new(),
+            dy_spec_buf: Buf::EMPTY,
+            ema_decay: 0.,
+            ema_buf: Buf::EMPTY,
             step: adam.step,
             lr: adam.lr,
             info,
@@ -586,6 +706,27 @@ impl CudaTrainer {
             reported_steps: 0,
             prev_wall_ms: 0.,
         })
+    }
+    fn alloc_buf(&mut self, len: usize) -> Result<Buf> {
+        let bytes = len
+            .max(1)
+            .checked_mul(4)
+            .context("CUDA allocation overflow")?;
+        let next = self.allocated + bytes;
+        let budget = device_budget_bytes();
+        ensure!(
+            next <= budget,
+            "CUDA allocation would exceed the {} MiB resident budget; reduce crop, batch or width",
+            budget >> 20
+        );
+        let mut ptr: CuDeviceptr = 0;
+        // SAFETY: allocate bytes validated above; freed with the owning context.
+        self.driver.check(
+            unsafe { (self.driver.mem_alloc)(&mut ptr, bytes) },
+            "cuMemAlloc",
+        )?;
+        self.allocated = next;
+        Ok(Buf { ptr, len })
     }
     fn new_event(driver: &Driver) -> Result<CuEvent> {
         let mut e: CuEvent = std::ptr::null_mut();
@@ -682,6 +823,44 @@ impl CudaTrainer {
     /// Weight of the detail term in the loss. 0 reproduces the plain objective exactly.
     pub fn set_detail(&mut self, detail: f32) {
         self.detail = detail.max(0.);
+    }
+    /// Weight of the multiresolution STFT log-magnitude L1 endpoint loss. 0 disables it.
+    pub fn set_spectral(&mut self, weight: f32) {
+        self.spectral_weight = weight.max(0.);
+    }
+    /// Set the learning rate for subsequent Adam updates (supports cosine/warmup schedules).
+    pub fn set_lr(&mut self, lr: f32) {
+        self.lr = lr;
+    }
+    /// Enable resident EMA weight tracking on the device and upload initial EMA parameters.
+    pub fn configure_ema(&mut self, decay: f32, initial: &[f32]) -> Result<()> {
+        ensure!(
+            decay.is_finite() && (0. ..1.).contains(&decay),
+            "invalid CUDA EMA decay ({decay})"
+        );
+        ensure!(initial.len() == self.count, "CUDA EMA shape mismatch");
+        self.activate()?;
+        if self.ema_buf.len < self.count {
+            self.ema_buf = self.alloc_buf(self.count)?;
+        }
+        Self::upload(&self.driver, self.ema_buf, initial, "ema weights")?;
+        self.ema_decay = decay;
+        Ok(())
+    }
+    /// Download resident EMA weights from the device.
+    pub fn sync_ema(&self, ema_out: &mut [f32]) -> Result<()> {
+        self.activate()?;
+        self.flush_pending()?;
+        ensure!(
+            ema_out.len() == self.count && self.ema_buf.len >= self.count,
+            "CUDA EMA not configured or shape mismatch"
+        );
+        Self::download(&self.driver, self.ema_buf, ema_out, "ema weights")?;
+        ensure!(
+            ema_out.iter().all(|v| v.is_finite()),
+            "nonfinite CUDA EMA state"
+        );
+        Ok(())
     }
     /// Forward-only field evaluation for sampling: payload upload and network forward, then the
     /// prediction comes back. No loss reduction, no backward pass, no optimizer.
@@ -822,6 +1001,84 @@ impl CudaTrainer {
                 a_total_frames
             ],
         )?;
+        if self.has_sample_conv {
+            let n_samples = self.n as u32;
+            let sample_grid = total_samples.div_ceil(BATCH_THREADS) as u32;
+            let mut u_x = self.acts[0].ptr;
+            let mut u_in = self.stem_in.ptr;
+            let mut u_frames = frames;
+            let mut u_block = block;
+            let mut u_items = items;
+            self.launch(
+                "unpack_stem_in",
+                self.k.unpack_stem_in,
+                (sample_grid, 1, 1),
+                (BATCH_THREADS as u32, 1, 1),
+                &mut kargs![u_x, u_in, u_frames, u_block, u_items],
+            )?;
+            let s0 = &self.stem_specs[0];
+            let mut p_x = self.stem_in.ptr;
+            let mut p_w = self.weights.ptr;
+            let mut p_y = self.stem_a0.ptr;
+            let mut p_n = n_samples;
+            let mut p_ci = s0.ci;
+            let mut p_co = s0.co;
+            let mut p_k = s0.k;
+            let mut p_wo = s0.w;
+            let mut p_bo = s0.b;
+            let mut p_act = 1i32;
+            let mut p_skip: CuDeviceptr = 0;
+            let mut p_ss = 0.0f32;
+            let mut p_items = items;
+            self.launch(
+                "stem_conv0",
+                self.k.sample_conv_fwd,
+                (
+                    (total_samples * s0.co as usize).div_ceil(BATCH_THREADS) as u32,
+                    1,
+                    1,
+                ),
+                (BATCH_THREADS as u32, 1, 1),
+                &mut kargs![
+                    p_x, p_w, p_y, p_n, p_ci, p_co, p_k, p_wo, p_bo, p_act, p_skip, p_ss, p_items
+                ],
+            )?;
+            let s1 = &self.stem_specs[1];
+            let mut q_x = self.stem_a0.ptr;
+            let mut q_w = self.weights.ptr;
+            let mut q_y = self.stem_a1.ptr;
+            let mut q_n = n_samples;
+            let mut q_ci = s1.ci;
+            let mut q_co = s1.co;
+            let mut q_k = s1.k;
+            let mut q_wo = s1.w;
+            let mut q_bo = s1.b;
+            let mut q_act = 1i32;
+            let mut q_skip: CuDeviceptr = 0;
+            let mut q_ss = 0.0f32;
+            let mut q_items = items;
+            self.launch(
+                "stem_conv1",
+                self.k.sample_conv_fwd,
+                (sample_grid, 1, 1),
+                (BATCH_THREADS as u32, 1, 1),
+                &mut kargs![
+                    q_x, q_w, q_y, q_n, q_ci, q_co, q_k, q_wo, q_bo, q_act, q_skip, q_ss, q_items
+                ],
+            )?;
+            let mut r_x = self.acts[0].ptr;
+            let mut r_s1 = self.stem_a1.ptr;
+            let mut r_frames = frames;
+            let mut r_block = block;
+            let mut r_items = items;
+            self.launch(
+                "apply_stem_residual",
+                self.k.apply_stem_residual,
+                (sample_grid, 1, 1),
+                (BATCH_THREADS as u32, 1, 1),
+                &mut kargs![r_x, r_s1, r_frames, r_block, r_items],
+            )?;
+        }
         for (j, s) in self.specs.iter().enumerate() {
             let cf = (self.frames as usize).div_ceil(s.s as usize) as u32;
             if s.s > 1 {
@@ -883,6 +1140,60 @@ impl CudaTrainer {
                 ],
             )?;
         }
+        if self.has_sample_conv {
+            let last = self.specs.len();
+            let n_samples = self.n as u32;
+            let h0 = &self.head_specs[0];
+            let mut p_x = self.acts[last].ptr;
+            let mut p_w = self.weights.ptr;
+            let mut p_y = self.head_a0.ptr;
+            let mut p_n = n_samples;
+            let mut p_ci = h0.ci;
+            let mut p_co = h0.co;
+            let mut p_k = h0.k;
+            let mut p_wo = h0.w;
+            let mut p_bo = h0.b;
+            let mut p_act = 1i32;
+            let mut p_skip: CuDeviceptr = 0;
+            let mut p_ss = 0.0f32;
+            let mut p_items = items;
+            self.launch(
+                "head_conv0",
+                self.k.sample_conv_fwd,
+                (
+                    (total_samples * h0.co as usize).div_ceil(BATCH_THREADS) as u32,
+                    1,
+                    1,
+                ),
+                (BATCH_THREADS as u32, 1, 1),
+                &mut kargs![
+                    p_x, p_w, p_y, p_n, p_ci, p_co, p_k, p_wo, p_bo, p_act, p_skip, p_ss, p_items
+                ],
+            )?;
+            let h1 = &self.head_specs[1];
+            let mut q_x = self.head_a0.ptr;
+            let mut q_w = self.weights.ptr;
+            let mut q_y = self.head_out.ptr;
+            let mut q_n = n_samples;
+            let mut q_ci = h1.ci;
+            let mut q_co = h1.co;
+            let mut q_k = h1.k;
+            let mut q_wo = h1.w;
+            let mut q_bo = h1.b;
+            let mut q_act = 0i32;
+            let mut q_skip = self.acts[last].ptr;
+            let mut q_ss = 0.5f32;
+            let mut q_items = items;
+            self.launch(
+                "head_conv1",
+                self.k.sample_conv_fwd,
+                (total_samples.div_ceil(BATCH_THREADS) as u32, 1, 1),
+                (BATCH_THREADS as u32, 1, 1),
+                &mut kargs![
+                    q_x, q_w, q_y, q_n, q_ci, q_co, q_k, q_wo, q_bo, q_act, q_skip, q_ss, q_items
+                ],
+            )?;
+        }
         Ok((upload_ms, launch_start))
     }
     fn execute(
@@ -930,10 +1241,20 @@ impl CudaTrainer {
         };
         let last = self.specs.len();
         let parts = (total_samples).div_ceil(BATCH_THREADS) as u32;
-        let mut d_pred = self.acts[last].ptr;
+        let pred_buf = if self.has_sample_conv {
+            self.head_out
+        } else {
+            self.acts[last]
+        };
+        let loss_dy_buf = if self.has_sample_conv {
+            self.dy_head
+        } else {
+            self.dh[last]
+        };
+        let mut d_pred = pred_buf.ptr;
         let mut d_data = self.data.ptr;
         let mut d_unknown = self.unknown_buf.ptr;
-        let mut d_dy = self.dh[last].ptr;
+        let mut d_dy = loss_dy_buf.ptr;
         let mut d_parts = self.loss_parts.ptr;
         let mut d_n = self.n as u32;
         let mut d_pre = pre;
@@ -960,6 +1281,152 @@ impl CudaTrainer {
                 d_items
             ],
         )?;
+        if self.spectral_weight > 0. {
+            if self.dy_spec_buf.len < total_samples {
+                self.dy_spec_buf = self.alloc_buf(total_samples)?;
+            }
+            self.pred_host.resize(total_samples, 0.);
+            self.dy_spec_host.resize(total_samples, 0.);
+            Self::download(
+                &self.driver,
+                pred_buf,
+                &mut self.pred_host,
+                "spectral prediction",
+            )?;
+            let spec_loss_sum = self.spectral.batch_endpoint_loss_gradient(
+                &self.flow,
+                clean,
+                mask,
+                noise,
+                &self.pred_host,
+                t,
+                self.spectral_weight,
+                &mut self.dy_spec_host,
+            );
+            Self::upload(
+                &self.driver,
+                self.dy_spec_buf,
+                &self.dy_spec_host,
+                "spectral gradient",
+            )?;
+            let mut s_dy = loss_dy_buf.ptr;
+            let mut s_spec = self.dy_spec_buf.ptr;
+            let mut s_parts = self.loss_parts.ptr;
+            let mut s_loss = spec_loss_sum;
+            let mut s_total = total_samples as u32;
+            self.launch(
+                "add_spectral",
+                self.k.add_spectral,
+                (parts, 1, 1),
+                (BATCH_THREADS as u32, 1, 1),
+                &mut kargs![s_dy, s_spec, s_parts, s_loss, s_total],
+            )?;
+        }
+        let inv_batch = 1.0f32 / self.items as f32;
+        if self.has_sample_conv {
+            let n_samples = self.n as u32;
+            let mut sh_src = self.dy_head.ptr;
+            let mut sh_dst = self.dh_scratch.ptr;
+            let mut sh_total = total_samples as u32;
+            self.launch(
+                "scale_half",
+                self.k.scale_half,
+                (parts, 1, 1),
+                (BATCH_THREADS as u32, 1, 1),
+                &mut kargs![sh_src, sh_dst, sh_total],
+            )?;
+            let h1 = &self.head_specs[1];
+            let mut dw_x = self.head_a0.ptr;
+            let mut dw_dz = self.dh_scratch.ptr;
+            let mut dw_grad = self.grad.ptr;
+            let mut dw_n = n_samples;
+            let mut dw_ci = h1.ci;
+            let mut dw_co = h1.co;
+            let mut dw_k = h1.k;
+            let mut dw_wo = h1.w;
+            let mut dw_bo = h1.b;
+            let mut dw_inv = inv_batch;
+            let mut dw_items = items;
+            self.launch(
+                "head_conv1_dw",
+                self.k.sample_conv_dw,
+                (h1.co * h1.k * h1.ci + h1.co, 1, 1),
+                (BATCH_THREADS as u32, 1, 1),
+                &mut kargs![
+                    dw_x, dw_dz, dw_grad, dw_n, dw_ci, dw_co, dw_k, dw_wo, dw_bo, dw_inv, dw_items
+                ],
+            )?;
+            let mut dx_dz = self.dh_scratch.ptr;
+            let mut dx_w = self.weights.ptr;
+            let mut dx_a = self.head_a0.ptr;
+            let mut dx_skip: CuDeviceptr = 0;
+            let mut dx_out = self.dz_sample.ptr;
+            let mut dx_n = n_samples;
+            let mut dx_ci = h1.ci;
+            let mut dx_co = h1.co;
+            let mut dx_k = h1.k;
+            let mut dx_wo = h1.w;
+            let mut dx_tanh = 1i32;
+            let mut dx_items = items;
+            self.launch(
+                "head_conv1_dx",
+                self.k.sample_conv_dx,
+                (
+                    (total_samples * h1.ci as usize).div_ceil(BATCH_THREADS) as u32,
+                    1,
+                    1,
+                ),
+                (BATCH_THREADS as u32, 1, 1),
+                &mut kargs![
+                    dx_dz, dx_w, dx_a, dx_skip, dx_out, dx_n, dx_ci, dx_co, dx_k, dx_wo, dx_tanh,
+                    dx_items
+                ],
+            )?;
+            let h0 = &self.head_specs[0];
+            let mut dw0_x = self.acts[last].ptr;
+            let mut dw0_dz = self.dz_sample.ptr;
+            let mut dw0_grad = self.grad.ptr;
+            let mut dw0_n = n_samples;
+            let mut dw0_ci = h0.ci;
+            let mut dw0_co = h0.co;
+            let mut dw0_k = h0.k;
+            let mut dw0_wo = h0.w;
+            let mut dw0_bo = h0.b;
+            let mut dw0_inv = inv_batch;
+            let mut dw0_items = items;
+            self.launch(
+                "head_conv0_dw",
+                self.k.sample_conv_dw,
+                (h0.co * h0.k * h0.ci + h0.co, 1, 1),
+                (BATCH_THREADS as u32, 1, 1),
+                &mut kargs![
+                    dw0_x, dw0_dz, dw0_grad, dw0_n, dw0_ci, dw0_co, dw0_k, dw0_wo, dw0_bo, dw0_inv,
+                    dw0_items
+                ],
+            )?;
+            let mut dx0_dz = self.dz_sample.ptr;
+            let mut dx0_w = self.weights.ptr;
+            let mut dx0_a: CuDeviceptr = 0;
+            let mut dx0_skip = self.dy_head.ptr;
+            let mut dx0_out = self.dh[last].ptr;
+            let mut dx0_n = n_samples;
+            let mut dx0_ci = h0.ci;
+            let mut dx0_co = h0.co;
+            let mut dx0_k = h0.k;
+            let mut dx0_wo = h0.w;
+            let mut dx0_tanh = 0i32;
+            let mut dx0_items = items;
+            self.launch(
+                "head_conv0_dx",
+                self.k.sample_conv_dx,
+                (parts, 1, 1),
+                (BATCH_THREADS as u32, 1, 1),
+                &mut kargs![
+                    dx0_dz, dx0_w, dx0_a, dx0_skip, dx0_out, dx0_n, dx0_ci, dx0_co, dx0_k, dx0_wo,
+                    dx0_tanh, dx0_items
+                ],
+            )?;
+        }
         for j in (0..last).rev() {
             let s = &self.specs[j];
             let cf = (self.frames as usize).div_ceil(s.s as usize) as u32;
@@ -1002,7 +1469,7 @@ impl CudaTrainer {
             let mut f_d = s.d;
             let mut f_wo = s.w;
             let mut f_bo = s.b;
-            let mut f_inv = 1.0f32 / self.items as f32;
+            let mut f_inv = inv_batch;
             let mut f_items = items;
             self.launch(
                 "weight_grad",
@@ -1017,7 +1484,7 @@ impl CudaTrainer {
                     f_x, f_dz, f_grad, f_frames, f_ci, f_co, f_k, f_d, f_wo, f_bo, f_inv, f_items
                 ],
             )?;
-            if j > 0 {
+            if j > 0 || self.has_sample_conv {
                 let mut g_dz = dz.ptr;
                 let mut g_w = self.weights.ptr;
                 let mut g_skip = self.dh[j + 1].ptr;
@@ -1047,12 +1514,98 @@ impl CudaTrainer {
                 )?;
             }
         }
+        if self.has_sample_conv {
+            let n_samples = self.n as u32;
+            let mut ex_dh0 = self.dh[0].ptr;
+            let mut ex_a1 = self.stem_a1.ptr;
+            let mut ex_dz = self.dh_scratch.ptr;
+            let mut ex_frames = frames;
+            let mut ex_block = self.block;
+            let mut ex_items = items;
+            self.launch(
+                "extract_stem_grad",
+                self.k.extract_stem_grad,
+                (parts, 1, 1),
+                (BATCH_THREADS as u32, 1, 1),
+                &mut kargs![ex_dh0, ex_a1, ex_dz, ex_frames, ex_block, ex_items],
+            )?;
+            let s1 = &self.stem_specs[1];
+            let mut dw1_x = self.stem_a0.ptr;
+            let mut dw1_dz = self.dh_scratch.ptr;
+            let mut dw1_grad = self.grad.ptr;
+            let mut dw1_n = n_samples;
+            let mut dw1_ci = s1.ci;
+            let mut dw1_co = s1.co;
+            let mut dw1_k = s1.k;
+            let mut dw1_wo = s1.w;
+            let mut dw1_bo = s1.b;
+            let mut dw1_inv = inv_batch;
+            let mut dw1_items = items;
+            self.launch(
+                "stem_conv1_dw",
+                self.k.sample_conv_dw,
+                (s1.co * s1.k * s1.ci + s1.co, 1, 1),
+                (BATCH_THREADS as u32, 1, 1),
+                &mut kargs![
+                    dw1_x, dw1_dz, dw1_grad, dw1_n, dw1_ci, dw1_co, dw1_k, dw1_wo, dw1_bo, dw1_inv,
+                    dw1_items
+                ],
+            )?;
+            let mut dx1_dz = self.dh_scratch.ptr;
+            let mut dx1_w = self.weights.ptr;
+            let mut dx1_a = self.stem_a0.ptr;
+            let mut dx1_skip: CuDeviceptr = 0;
+            let mut dx1_out = self.dz_sample.ptr;
+            let mut dx1_n = n_samples;
+            let mut dx1_ci = s1.ci;
+            let mut dx1_co = s1.co;
+            let mut dx1_k = s1.k;
+            let mut dx1_wo = s1.w;
+            let mut dx1_tanh = 1i32;
+            let mut dx1_items = items;
+            self.launch(
+                "stem_conv1_dx",
+                self.k.sample_conv_dx,
+                (
+                    (total_samples * s1.ci as usize).div_ceil(BATCH_THREADS) as u32,
+                    1,
+                    1,
+                ),
+                (BATCH_THREADS as u32, 1, 1),
+                &mut kargs![
+                    dx1_dz, dx1_w, dx1_a, dx1_skip, dx1_out, dx1_n, dx1_ci, dx1_co, dx1_k, dx1_wo,
+                    dx1_tanh, dx1_items
+                ],
+            )?;
+            let s0 = &self.stem_specs[0];
+            let mut dw0_x = self.stem_in.ptr;
+            let mut dw0_dz = self.dz_sample.ptr;
+            let mut dw0_grad = self.grad.ptr;
+            let mut dw0_n = n_samples;
+            let mut dw0_ci = s0.ci;
+            let mut dw0_co = s0.co;
+            let mut dw0_k = s0.k;
+            let mut dw0_wo = s0.w;
+            let mut dw0_bo = s0.b;
+            let mut dw0_inv = inv_batch;
+            let mut dw0_items = items;
+            self.launch(
+                "stem_conv0_dw",
+                self.k.sample_conv_dw,
+                (s0.co * s0.k * s0.ci + s0.co, 1, 1),
+                (BATCH_THREADS as u32, 1, 1),
+                &mut kargs![
+                    dw0_x, dw0_dz, dw0_grad, dw0_n, dw0_ci, dw0_co, dw0_k, dw0_wo, dw0_bo, dw0_inv,
+                    dw0_items
+                ],
+            )?;
+        }
         let mut h_grad = self.grad.ptr;
         let mut h_parts = self.loss_parts.ptr;
         let mut h_stats = self.stats.ptr;
         let mut h_count = self.count as u32;
         let mut h_nparts = parts;
-        let mut h_inv = 1.0f32 / self.items as f32;
+        let mut h_inv = inv_batch;
         self.launch(
             "statistics",
             self.k.stats,
@@ -1086,6 +1639,20 @@ impl CudaTrainer {
                 (64, 1, 1),
                 &mut kargs![i_w, i_m, i_v, i_grad, i_stats, i_count, i_lr, i_c1, i_c2],
             )?;
+            if self.ema_decay > 0. && self.ema_buf.len >= self.count {
+                let mut e_ema = self.ema_buf.ptr;
+                let mut e_w = self.weights.ptr;
+                let mut e_stats = self.stats.ptr;
+                let mut e_count = self.count as u32;
+                let mut e_decay = self.ema_decay;
+                self.launch(
+                    "ema",
+                    self.k.ema,
+                    ((self.count as u32).div_ceil(64), 1, 1),
+                    (64, 1, 1),
+                    &mut kargs![e_ema, e_w, e_stats, e_count, e_decay],
+                )?;
+            }
             // No explicit barrier: the blocking statistics download below drains the stream, so the
             // optimizer is complete before the next step's uploads are enqueued.
         }
@@ -1174,8 +1741,12 @@ impl CudaTrainer {
     pub fn read_prediction(&self) -> Result<Vec<f32>> {
         self.activate()?;
         let mut y = vec![0.; self.items * self.n];
-        let last = self.acts.last().context("no activation buffer")?;
-        Self::download(&self.driver, *last, &mut y, "prediction")?;
+        let pred_buf = if self.has_sample_conv {
+            self.head_out
+        } else {
+            *self.acts.last().context("no activation buffer")?
+        };
+        Self::download(&self.driver, pred_buf, &mut y, "prediction")?;
         Ok(y)
     }
     /// Upload updated parameters onto this resident trainer without recreating its context or
@@ -1251,6 +1822,12 @@ impl crate::backend::Resident for CudaTrainer {
     }
     fn set_detail(&mut self, detail: f32) {
         CudaTrainer::set_detail(self, detail)
+    }
+    fn set_spectral(&mut self, weight: f32) {
+        CudaTrainer::set_spectral(self, weight)
+    }
+    fn set_lr(&mut self, lr: f32) {
+        CudaTrainer::set_lr(self, lr)
     }
     fn sync(&self, model: &mut Model, adam: &mut Adam) -> Result<()> {
         CudaTrainer::sync(self, model, adam)

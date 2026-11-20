@@ -3,9 +3,114 @@
 use crate::{
     flow,
     model::{Model, Velocity},
+    rng::Rng,
+    spectral::SpectralEngine,
 };
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
+
+/// Training flow-time distribution.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum TimeSampling {
+    #[default]
+    Uniform,
+    LogitNormal {
+        #[serde(default)]
+        mean: f32,
+        #[serde(default = "default_logit_std")]
+        std: f32,
+    },
+}
+fn default_logit_std() -> f32 {
+    1.
+}
+impl TimeSampling {
+    pub fn is_uniform(&self) -> bool {
+        matches!(self, Self::Uniform)
+    }
+    pub fn validate(&self) -> Result<()> {
+        if let Self::LogitNormal { mean, std } = self {
+            ensure!(
+                mean.is_finite() && (-4. ..=4.).contains(mean),
+                "logit-normal mean must be finite and -4..4"
+            );
+            ensure!(
+                std.is_finite() && (0.1..=4.).contains(std),
+                "logit-normal std must be finite and 0.1..4"
+            );
+        }
+        Ok(())
+    }
+    pub fn sample(&self, rng: &mut Rng) -> f32 {
+        match *self {
+            Self::Uniform => rng.uniform(),
+            Self::LogitNormal { mean, std } => {
+                let z = mean + std * rng.normal();
+                (1. / (1. + (-z).exp())).clamp(1e-5, 1. - 1e-5)
+            }
+        }
+    }
+}
+
+/// Optimizer learning-rate schedule.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum LrSchedule {
+    #[default]
+    Constant,
+    Cosine {
+        warmup_steps: usize,
+        total_steps: usize,
+        min_lr: f32,
+    },
+}
+impl LrSchedule {
+    pub fn is_constant(&self) -> bool {
+        matches!(self, Self::Constant)
+    }
+    pub fn validate(&self, base_lr: f32) -> Result<()> {
+        if let Self::Cosine {
+            warmup_steps,
+            total_steps,
+            min_lr,
+        } = *self
+        {
+            ensure!(total_steps > 0, "cosine schedule total_steps must be > 0");
+            ensure!(
+                warmup_steps <= total_steps,
+                "warmup steps ({warmup_steps}) cannot exceed schedule steps ({total_steps})"
+            );
+            ensure!(
+                min_lr.is_finite() && min_lr >= 0. && min_lr <= base_lr,
+                "min_lr ({min_lr}) must be finite and in 0..=lr ({base_lr})"
+            );
+        }
+        Ok(())
+    }
+    /// Learning rate for 1-indexed optimizer `step`.
+    pub fn lr_at(&self, base_lr: f32, step: usize) -> f32 {
+        match *self {
+            Self::Constant => base_lr,
+            Self::Cosine {
+                warmup_steps,
+                total_steps,
+                min_lr,
+            } => {
+                if warmup_steps > 0 && step <= warmup_steps {
+                    base_lr * (step as f32 / warmup_steps as f32)
+                } else if total_steps <= warmup_steps || step >= total_steps {
+                    min_lr
+                } else {
+                    let progress =
+                        (step - warmup_steps) as f32 / (total_steps - warmup_steps) as f32;
+                    min_lr
+                        + 0.5 * (base_lr - min_lr) * (1. + (std::f32::consts::PI * progress).cos())
+                }
+            }
+        }
+    }
+}
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum FlowConfig {
@@ -167,6 +272,66 @@ pub fn loss_gradient_detailed(
                 dy[i + 1] += 2. * detail * delta / count;
             }
         }
+    }
+    (loss, model.backward(&tape, &dy))
+}
+/// Residual MSE + optional detail term + optional multiresolution STFT log-magnitude L1 loss on
+/// the predicted clean endpoint `y_hat = x_t + (1 - t) * v_pred`, time-weighted by `t`.
+#[allow(clippy::too_many_arguments)]
+pub fn loss_gradient_with_spectral(
+    model: &Model,
+    config: &FlowConfig,
+    clean: &[f32],
+    mask: &[f32],
+    noise: &[f32],
+    t: f32,
+    detail: f32,
+    spectral_weight: f32,
+    spectral: &SpectralEngine,
+) -> (f32, Vec<f32>) {
+    if spectral_weight <= 0. {
+        return loss_gradient_detailed(model, config, clean, mask, noise, t, detail);
+    }
+    let x: Vec<f32> = clean
+        .iter()
+        .zip(noise)
+        .zip(mask)
+        .map(|((&y, &z), &m)| if m == 1. { y } else { (1. - t) * z + t * y })
+        .collect();
+    let (xx, k) = config.inputs(&x, clean, mask, t);
+    let (pred, tape) = model.forward(&xx, &k, mask, t);
+    let (skip, out, _) = config.coefficients(t);
+    let count = mask.iter().filter(|&&m| m == 0.).count().max(1) as f32;
+    let n = clean.len();
+    let mut loss = 0.;
+    let mut dy = vec![0f32; n];
+    let mut r = vec![0f32; n];
+    for i in 0..n {
+        let target = if config.is_legacy() {
+            clean[i] - noise[i]
+        } else {
+            (clean[i] - noise[i] - skip * x[i]) / out
+        };
+        r[i] = pred[i] - target;
+        let d = r[i] * (1. - mask[i]);
+        loss += d * d / count;
+        dy[i] = 2. * d / count;
+    }
+    if detail > 0. {
+        for i in 0..n.saturating_sub(1) {
+            if mask[i] == 0. && mask[i + 1] == 0. {
+                let delta = r[i + 1] - r[i];
+                loss += detail * delta * delta / count;
+                dy[i] -= 2. * detail * delta / count;
+                dy[i + 1] += 2. * detail * delta / count;
+            }
+        }
+    }
+    let (spec_loss, dy_spec) =
+        spectral.endpoint_loss_gradient(config, clean, mask, noise, &pred, t, spectral_weight);
+    loss += spec_loss;
+    for (d, s) in dy.iter_mut().zip(&dy_spec) {
+        *d += s;
     }
     (loss, model.backward(&tape, &dy))
 }

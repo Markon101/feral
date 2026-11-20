@@ -230,7 +230,7 @@ pub fn evaluate(
     crops: usize,
     seed: u64,
 ) -> Result<()> {
-    evaluate_with_backend(checkpoint, input, output, crops, seed, "cpu")
+    evaluate_with_options(checkpoint, input, output, crops, seed, "cpu", true)
 }
 pub fn evaluate_with_backend(
     checkpoint: &Path,
@@ -240,6 +240,17 @@ pub fn evaluate_with_backend(
     seed: u64,
     backend: &str,
 ) -> Result<()> {
+    evaluate_with_options(checkpoint, input, output, crops, seed, backend, true)
+}
+pub fn evaluate_with_options(
+    checkpoint: &Path,
+    input: &Path,
+    output: &Path,
+    crops: usize,
+    seed: u64,
+    backend: &str,
+    use_ema: bool,
+) -> Result<()> {
     ensure!((1..=32).contains(&crops), "evaluation crops must be 1..32");
     ensure!(!output.exists(), "evaluation output already exists");
     ensure!(
@@ -248,6 +259,8 @@ pub fn evaluate_with_backend(
     );
     let start = Instant::now();
     let ck = Checkpoint::load(checkpoint)?;
+    let active_model = ck.sampling_model(use_ema);
+    let using_ema = use_ema && ck.has_ema();
     let p = Preprocess {
         sample_rate: ck.sample_rate,
         normalize: false,
@@ -255,10 +268,14 @@ pub fn evaluate_with_backend(
         ..Default::default()
     };
     let dataset = Dataset::load(input, p, ck.crop_samples)?;
+    let cpu_field = crate::parameterization::ConfiguredVelocity {
+        model: &active_model,
+        config: &ck.flow,
+    };
     let device_field = match backend {
         "cpu" => None,
         "cuda" => Some(crate::sampler::DeviceVelocity::from_cuda(
-            &ck.model,
+            &active_model,
             ck.adam.lr,
             &ck.flow,
             ck.crop_samples,
@@ -267,7 +284,7 @@ pub fn evaluate_with_backend(
     };
     let field: &dyn Velocity = match &device_field {
         Some(f) => f,
-        None => &ck.velocity(),
+        None => &cpu_field,
     };
     let mut rng = Rng::new(seed);
     let mut rows = vec![];
@@ -295,7 +312,7 @@ pub fn evaluate_with_backend(
     }
     runtime::write_json(
         output,
-        &serde_json::json!({"checkpoint":checkpoint,"checkpoint_sha256":data::hash_file(checkpoint)?,"dataset":dataset.identity,"seed":seed,"crops":crops,"crop_samples":ck.crop_samples,"training_steps":ck.completed_steps,"flow":ck.flow,"parameters":ck.model.count(),"architecture":ck.model.architecture,"context_samples":ck.model.architecture.context_samples(),"evaluation_backend":backend,"mean_velocity_mse":mean,"rows":rows,"elapsed_ms":start.elapsed().as_secs_f64()*1000.,"note":"same-recording held-out probes are not cross-recording or perceptual quality evidence; endpoint estimates are paired denoising, not generated samples"}),
+        &serde_json::json!({"checkpoint":checkpoint,"checkpoint_sha256":data::hash_file(checkpoint)?,"dataset":dataset.identity,"seed":seed,"crops":crops,"crop_samples":ck.crop_samples,"training_steps":ck.completed_steps,"flow":ck.flow,"parameters":ck.model.count(),"architecture":ck.model.architecture,"context_samples":ck.model.architecture.context_samples(),"evaluation_backend":backend,"using_ema":using_ema,"mean_velocity_mse":mean,"rows":rows,"elapsed_ms":start.elapsed().as_secs_f64()*1000.,"note":"same-recording held-out probes are not cross-recording or perceptual quality evidence; endpoint estimates are paired denoising, not generated samples"}),
     )?;
     eprintln!(
         "evaluation {} | {} probes | mean velocity MSE {:.6}",

@@ -265,6 +265,28 @@ longer-context model affordable.
 reproduces the plain objective bit for bit. It is checkpointed, must be repeated on a full resume,
 and is implemented on the CPU and CUDA backends.
 
+`--spectral-weight <w>` adds a non-quadratic multiresolution Hann STFT log-magnitude smooth-L1
+loss (`FFT sizes 128/512/2048`, `hop = N/4`, reusing the existing `rustfft` crate) on the
+predicted clean endpoint `y_hat = x_t + (1 - t) * v_pred`, weighted by `w * t` with strictly zero
+gradient on protected samples. `0` (default) disables it with zero overhead. Checkpointed and
+implemented on CPU and CUDA.
+
+Training schedule, time sampling and EMA controls (all opt-in, checkpointed, and deterministic on
+resume; defaults preserve v1–v3 behavior bit for bit):
+- `--time-sampling uniform|logit-normal` with `--time-mean` (default `0.0`) and `--time-std`
+  (default `1.0`) concentrates flow-time updates around mid-trajectory `t` where structure forms.
+- `--lr-schedule constant|cosine` with `--warmup-steps`, `--min-lr` (default `1e-5`) and optional
+  `--schedule-steps` (defaults to `--steps`) applies linear warmup and cosine decay to Adam.
+- `--ema-decay <d>` (e.g. `0.999`; `0` disables) maintains checkpointed exponential-moving-average
+  weights on CPU and CUDA. Training previews, validation, `generate`/`continue`/`inpaint`/`variation`
+  and `evaluate` automatically use EMA weights when present; pass `--no-ema` to inspect raw weights.
+
+`--sample-conv <K>` (`0` disables; odd `3..=15` enables) wraps the `block`-sample frame stack with
+two-layer residual sample-domain 1D convolutions (16 hidden channels) before packing and after
+unpacking, bridging frame boundaries with shift-equivariant sample context while preserving exact
+protected-sample masking. Supported on CPU and CUDA and gated by finite-difference and CUDA parity
+tests.
+
 Long-context configurations are checked the same way as any other: `--block 128` changes the feature
 layout and exercises 128-frame dilations, so `tests/cuda.rs::large_frame_and_wide_dilation_parity`
 pins loss, gradient and prediction parity there, and `gpu-audit` passes on a checkpoint built at the
