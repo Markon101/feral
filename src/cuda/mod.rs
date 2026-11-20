@@ -8,7 +8,7 @@
 //! launch or numerical failure is returned as an error.
 use crate::{
     backend::Step,
-    model::{BlockStyle, Model, SAMPLE_CONV_CHANNELS},
+    model::{Model, SAMPLE_CONV_CHANNELS},
     parameterization::FlowConfig,
     runtime::Adam,
 };
@@ -272,6 +272,7 @@ struct Kernels {
     zero_buf: CuFunction,
     stft_frame: CuFunction,
     stft_accum: CuFunction,
+    stft_accum_ms: CuFunction,
     add_loss_sum: CuFunction,
 }
 
@@ -300,6 +301,7 @@ pub struct CudaTrainer {
     m: Buf,
     v: Buf,
     grad: Buf,
+    decay_mask: Buf,
     data: Buf,
     stats: Buf,
     loss_parts: Buf,
@@ -309,11 +311,14 @@ pub struct CudaTrainer {
     dh: Vec<Buf>,
     dz: Vec<Buf>,
     specs: Vec<Spec>,
+    pooled_caps: Vec<usize>,
     time_proj_specs: Vec<Spec>,
     stem_specs: Vec<Spec>,
     head_specs: Vec<Spec>,
     has_sample_conv: bool,
     has_gated_film: bool,
+    is_glu: bool,
+    res_scale: f32,
     width: u32,
     norm_acts: Vec<Buf>,
     inv_rms: Vec<Buf>,
@@ -330,8 +335,14 @@ pub struct CudaTrainer {
     dz_sample: Buf,
     n: usize,
     items: usize,
+    max_n: usize,
+    max_items: usize,
+    max_total_samples: usize,
+    max_spec_loss_elems: usize,
     frames: u32,
     block: u32,
+    audio_channels: u32,
+    frame_elems: u32,
     count: usize,
     flow: FlowConfig,
     /// Detail-term weight applied by the loss kernel; 0 reproduces the plain objective.
@@ -342,6 +353,7 @@ pub struct CudaTrainer {
     spec_loss_buf: Buf,
     ema_decay: f32,
     ema_buf: Buf,
+    weight_decay: f32,
     pub step: usize,
     lr: f32,
     info: Value,
@@ -371,15 +383,55 @@ impl CudaTrainer {
         items: usize,
         flow: FlowConfig,
     ) -> Result<Self> {
+        Self::new_with_horizons(model, adam, &[(n, items)], flow)
+    }
+    pub fn new_with_horizons(
+        model: &Model,
+        adam: &Adam,
+        horizons: &[(usize, usize)],
+        flow: FlowConfig,
+    ) -> Result<Self> {
         model.validate()?;
         flow.validate()?;
         ensure!(
-            n > 0
-                && n <= crate::model::MAX_WINDOW_SAMPLES
-                && n.is_multiple_of(model.architecture.block),
-            "invalid CUDA crop size"
+            !horizons.is_empty(),
+            "at least one CUDA horizon is required"
         );
-        ensure!((1..=64).contains(&items), "CUDA batch size must be 1..64");
+        for &(hn, hitems) in horizons {
+            ensure!(
+                hn > 0
+                    && hn <= crate::model::MAX_WINDOW_SAMPLES
+                    && hn.is_multiple_of(model.architecture.block),
+                "invalid CUDA crop size ({hn})"
+            );
+            ensure!(
+                (1..=64).contains(&hitems),
+                "CUDA batch size must be 1..64 (got {hitems})"
+            );
+        }
+        let (n, items) = horizons[0];
+        let block_samples = model.architecture.block;
+        let audio_channels = model.architecture.channels as u32;
+        let frame_elems = (block_samples * audio_channels as usize) as u32;
+        let max_n = horizons.iter().map(|&(hn, _)| hn).max().unwrap_or(n);
+        let max_items = horizons
+            .iter()
+            .map(|&(_, hitems)| hitems)
+            .max()
+            .unwrap_or(items);
+        let max_total_time = horizons
+            .iter()
+            .map(|&(hn, hitems)| hn * hitems)
+            .max()
+            .unwrap_or(n * items);
+        let max_total_samples = max_total_time * audio_channels as usize;
+        let max_total_frames = max_total_time / block_samples;
+        let min_stft_hop = crate::spectral::SIZES[0] / 4;
+        let max_spec_loss_elems = horizons
+            .iter()
+            .map(|&(hn, hitems)| hitems * audio_channels as usize * hn.div_ceil(min_stft_hop))
+            .max()
+            .unwrap_or(items * audio_channels as usize * n.div_ceil(min_stft_hop));
         ensure!(
             adam.m.len() == model.count() && adam.v.len() == model.count(),
             "CUDA optimizer shape mismatch"
@@ -510,10 +562,16 @@ impl CudaTrainer {
             zero_buf: load("feral_zero_buf")?,
             stft_frame: load("feral_stft_frame")?,
             stft_accum: load("feral_stft_accum")?,
+            stft_accum_ms: load("feral_stft_accum_ms")?,
             add_loss_sum: load("feral_add_loss_sum")?,
         };
-        let frames = n / model.architecture.block;
-        let has_gated_film = model.architecture.block_style == BlockStyle::GatedFilm;
+        let frames = n / block_samples;
+        let has_gated_film = model.architecture.block_style.uses_film();
+        let is_glu = model.architecture.block_style.is_glu();
+        let res_scale = model
+            .architecture
+            .block_style
+            .residual_scale(model.architecture.dilations.len());
         let width = model.architecture.width;
         let mut specs = Vec::with_capacity(model.layers.len());
         let mut offset = 0;
@@ -596,58 +654,69 @@ impl CudaTrainer {
         let m = alloc(offset)?;
         let v = alloc(offset)?;
         let grad = alloc(offset)?;
-        let data = alloc(3 * items * n + 4 * items)?;
+        let decay_mask = alloc(offset)?;
+        let data = alloc(3 * max_total_samples + 4 * max_items)?;
         let stats = alloc(4)?;
-        let parts = (items * n).div_ceil(BATCH_THREADS);
+        let parts = max_total_samples.div_ceil(BATCH_THREADS);
         let loss_parts = alloc(parts)?;
-        let mut acts = vec![alloc(items * frames * model.layers[0].input)?];
+        let mut acts = vec![alloc(max_total_frames * model.layers[0].input)?];
         let mut dh = vec![alloc(if has_sample_conv {
-            items * frames * model.layers[0].input
+            max_total_frames * model.layers[0].input
         } else {
             1
         })?];
         let mut pooled = Vec::with_capacity(specs.len());
+        let mut pooled_caps = Vec::with_capacity(specs.len());
         let mut z = Vec::with_capacity(specs.len());
         let mut dz = Vec::with_capacity(specs.len());
         for (j, s) in specs.iter().enumerate() {
-            let cf = frames.div_ceil(s.s as usize);
+            let max_cf_items = horizons
+                .iter()
+                .map(|&(hn, hb)| hb * (hn / block_samples).div_ceil(s.s as usize))
+                .max()
+                .unwrap_or(1);
+            pooled_caps.push(max_cf_items);
             let is_gated_res = has_gated_film && j > 0 && j + 1 < specs.len();
             let act_ch = if is_gated_res { width } else { s.co as usize };
-            acts.push(alloc(items * frames * act_ch)?);
-            dh.push(alloc(items * frames * act_ch)?);
+            acts.push(alloc(max_total_frames * act_ch)?);
+            dh.push(alloc(max_total_frames * act_ch)?);
             pooled.push(alloc(if s.s > 1 {
-                items * cf * s.ci as usize
+                max_cf_items * s.ci as usize
             } else {
                 1
             })?);
-            z.push(alloc(items * cf * s.co as usize)?);
-            dz.push(alloc(items * cf * s.co as usize)?);
+            z.push(alloc(max_cf_items * s.co as usize)?);
+            dz.push(alloc(max_cf_items * s.co as usize)?);
         }
         let mut norm_acts = Vec::with_capacity(time_proj_specs.len());
         let mut inv_rms = Vec::with_capacity(time_proj_specs.len());
         let mut films = Vec::with_capacity(time_proj_specs.len());
         let (d_film, d_norm) = if has_gated_film {
             for _ in 0..time_proj_specs.len() {
-                norm_acts.push(alloc(items * frames * width)?);
-                inv_rms.push(alloc(items * frames)?);
-                films.push(alloc(items * 2 * width)?);
+                norm_acts.push(alloc(max_total_frames * width)?);
+                inv_rms.push(alloc(max_total_frames)?);
+                films.push(alloc(max_items * 2 * width)?);
             }
-            (alloc(items * 2 * width)?, alloc(items * frames * width)?)
+            (
+                alloc(max_items * 2 * width)?,
+                alloc(max_total_frames * width)?,
+            )
         } else {
             (Buf::EMPTY, Buf::EMPTY)
         };
         let (stem_in, stem_a0, stem_a1, head_a0, head_out, dy_head, dh_scratch, dz_sample) =
             if has_sample_conv {
-                let total = items * n;
+                let total = max_total_samples;
+                let total_time = max_total_time;
                 (
                     alloc(total * 3)?,
-                    alloc(total * SAMPLE_CONV_CHANNELS)?,
+                    alloc(total_time * SAMPLE_CONV_CHANNELS)?,
                     alloc(total)?,
-                    alloc(total * SAMPLE_CONV_CHANNELS)?,
+                    alloc(total_time * SAMPLE_CONV_CHANNELS)?,
                     alloc(total)?,
                     alloc(total)?,
                     alloc(total)?,
-                    alloc(total * SAMPLE_CONV_CHANNELS)?,
+                    alloc(total_time * SAMPLE_CONV_CHANNELS)?,
                 )
             } else {
                 (
@@ -665,7 +734,13 @@ impl CudaTrainer {
         Self::upload(&driver, weights, &p, "parameters")?;
         Self::upload(&driver, m, &adam.m, "adam m")?;
         Self::upload(&driver, v, &adam.v, "adam v")?;
-        let unknown_buf = alloc(items.max(1))?;
+        Self::upload(
+            &driver,
+            decay_mask,
+            &model.weight_decay_mask(),
+            "decay mask",
+        )?;
+        let unknown_buf = alloc(max_items.max(1))?;
         drop(alloc);
         let mut pinned: *mut c_void = std::ptr::null_mut();
         driver.check(
@@ -698,6 +773,7 @@ impl CudaTrainer {
             "resident_budget_bytes": device_budget_bytes(),
             "allocated_bytes": allocated,
             "batched": true,
+            "audio_channels": audio_channels,
             "note": "driver API via dlopen; kernels AOT-compiled by build.rs; fmad disabled",
         });
         Ok(Self {
@@ -708,6 +784,7 @@ impl CudaTrainer {
             m,
             v,
             grad,
+            decay_mask,
             data,
             stats,
             loss_parts,
@@ -717,11 +794,14 @@ impl CudaTrainer {
             dh,
             dz,
             specs,
+            pooled_caps,
             time_proj_specs,
             stem_specs,
             head_specs,
             has_sample_conv,
             has_gated_film,
+            is_glu,
+            res_scale,
             width: width as u32,
             norm_acts,
             inv_rms,
@@ -738,8 +818,14 @@ impl CudaTrainer {
             dz_sample,
             n,
             items,
+            max_n,
+            max_items,
+            max_total_samples,
+            max_spec_loss_elems,
             frames: frames as u32,
-            block: model.architecture.block as u32,
+            block: block_samples as u32,
+            audio_channels,
+            frame_elems,
             count: offset,
             flow,
             detail: 0.,
@@ -748,13 +834,14 @@ impl CudaTrainer {
             spec_loss_buf: Buf::EMPTY,
             ema_decay: 0.,
             ema_buf: Buf::EMPTY,
+            weight_decay: 0.,
             step: adam.step,
             lr: adam.lr,
             info,
             allocated,
             total_wall_ms: 0.,
             unknown_buf,
-            trig: vec![0.; 4 * items.max(1)],
+            trig: vec![0.; 4 * max_items.max(1)],
             unknown_host: vec![0.; items.max(1)],
             ev_start,
             ev_end,
@@ -893,6 +980,44 @@ impl CudaTrainer {
     pub fn set_lr(&mut self, lr: f32) {
         self.lr = lr;
     }
+    /// Set decoupled AdamW weight decay factor (0 disables).
+    pub fn set_weight_decay(&mut self, wd: f32) {
+        self.weight_decay = wd.max(0.);
+    }
+    /// Switch active `(crop_samples, batch_items)` within preallocated multi-horizon capacity.
+    pub fn set_shape(&mut self, n: usize, items: usize) -> Result<()> {
+        let b = self.block as usize;
+        ensure!(
+            n > 0 && n <= self.max_n && n.is_multiple_of(b),
+            "CUDA set_shape n={n} out of preallocated range (max_n={}, block={b})",
+            self.max_n
+        );
+        ensure!(
+            items > 0 && items <= self.max_items,
+            "CUDA set_shape items={items} out of preallocated range (max_items={})",
+            self.max_items
+        );
+        let scalars = n * items * self.audio_channels as usize;
+        ensure!(
+            scalars <= self.max_total_samples,
+            "CUDA set_shape total samples {scalars} exceeds preallocated {}",
+            self.max_total_samples
+        );
+        let frames = n / b;
+        for (j, s) in self.specs.iter().enumerate() {
+            let cf_items = items * frames.div_ceil(s.s as usize);
+            ensure!(
+                cf_items <= self.pooled_caps[j],
+                "CUDA set_shape pooled groups {cf_items} exceed layer {j} capacity {}",
+                self.pooled_caps[j]
+            );
+        }
+        self.n = n;
+        self.items = items;
+        self.frames = frames as u32;
+        self.unknown_host.resize(items.max(1), 0.);
+        Ok(())
+    }
     /// Enable resident EMA weight tracking on the device and upload initial EMA parameters.
     pub fn configure_ema(&mut self, decay: f32, initial: &[f32]) -> Result<()> {
         ensure!(
@@ -963,7 +1088,10 @@ impl CudaTrainer {
         t: &[f32],
         timed: bool,
     ) -> Result<(f64, Instant)> {
-        let total_samples = self.items * self.n;
+        let ch = self.audio_channels as usize;
+        let total_time = self.items * self.n;
+        let total_samples = total_time * ch;
+        let scalar_n = self.n * ch;
         ensure!(
             t.len() == self.items
                 && clean.len() == total_samples
@@ -988,7 +1116,7 @@ impl CudaTrainer {
             ]);
         }
         for (i, slot) in self.unknown_host.iter_mut().enumerate() {
-            let row = &mask[i * self.n..(i + 1) * self.n];
+            let row = &mask[i * scalar_n..(i + 1) * scalar_n];
             *slot = row.iter().filter(|&&v| v == 0.).count().max(1) as f32;
         }
         Self::upload_at(
@@ -1021,6 +1149,7 @@ impl CudaTrainer {
         let items = self.items as u32;
         let frames = self.frames;
         let block = self.block;
+        let frame_elems = self.frame_elems;
         let (pre, data_scale, prior_std) = match self.flow {
             FlowConfig::Velocity => (0i32, 1f32, 1f32),
             FlowConfig::Preconditioned {
@@ -1031,11 +1160,11 @@ impl CudaTrainer {
         let launch_start = Instant::now();
         // features: 2D grid keeps total_frames on blockIdx.x (2^31-1 max) and channels on blockIdx.y.
         let total_frames = self.frames * items;
-        let channels = 3u32 * self.block + 4u32;
+        let channels = 3u32 * frame_elems + 4u32;
         let mut a_data = self.data.ptr;
         let mut a_x = self.acts[0].ptr;
         let mut a_n = n;
-        let mut a_block = block;
+        let mut a_block = frame_elems;
         let mut a_pre = pre;
         let mut a_data_scale = data_scale;
         let mut a_prior_std = prior_std;
@@ -1064,18 +1193,20 @@ impl CudaTrainer {
         )?;
         if self.has_sample_conv {
             let n_samples = self.n as u32;
-            let sample_grid = total_samples.div_ceil(BATCH_THREADS) as u32;
+            let time_grid = total_time.div_ceil(BATCH_THREADS) as u32;
+            let scalar_grid = total_samples.div_ceil(BATCH_THREADS) as u32;
             let mut u_x = self.acts[0].ptr;
             let mut u_in = self.stem_in.ptr;
             let mut u_frames = frames;
             let mut u_block = block;
+            let mut u_ch = self.audio_channels;
             let mut u_items = items;
             self.launch(
                 "unpack_stem_in",
                 self.k.unpack_stem_in,
-                (sample_grid, 1, 1),
+                (time_grid, 1, 1),
                 (BATCH_THREADS as u32, 1, 1),
-                &mut kargs![u_x, u_in, u_frames, u_block, u_items],
+                &mut kargs![u_x, u_in, u_frames, u_block, u_ch, u_items],
             )?;
             let s0 = &self.stem_specs[0];
             let mut p_x = self.stem_in.ptr;
@@ -1095,7 +1226,7 @@ impl CudaTrainer {
                 "stem_conv0",
                 self.k.sample_conv_fwd,
                 (
-                    (total_samples * s0.co as usize).div_ceil(BATCH_THREADS) as u32,
+                    (total_time * s0.co as usize).div_ceil(BATCH_THREADS) as u32,
                     1,
                     1,
                 ),
@@ -1121,7 +1252,7 @@ impl CudaTrainer {
             self.launch(
                 "stem_conv1",
                 self.k.sample_conv_fwd,
-                (sample_grid, 1, 1),
+                (scalar_grid, 1, 1),
                 (BATCH_THREADS as u32, 1, 1),
                 &mut kargs![
                     q_x, q_w, q_y, q_n, q_ci, q_co, q_k, q_wo, q_bo, q_act, q_skip, q_ss, q_items
@@ -1130,12 +1261,12 @@ impl CudaTrainer {
             let mut r_x = self.acts[0].ptr;
             let mut r_s1 = self.stem_a1.ptr;
             let mut r_frames = frames;
-            let mut r_block = block;
+            let mut r_block = frame_elems;
             let mut r_items = items;
             self.launch(
                 "apply_stem_residual",
                 self.k.apply_stem_residual,
-                (sample_grid, 1, 1),
+                (scalar_grid, 1, 1),
                 (BATCH_THREADS as u32, 1, 1),
                 &mut kargs![r_x, r_s1, r_frames, r_block, r_items],
             )?;
@@ -1239,6 +1370,8 @@ impl CudaTrainer {
                 let mut g_frames = frames;
                 let mut g_width = self.width;
                 let mut g_scale = s.s;
+                let mut g_glu = i32::from(self.is_glu);
+                let mut g_rs = self.res_scale;
                 let mut g_items = items;
                 let elems = self.items * cf as usize * self.width as usize;
                 self.launch(
@@ -1246,7 +1379,7 @@ impl CudaTrainer {
                     self.k.gated_residual_fwd,
                     (elems.div_ceil(BATCH_THREADS) as u32, 1, 1),
                     (BATCH_THREADS as u32, 1, 1),
-                    &mut kargs![g_z, g_skip, g_y, g_frames, g_width, g_scale, g_items],
+                    &mut kargs![g_z, g_skip, g_y, g_frames, g_width, g_scale, g_glu, g_rs, g_items],
                 )?;
                 continue;
             }
@@ -1325,7 +1458,7 @@ impl CudaTrainer {
                 "head_conv0",
                 self.k.sample_conv_fwd,
                 (
-                    (total_samples * h0.co as usize).div_ceil(BATCH_THREADS) as u32,
+                    (total_time * h0.co as usize).div_ceil(BATCH_THREADS) as u32,
                     1,
                     1,
                 ),
@@ -1393,7 +1526,9 @@ impl CudaTrainer {
         }
         let start = Instant::now();
         let (upload_ms, launch_start) = self.forward_pass(clean, mask, noise, t, true)?;
-        let total_samples = self.items * self.n;
+        let ch = self.audio_channels as usize;
+        let total_time = self.items * self.n;
+        let total_samples = total_time * ch;
         let items = self.items as u32;
         let frames = self.frames;
         let (pre, data_scale, prior_std) = match self.flow {
@@ -1404,7 +1539,7 @@ impl CudaTrainer {
             } => (1i32, data_scale, prior_std),
         };
         let last = self.specs.len();
-        let parts = (total_samples).div_ceil(BATCH_THREADS) as u32;
+        let parts = total_samples.div_ceil(BATCH_THREADS) as u32;
         let pred_buf = if self.has_sample_conv {
             self.head_out
         } else {
@@ -1420,12 +1555,13 @@ impl CudaTrainer {
         let mut d_unknown = self.unknown_buf.ptr;
         let mut d_dy = loss_dy_buf.ptr;
         let mut d_parts = self.loss_parts.ptr;
-        let mut d_n = self.n as u32;
+        let mut d_n = (self.n * ch) as u32;
         let mut d_pre = pre;
         let mut d_data_scale = data_scale;
         let mut d_prior_std = prior_std;
         let mut d_detail = self.detail;
         let mut d_items = items;
+        let mut d_ch = self.audio_channels;
         self.launch(
             "loss",
             self.k.loss,
@@ -1442,20 +1578,24 @@ impl CudaTrainer {
                 d_data_scale,
                 d_prior_std,
                 d_detail,
-                d_items
+                d_items,
+                d_ch
             ],
         )?;
         if self.spectral_weight > 0. {
             // Resident GPU multiresolution STFT loss & gradient (zero PCIe sync, zero atomics).
-            let max_frames = self.n.div_ceil(crate::spectral::SIZES[0] / 4);
-            if self.spec_overlap_buf.len < 4 * total_samples {
-                self.spec_overlap_buf = self.alloc_buf(4 * total_samples)?;
+            // For stereo (channels == 2), evaluates L, R, Mid, and Side uniformly across 4 streams.
+            if self.spec_overlap_buf.len < 4 * self.max_total_samples {
+                self.spec_overlap_buf = self.alloc_buf(4 * self.max_total_samples)?;
             }
-            if self.spec_loss_buf.len < self.items * max_frames {
-                self.spec_loss_buf = self.alloc_buf(self.items * max_frames)?;
+            if self.spec_loss_buf.len < self.max_spec_loss_elems {
+                self.spec_loss_buf = self.alloc_buf(self.max_spec_loss_elems)?;
             }
             let num_res = crate::spectral::SIZES.len() as f32;
+            let num_streams = if ch == 2 { 4.0f32 } else { 1.0f32 };
             let overlap_elems = (4 * total_samples) as u32;
+            let stft_y = items * self.audio_channels;
+            let time_parts = total_time.div_ceil(BATCH_THREADS) as u32;
             for &size in &crate::spectral::SIZES {
                 let hop = size / 4;
                 let log2_n = size.trailing_zeros();
@@ -1484,15 +1624,18 @@ impl CudaTrainer {
                 let mut f_ps = prior_std;
                 let mut f_sw = self.spectral_weight;
                 let mut f_nr = num_res;
+                let mut f_ch = self.audio_channels;
+                let mut f_mode = 0i32;
+                let mut f_ns = num_streams;
                 let threads = if size == 128 { 128u32 } else { 256u32 };
                 self.launch(
                     "stft_frame",
                     self.k.stft_frame,
-                    (frame_count as u32, items, 1),
+                    (frame_count as u32, stft_y, 1),
                     (threads, 1, 1),
                     &mut kargs![
                         f_pred, f_data, f_ov, f_fl, f_n, f_items, f_size, f_log2, f_hop, f_fc,
-                        f_pre, f_ds, f_ps, f_sw, f_nr
+                        f_pre, f_ds, f_ps, f_sw, f_nr, f_ch, f_mode, f_ns
                     ],
                 )?;
                 let mut a_dy = loss_dy_buf.ptr;
@@ -1507,7 +1650,7 @@ impl CudaTrainer {
                 )?;
                 let mut l_parts = self.loss_parts.ptr;
                 let mut l_fl = self.spec_loss_buf.ptr;
-                let mut l_count = (self.items * frame_count) as u32;
+                let mut l_count = (self.items * ch * frame_count) as u32;
                 self.launch(
                     "add_loss_sum",
                     self.k.add_loss_sum,
@@ -1515,6 +1658,45 @@ impl CudaTrainer {
                     (BATCH_THREADS as u32, 1, 1),
                     &mut kargs![l_parts, l_fl, l_count],
                 )?;
+                if ch == 2 {
+                    self.launch(
+                        "zero_overlap_ms",
+                        self.k.zero_buf,
+                        (overlap_elems.div_ceil(BATCH_THREADS as u32), 1, 1),
+                        (BATCH_THREADS as u32, 1, 1),
+                        &mut kargs![z_dst, z_total],
+                    )?;
+                    let mut m_mode = 1i32;
+                    self.launch(
+                        "stft_frame_ms",
+                        self.k.stft_frame,
+                        (frame_count as u32, stft_y, 1),
+                        (threads, 1, 1),
+                        &mut kargs![
+                            f_pred, f_data, f_ov, f_fl, f_n, f_items, f_size, f_log2, f_hop, f_fc,
+                            f_pre, f_ds, f_ps, f_sw, f_nr, f_ch, m_mode, f_ns
+                        ],
+                    )?;
+                    let mut ms_dy = loss_dy_buf.ptr;
+                    let mut ms_ov = self.spec_overlap_buf.ptr;
+                    let mut ms_data = self.data.ptr;
+                    let mut ms_time = total_time as u32;
+                    let mut ms_tot = total_samples as u32;
+                    self.launch(
+                        "stft_accum_ms",
+                        self.k.stft_accum_ms,
+                        (time_parts, 1, 1),
+                        (BATCH_THREADS as u32, 1, 1),
+                        &mut kargs![ms_dy, ms_ov, ms_data, ms_time, ms_tot],
+                    )?;
+                    self.launch(
+                        "add_loss_sum_ms",
+                        self.k.add_loss_sum,
+                        (1, 1, 1),
+                        (BATCH_THREADS as u32, 1, 1),
+                        &mut kargs![l_parts, l_fl, l_count],
+                    )?;
+                }
             }
         }
         let inv_batch = 1.0f32 / self.items as f32;
@@ -1567,7 +1749,7 @@ impl CudaTrainer {
                 "head_conv1_dx",
                 self.k.sample_conv_dx,
                 (
-                    (total_samples * h1.ci as usize).div_ceil(BATCH_THREADS) as u32,
+                    (total_time * h1.ci as usize).div_ceil(BATCH_THREADS) as u32,
                     1,
                     1,
                 ),
@@ -1634,6 +1816,8 @@ impl CudaTrainer {
                 let mut e_frames = frames;
                 let mut e_width = self.width;
                 let mut e_scale = s.s;
+                let mut e_glu = i32::from(self.is_glu);
+                let mut e_rs = self.res_scale;
                 let mut e_items = items;
                 let elems = self.items * cf as usize * self.width as usize;
                 self.launch(
@@ -1641,7 +1825,7 @@ impl CudaTrainer {
                     self.k.gated_activation_grad,
                     (elems.div_ceil(BATCH_THREADS) as u32, 1, 1),
                     (BATCH_THREADS as u32, 1, 1),
-                    &mut kargs![e_dh, e_z, e_dz, e_frames, e_width, e_scale, e_items],
+                    &mut kargs![e_dh, e_z, e_dz, e_frames, e_width, e_scale, e_glu, e_rs, e_items],
                 )?;
                 let x = if s.s > 1 {
                     self.pooled[j]
@@ -1844,7 +2028,7 @@ impl CudaTrainer {
             let mut ex_a1 = self.stem_a1.ptr;
             let mut ex_dz = self.dh_scratch.ptr;
             let mut ex_frames = frames;
-            let mut ex_block = self.block;
+            let mut ex_block = self.frame_elems;
             let mut ex_items = items;
             self.launch(
                 "extract_stem_grad",
@@ -1891,7 +2075,7 @@ impl CudaTrainer {
                 "stem_conv1_dx",
                 self.k.sample_conv_dx,
                 (
-                    (total_samples * s1.ci as usize).div_ceil(BATCH_THREADS) as u32,
+                    (total_time * s1.ci as usize).div_ceil(BATCH_THREADS) as u32,
                     1,
                     1,
                 ),
@@ -1952,16 +2136,18 @@ impl CudaTrainer {
             let mut i_v = self.v.ptr;
             let mut i_grad = self.grad.ptr;
             let mut i_stats = self.stats.ptr;
+            let mut i_dm = self.decay_mask.ptr;
             let mut i_count = self.count as u32;
             let mut i_lr = self.lr;
             let mut i_c1 = c1;
             let mut i_c2 = c2;
+            let mut i_wd = self.weight_decay;
             self.launch(
                 "adam",
                 self.k.adam,
                 ((self.count as u32).div_ceil(64), 1, 1),
                 (64, 1, 1),
-                &mut kargs![i_w, i_m, i_v, i_grad, i_stats, i_count, i_lr, i_c1, i_c2],
+                &mut kargs![i_w, i_m, i_v, i_grad, i_stats, i_dm, i_count, i_lr, i_c1, i_c2, i_wd],
             )?;
             if self.ema_decay > 0. && self.ema_buf.len >= self.count {
                 let mut e_ema = self.ema_buf.ptr;
@@ -2064,7 +2250,7 @@ impl CudaTrainer {
     }
     pub fn read_prediction(&self) -> Result<Vec<f32>> {
         self.activate()?;
-        let mut y = vec![0.; self.items * self.n];
+        let mut y = vec![0.; self.items * self.n * self.audio_channels as usize];
         let pred_buf = if self.has_sample_conv {
             self.head_out
         } else {
@@ -2152,6 +2338,12 @@ impl crate::backend::Resident for CudaTrainer {
     }
     fn set_lr(&mut self, lr: f32) {
         CudaTrainer::set_lr(self, lr)
+    }
+    fn set_weight_decay(&mut self, wd: f32) {
+        CudaTrainer::set_weight_decay(self, wd)
+    }
+    fn set_shape(&mut self, n: usize, items: usize) -> Result<()> {
+        CudaTrainer::set_shape(self, n, items)
     }
     fn sync(&self, model: &mut Model, adam: &mut Adam) -> Result<()> {
         CudaTrainer::sync(self, model, adam)

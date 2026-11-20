@@ -1,28 +1,35 @@
 # Architecture
 
-FERAL models acoustic samples directly. An f32 mono waveform is losslessly packed
-into consecutive blocks of 32 samples. This is a layout, not a learned codec or
-magnitude spectrogram: phase and sample identities remain present. A complex STFT
-would add consistency/windowing/reconstruction requirements; direct waveform is
-the smaller reliable first implementation on this CPU. Candle is used by existing
-projects but was absent from the local registry cache. FERAL needs only dense and
-short convolution derivatives, so a specialized network with explicit reverse-mode
-backpropagation avoids framework downloads and a general-purpose tensor engine.
-Numerical finite-difference tests check weights and biases in every layer.
+FERAL models acoustic samples directly. An f32 mono or interleaved stereo
+(`--channel stereo`, `[L0, R0, ...]`) waveform is losslessly packed into consecutive
+frames of `block * channels` scalar values (`frame_elems`). This is a layout, not a
+learned codec or magnitude spectrogram: phase and sample identities remain present.
+A complex STFT would add consistency/windowing/reconstruction requirements; direct
+waveform is the smaller reliable first implementation on this CPU. Candle is used by
+existing projects but was absent from the local registry cache. FERAL needs only
+dense and short convolution derivatives, so a specialized network with explicit
+reverse-mode backpropagation avoids framework downloads and a general-purpose tensor
+engine. Numerical finite-difference tests check weights and biases in every layer.
 
 ## Modules and contracts
 
-* `audio`: FFmpeg adapter, bounded decoding/resampling/channel selection, optional
-  peak normalization, finite mono f32 PCM, exclusive float WAV output.
-* `data`: file/directory/manifest selection, streaming SHA-256, decoded RAM cache,
-  deterministic crops and silence rejection. No genre/text/score annotations.
+* `audio`: FFmpeg adapter, bounded decoding/resampling/channel selection (`mix`,
+  `left`, `right`, or interleaved `stereo`), optional joint peak normalization,
+  finite f32 PCM, exclusive float WAV output.
+* `data`: file/directory/manifest selection (up to 512 files), streaming SHA-256,
+  decoded RAM cache (1024 MB default, adjustable via `FERAL_MAX_DATASET_MB` in
+  `256..=4096`), deterministic frame-aligned crops and silence rejection. No
+  genre/text/score annotations.
 * `model`: time-major `[frame, channel]` neural operations and parameter state.
-  `Velocity` is the backend boundary used by the solver. No device types escape.
-* `conditioning`: sample masks, exact projection and unknown-side boundary collar.
+  `Velocity` (including `channels()`) is the backend boundary used by the solver. No
+  device types escape.
+* `conditioning`: frame-aligned multi-channel sample masks, exact projection and
+  unknown-side per-channel boundary collar.
 * `flow`: conditional path, unknown-sample MSE, Euler/Heun and bounded perturbation.
-* `runtime`: Adam, gradient clipping, full-state checkpoints, run metadata,
-  evaluation probes, training loop and rendering. `backend::Trainer` explicitly
-  selects CPU or optional resident FP32 OpenCL training; audio stays independent.
+* `runtime`: Adam/AdamW, gradient clipping, versioned JSON (`<= 4M` params) and
+  single-file `FERALCK1` binary (`> 4M` params) full-state checkpoints, run
+  metadata, evaluation probes, multi-horizon training loop and rendering.
+  `backend::Trainer` explicitly selects CPU, OpenCL or CUDA; audio stays independent.
 * `rng`: versioned SplitMix64 + Box-Muller normal stream; checkpointed training
   state and separate seeded preview/sampling streams.
 * `main`: clap CLI and configuration. Research definitions live in EXPERIMENTS.md.
@@ -216,9 +223,39 @@ hashes, serialization and numerical behavior bit for bit.
   deterministic 16-frequency log-spaced sinusoidal time embedding, followed by a `width -> 2*width`
   dilated 1D conv and WaveNet gated activation `h + 0.5 * (tanh(a) * sigmoid(b))`.
 * Sample-level residual 1D conv stem and head (`Architecture::sample_conv = K`, odd `3..=15`):
-  adds `stem` (`3 -> 16 -> 1`, tanh, `x_eff = x + 0.5 * s1`) before frame packing and `head`
-  (`1 -> 16 -> 1`, tanh then linear, `out = h_raw + 0.5 * h1`) after frame unpacking, adding
-  `4 * (K - 1)` samples of shift-equivariant context across frame boundaries. Parameter order is
-  `layers`, `time_proj`, `stem`, `head`. Unknown clean audio stays masked to zero in `stem`'s
-  context channel (`known * mask`), and CPU finite differences plus batched CUDA parity tests
+  adds `stem` (`3*C -> 16 -> C`, tanh, `x_eff = x + 0.5 * s1`) before frame packing and `head`
+  (`C -> 16 -> C`, tanh then linear, `out = h_raw + 0.5 * h1`) after frame unpacking, adding
+  `4 * (K - 1)` time steps of shift-equivariant context across frame boundaries while keeping
+  unknown clean audio masked to zero (`known * mask`). Parameter order is
+  `layers`, `time_proj`, `stem`, `head`. CPU finite differences and batched CUDA parity tests
   verify every frame, time-projection, stem and head parameter.
+
+## Native stereo, GluFilm, AdamW, multi-scale horizons and FERALCK1 checkpoints
+
+All additions preserve legacy mono model hashes and checkpoint behavior bit for bit when at
+their defaults (`channels = 1`, `block_style = tanh`, `weight_decay = 0`, single fixed horizon).
+
+* Native interleaved stereo (`Architecture::channels = 2`): frames hold `frame_elems = block * C`
+  scalars (`3 * frame_elems + 4` input features per frame), so the dilated frame convolution stack
+  runs at the same time-frame count `T / block` for mono and stereo while `stem`/`head` run over
+  interleaved time steps `time_steps = total_scalars / C`. Serde omits `channels` when `1`. Masks
+  and tangent collars (`conditioning::{training_mask_channels_into, continuity_channels}`) align to
+  channel pairs, and `spectral::endpoint_loss_gradient_channels` evaluates Left, Right, Mid
+  `(L+R)/sqrt(2)`, and Side `(L-R)/sqrt(2)` uniformly (`1/4` each) on both CPU (`rustfft`) and
+  CUDA (`feral_stft_frame` + `feral_stft_accum_ms`) with zero gradient on protected samples.
+* Non-saturating depth-scaled GLU (`BlockStyle::GluFilm`): replaces the double-bounded `tanh(a)`
+  content branch of `GatedFilm` with `a * sigmoid(b)` scaled by `1 / sqrt(num_blocks)`.
+* Decoupled AdamW (`Adam::update_with_lr_wd`, CUDA `feral_adam`): `Model::weight_decay_mask()`
+  marks layer weights (`1.0`) while exempting all biases (`0.0`).
+* Multi-scale horizons (`parameterization::HorizonSchedule::{Fixed, Random, ShortToLong,
+  LongToShort}`): varies crop duration across `--crop-horizons` while adjusting per-horizon batch
+  size to hold `crop_frames * batch` roughly fixed (`set_shape` switches preallocated CUDA buffers
+  without reallocation). `eval_n = probe_window_samples(sr, max_crop_frames, block)` probes up to
+  the maximum training horizon; `feral evaluate` pins its window from `checkpoint.crop_samples`.
+* Single-file `FERALCK1` binary checkpoints: automatically used when `model.count() > 4_000_000`
+  (transparently detected by `Checkpoint::load`, capped at 2 GiB). Format: 8-byte magic
+  `FERALCK1`, little-endian u64 header byte length, UTF-8 JSON metadata (including architecture,
+  optimizer metadata, RNG state and `tensors_sha256`), followed by contiguous little-endian f32
+  arrays (`weights`, `adam.m`, `adam.v`, and optional `ema_weights`).
+* `OpenClTrainer` remains mono-only and explicitly errors if given `channels != 1`, non-zero
+  `weight_decay`, or multi-horizon shapes.

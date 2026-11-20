@@ -125,14 +125,43 @@ impl SpectralEngine {
         t: f32,
         spectral_weight: f32,
     ) -> (f32, Vec<f32>) {
-        let n = clean.len();
-        if spectral_weight <= 0. || t <= 0. || t >= 1. || n == 0 {
-            return (0., vec![0.; n]);
+        self.endpoint_loss_gradient_channels(
+            clean,
+            mask,
+            noise,
+            pred,
+            config,
+            t,
+            spectral_weight,
+            1,
+        )
+    }
+
+    /// Channel-aware endpoint loss: mono (`channels == 1`) computes single-channel STFT; stereo
+    /// (`channels == 2`) averages multiresolution STFT L1 across Left, Right, Mid `(L+R)/sqrt(2)`,
+    /// and Side `(L-R)/sqrt(2)` streams and backpropagates exact chain-rule gradients to L & R.
+    #[allow(clippy::too_many_arguments)]
+    pub fn endpoint_loss_gradient_channels(
+        &self,
+        clean: &[f32],
+        mask: &[f32],
+        noise: &[f32],
+        pred: &[f32],
+        config: &FlowConfig,
+        t: f32,
+        spectral_weight: f32,
+        channels: usize,
+    ) -> (f32, Vec<f32>) {
+        let total = clean.len();
+        if spectral_weight <= 0. || t <= 0. || t >= 1. || total == 0 {
+            return (0., vec![0.; total]);
         }
+        assert!(channels == 1 || channels == 2);
+        assert!(total.is_multiple_of(channels));
         let (cskip, cout, _) = config.coefficients(t);
         let omt = 1. - t;
-        let mut yhat = Vec::with_capacity(n);
-        for i in 0..n {
+        let mut yhat = Vec::with_capacity(total);
+        for i in 0..total {
             if mask[i] == 1. {
                 yhat.push(clean[i]);
             } else {
@@ -141,14 +170,58 @@ impl SpectralEngine {
                 yhat.push(xt + omt * v);
             }
         }
-        let (base_loss, g_yhat) = self.loss_and_yhat_grad(clean, &yhat);
         let weight = spectral_weight * t;
         let grad_scale = weight * omt * cout;
-        let dy = g_yhat
-            .into_iter()
-            .zip(mask)
-            .map(|(g, &m)| if m == 0. { g * grad_scale } else { 0. })
-            .collect();
+        if channels == 1 {
+            let (base_loss, g_yhat) = self.loss_and_yhat_grad(clean, &yhat);
+            let dy = g_yhat
+                .into_iter()
+                .zip(mask)
+                .map(|(g, &m)| if m == 0. { g * grad_scale } else { 0. })
+                .collect();
+            return (weight * base_loss, dy);
+        }
+
+        let frames = total / 2;
+        const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+        let mut clean_l = Vec::with_capacity(frames);
+        let mut clean_r = Vec::with_capacity(frames);
+        let mut clean_m = Vec::with_capacity(frames);
+        let mut clean_s = Vec::with_capacity(frames);
+        let mut yhat_l = Vec::with_capacity(frames);
+        let mut yhat_r = Vec::with_capacity(frames);
+        let mut yhat_m = Vec::with_capacity(frames);
+        let mut yhat_s = Vec::with_capacity(frames);
+        for i in 0..frames {
+            let cl = clean[2 * i];
+            let cr = clean[2 * i + 1];
+            clean_l.push(cl);
+            clean_r.push(cr);
+            clean_m.push(INV_SQRT2 * (cl + cr));
+            clean_s.push(INV_SQRT2 * (cl - cr));
+            let yl = yhat[2 * i];
+            let yr = yhat[2 * i + 1];
+            yhat_l.push(yl);
+            yhat_r.push(yr);
+            yhat_m.push(INV_SQRT2 * (yl + yr));
+            yhat_s.push(INV_SQRT2 * (yl - yr));
+        }
+        let (ll, gl) = self.loss_and_yhat_grad(&clean_l, &yhat_l);
+        let (lr, gr) = self.loss_and_yhat_grad(&clean_r, &yhat_r);
+        let (lm, gm) = self.loss_and_yhat_grad(&clean_m, &yhat_m);
+        let (ls, gs) = self.loss_and_yhat_grad(&clean_s, &yhat_s);
+        let base_loss = 0.25 * (ll + lr + lm + ls);
+        let mut dy = vec![0f32; total];
+        for i in 0..frames {
+            let g_l = 0.25 * (gl[i] + INV_SQRT2 * (gm[i] + gs[i]));
+            let g_r = 0.25 * (gr[i] + INV_SQRT2 * (gm[i] - gs[i]));
+            if mask[2 * i] == 0. {
+                dy[2 * i] = g_l * grad_scale;
+            }
+            if mask[2 * i + 1] == 0. {
+                dy[2 * i + 1] = g_r * grad_scale;
+            }
+        }
         (weight * base_loss, dy)
     }
 
@@ -167,6 +240,32 @@ impl SpectralEngine {
         spectral_weight: f32,
         dy_out: &mut [f32],
     ) -> f32 {
+        self.batch_endpoint_loss_gradient_channels(
+            config,
+            clean,
+            mask,
+            noise,
+            pred,
+            t,
+            spectral_weight,
+            1,
+            dy_out,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_endpoint_loss_gradient_channels(
+        &self,
+        config: &FlowConfig,
+        clean: &[f32],
+        mask: &[f32],
+        noise: &[f32],
+        pred: &[f32],
+        t: &[f32],
+        spectral_weight: f32,
+        channels: usize,
+        dy_out: &mut [f32],
+    ) -> f32 {
         let items = t.len();
         if items == 0 || spectral_weight <= 0. {
             dy_out.fill(0.);
@@ -175,14 +274,15 @@ impl SpectralEngine {
         let n = clean.len() / items;
         assert_eq!(dy_out.len(), items * n);
         if items == 1 {
-            let (loss, dy) = self.endpoint_loss_gradient(
-                config,
+            let (loss, dy) = self.endpoint_loss_gradient_channels(
                 clean,
                 mask,
                 noise,
                 pred,
+                config,
                 t[0],
                 spectral_weight,
+                channels,
             );
             dy_out.copy_from_slice(&dy);
             return loss;
@@ -197,14 +297,15 @@ impl SpectralEngine {
                 let row = item * n..(item + 1) * n;
                 let ti = t[item];
                 scope.spawn(move || {
-                    let (loss, dy) = self.endpoint_loss_gradient(
-                        config,
+                    let (loss, dy) = self.endpoint_loss_gradient_channels(
                         &clean[row.clone()],
                         &mask[row.clone()],
                         &noise[row.clone()],
                         &pred[row],
+                        config,
                         ti,
                         spectral_weight,
+                        channels,
                     );
                     *loss_slot = loss;
                     dy_slice.copy_from_slice(&dy);

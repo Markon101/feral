@@ -2,7 +2,7 @@
 
 Implemented: real differentiable neural rectified-flow training; CPU and optional
 OpenCL Adam updates;
-WAV/FFmpeg ingestion; mono f32 output; unconditional and masked sampling; exact
+WAV/FFmpeg ingestion; mono or optional native 2-channel interleaved stereo f32 output; unconditional and masked sampling; exact
 canonical protected samples; learned prefix continuation and hole inpainting;
 experimental anchored variation; Euler/Heun; seeded noise scaling and bounded
 velocity perturbations; versioned full Adam/RNG checkpoints and weights-only
@@ -18,21 +18,26 @@ output for any of those results. No subjective listening evaluation is claimed.
   468 ms, shortened by crop edges. Neither can plan musical form. Outputs after very
   short training can be noisy, clipped, strange or unrecognizable. Unknown-region
   hard clipping can introduce distortion; counts are a future diagnostic.
-* Training is currently single-threaded batch one. The working-memory ceiling is 8 GB on
-  the desktop and 3 GB on the mobile target; both are respected by a much smaller profile.
-  Thermal state, background scheduling and device load are uncontrolled; measured latency
-  is not a maximum-speed claim.
-* Only mono is modeled. Stereo inputs are downmixed or one channel selected.
+* CPU training is single-threaded batch one, while optional `--backend cuda` supports batched
+  resident training. The working-memory ceiling is 8 GB on the desktop and 3 GB on the mobile
+  target; both are respected by our configurations. Thermal state, background scheduling and device
+  load are uncontrolled; measured latency is not a maximum-speed claim.
+* Mono (`mix`/`left`/`right`) is the default; optional native 2-channel interleaved stereo
+  (`--channel stereo`) is implemented on the CPU and CUDA backends. Optional OpenCL stays
+  mono-only (`channels = 1`), single-crop, fixed-horizon, and zero weight decay.
 * Every selected file is cropped at its beginning to `--max-file-seconds`
   (default 30); random training crops are taken inside that decoded section.
-  There is no disk cache, streaming corpus loader, recursive traversal or
-  offset-indexed whole-collection sampling yet. At most 128 files and 128 MB PCM.
+  There is no disk cache, streaming corpus loader or recursive directory traversal
+  yet (though `.txt` manifests support curated cross-directory file lists). At most
+  512 files and 1024 MB scalar PCM by default (configurable `256..=4096` MB via
+  `FERAL_MAX_DATASET_MB`).
 * Conditioning accepts complete inputs up to `--max-input-seconds` (default and
   maximum 600). A duration probe rejects longer inputs before decoding. Unknown
   durations require an explicitly decoded WAV crop; there is no streaming input
   or seekable long-file conditioning yet.
-* Generation bounds: 5 s and 160000 samples; conditional windows include context
-  and padding. Training crops <=1 s. Long generation is OOD and can be poor.
+* Generation bounds: up to 16 s per call (`MAX_WINDOW_SAMPLES = 512,000` frames at
+  16 kHz including context and padding); training crops up to 32 s. Generation
+  longer than the model's trained horizons is OOD and can be poor.
 * Continuation and inpainting are trained mask operations, but a tiny dataset/run
   cannot establish useful repair or coherent continuation. Exact retention is
   confirmed independently of perceptual quality. Smoothing is a local operation,
@@ -42,7 +47,8 @@ output for any of those results. No subjective listening evaluation is claimed.
 * No public backward outpaint command, latent interpolation, recurrent latent
   dynamics, learned codec, diffusion, acoustic invariant engine,
   evolutionary search or automated OOD selection. No pretrained models or services.
-* Checkpoint formats v1-v3 are readable JSON and includes weights, Adam and RNG. CPU
+* Checkpoint formats v1-v3 use compact JSON up to 4M parameters and single-file `FERALCK1` binary
+  above 4M parameters (up to 2 GiB), storing weights, Adam `m`/`v`, EMA weights, and RNG. CPU/CUDA
   deterministic resume is tested on this compiler/architecture; cross-platform
   floating-point bit parity is not promised. Hashes detect model payload changes,
   not malicious edits with recomputed hashes. Only load trusted local artifacts.

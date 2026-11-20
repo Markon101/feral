@@ -21,13 +21,28 @@ pub enum BlockStyle {
     /// Legacy v1-v3 residual block: `h + 0.5 * tanh(Conv1d(h))`.
     #[default]
     Tanh,
-    /// Pre-RMSNorm + per-block FiLM time conditioning + WaveNet gated activation
-    /// `h + 0.5 * (tanh(a) * sigmoid(b))`.
+    /// Pre-RMSNorm + per-block FiLM time conditioning + gated activation `h + 0.5 * (tanh(a) * sigmoid(b))`.
     GatedFilm,
+    /// Pre-RMSNorm + per-block FiLM time conditioning + linear-value GLU `a * sigmoid(b)` with
+    /// depth-scaled residual `1 / sqrt(num_residual_blocks)` to prevent saturation and blow-up.
+    GluFilm,
 }
 impl BlockStyle {
     pub fn is_tanh(&self) -> bool {
         matches!(self, Self::Tanh)
+    }
+    pub fn uses_film(&self) -> bool {
+        matches!(self, Self::GatedFilm | Self::GluFilm)
+    }
+    pub fn is_glu(&self) -> bool {
+        matches!(self, Self::GluFilm)
+    }
+    pub fn residual_scale(&self, num_blocks: usize) -> f32 {
+        if self.is_glu() {
+            1.0 / (num_blocks.max(1) as f32).sqrt()
+        } else {
+            0.5
+        }
     }
 }
 
@@ -46,6 +61,12 @@ pub fn time_embedding(t: f32) -> [f32; TIME_EMBED_DIM] {
 fn is_zero_usize(v: &usize) -> bool {
     *v == 0
 }
+fn default_audio_channels() -> usize {
+    1
+}
+fn is_mono(v: &usize) -> bool {
+    *v == 1
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Architecture {
     pub block: usize,
@@ -57,9 +78,12 @@ pub struct Architecture {
     /// sample-domain stem and head convolutions around the frame stack).
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub sample_conv: usize,
-    /// Residual block style (`tanh` legacy default, or `gated-film` with pre-RMSNorm + FiLM + gate).
+    /// Residual block style (`tanh` legacy default, `gated-film`, or `glu-film`).
     #[serde(default, skip_serializing_if = "BlockStyle::is_tanh")]
     pub block_style: BlockStyle,
+    /// Number of audio channels (1 = mono legacy default, 2 = interleaved stereo `[L0,R0,...]`).
+    #[serde(default = "default_audio_channels", skip_serializing_if = "is_mono")]
+    pub channels: usize,
 }
 impl Default for Architecture {
     fn default() -> Self {
@@ -70,10 +94,25 @@ impl Default for Architecture {
             scales: vec![],
             sample_conv: 0,
             block_style: BlockStyle::Tanh,
+            channels: 1,
         }
     }
 }
 impl Architecture {
+    /// Select audio channel count (1 = mono, 2 = interleaved stereo).
+    pub fn with_channels(mut self, channels: usize) -> Result<Self> {
+        ensure!(
+            [1, 2].contains(&channels),
+            "audio channels must be 1 (mono) or 2 (stereo)"
+        );
+        self.channels = channels;
+        self.validate()?;
+        Ok(self)
+    }
+    /// Scalar values per time frame across all channels (`block * channels`).
+    pub fn frame_elems(&self) -> usize {
+        self.block * self.channels
+    }
     /// Select a bounded training width without changing the baseline topology.
     /// Small custom architectures remain valid for numerical-reference tests.
     pub fn with_width(mut self, width: usize) -> Result<Self> {
@@ -214,6 +253,10 @@ impl Architecture {
                 || ((3..=15).contains(&self.sample_conv) && self.sample_conv % 2 == 1),
             "invalid sample_conv kernel size (must be 0 or odd 3..=15)"
         );
+        ensure!(
+            [1, 2].contains(&self.channels),
+            "invalid audio channels (must be 1 or 2)"
+        );
         Ok(())
     }
 }
@@ -281,6 +324,9 @@ pub trait Velocity {
         1.
     }
     fn block(&self) -> usize;
+    fn channels(&self) -> usize {
+        1
+    }
     fn velocity(&self, x: &[f32], known: &[f32], mask: &[f32], t: f32) -> Vec<f32>;
     /// Fallible field evaluation. The CPU reference cannot fail, but an accelerator can (driver
     /// error, window mismatch); a sampler must report that instead of panicking or continuing.
@@ -368,13 +414,14 @@ impl Layer {
 impl Model {
     pub fn new(a: Architecture, seed: u64) -> Self {
         let mut rng = Rng::new(seed);
-        let gated = a.block_style == BlockStyle::GatedFilm;
+        let fe = a.frame_elems();
+        let gated = a.block_style.uses_film();
         let res_out = if gated { 2 * a.width } else { a.width };
-        let mut layers = vec![Layer::new(3 * a.block + 4, a.width, 1, 1, &mut rng)];
+        let mut layers = vec![Layer::new(3 * fe + 4, a.width, 1, 1, &mut rng)];
         for &d in &a.dilations {
             layers.push(Layer::new(a.width, res_out, 3, d, &mut rng));
         }
-        layers.push(Layer::new(a.width, a.block, 1, 1, &mut rng));
+        layers.push(Layer::new(a.width, fe, 1, 1, &mut rng));
         let time_proj = if gated {
             let scale = 0.1 / (TIME_EMBED_DIM as f32).sqrt();
             (0..a.dilations.len())
@@ -394,14 +441,15 @@ impl Model {
         };
         let (stem, head) = if a.sample_conv > 0 {
             let k = a.sample_conv;
+            let c = a.channels;
             (
                 vec![
-                    Layer::new(3, SAMPLE_CONV_CHANNELS, k, 1, &mut rng),
-                    Layer::new(SAMPLE_CONV_CHANNELS, 1, k, 1, &mut rng),
+                    Layer::new(3 * c, SAMPLE_CONV_CHANNELS, k, 1, &mut rng),
+                    Layer::new(SAMPLE_CONV_CHANNELS, c, k, 1, &mut rng),
                 ],
                 vec![
-                    Layer::new(1, SAMPLE_CONV_CHANNELS, k, 1, &mut rng),
-                    Layer::new(SAMPLE_CONV_CHANNELS, 1, k, 1, &mut rng),
+                    Layer::new(c, SAMPLE_CONV_CHANNELS, k, 1, &mut rng),
+                    Layer::new(SAMPLE_CONV_CHANNELS, c, k, 1, &mut rng),
                 ],
             )
         } else {
@@ -433,6 +481,22 @@ impl Model {
             .flat_map(|l| l.w.iter().chain(&l.b).copied())
             .collect()
     }
+    /// Per-parameter AdamW decay mask: `1.0` for convolution/projection weights, `0.0` for biases.
+    pub fn weight_decay_mask(&self) -> Vec<f32> {
+        let mut mask = Vec::with_capacity(self.count());
+        for l in self
+            .layers
+            .iter()
+            .chain(&self.time_proj)
+            .chain(&self.stem)
+            .chain(&self.head)
+        {
+            mask.extend(std::iter::repeat_n(1.0f32, l.w.len()));
+            mask.extend(std::iter::repeat_n(0.0f32, l.b.len()));
+        }
+        debug_assert_eq!(mask.len(), self.count());
+        mask
+    }
     pub fn set_parameters(&mut self, p: &[f32]) {
         let mut offset = 0;
         for l in self
@@ -450,25 +514,34 @@ impl Model {
         assert_eq!(offset, p.len());
     }
     pub fn forward(&self, x: &[f32], known: &[f32], mask: &[f32], t: f32) -> (Vec<f32>, Tape) {
+        let c = self.architecture.channels;
         let b = self.architecture.block;
+        let fe = b * c;
         let n = x.len();
-        assert_eq!(n % b, 0);
+        assert_eq!(n % fe, 0);
         assert_eq!(n, known.len());
         assert_eq!(n, mask.len());
-        let frames = n / b;
-        let gated = self.architecture.block_style == BlockStyle::GatedFilm;
+        let time_steps = n / c;
+        let frames = n / fe;
+        let gated = self.architecture.block_style.uses_film();
+        let is_glu = self.architecture.block_style.is_glu();
+        let res_scale = self
+            .architecture
+            .block_style
+            .residual_scale(self.architecture.dilations.len());
         let (x_eff, stem_in, stem_a0, stem_a1) = if !self.stem.is_empty() {
             let mut stem_in = Vec::with_capacity(3 * n);
-            for i in 0..n {
-                stem_in.push(x[i]);
-                stem_in.push(known[i] * mask[i]);
-                stem_in.push(mask[i]);
+            for ts in 0..time_steps {
+                let s = ts * c;
+                stem_in.extend_from_slice(&x[s..s + c]);
+                stem_in.extend((s..s + c).map(|i| known[i] * mask[i]));
+                stem_in.extend_from_slice(&mask[s..s + c]);
             }
-            let mut s0 = self.stem[0].forward(&stem_in, n);
+            let mut s0 = self.stem[0].forward(&stem_in, time_steps);
             for v in &mut s0 {
                 *v = v.tanh();
             }
-            let mut s1 = self.stem[1].forward(&s0, n);
+            let mut s1 = self.stem[1].forward(&s0, time_steps);
             for v in &mut s1 {
                 *v = v.tanh();
             }
@@ -478,11 +551,11 @@ impl Model {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new())
         };
         let x_src = if x_eff.is_empty() { x } else { &x_eff };
-        let mut features = Vec::with_capacity(frames * (3 * b + 4));
+        let mut features = Vec::with_capacity(frames * (3 * fe + 4));
         for p in 0..frames {
-            features.extend_from_slice(&x_src[p * b..(p + 1) * b]);
-            features.extend((p * b..(p + 1) * b).map(|i| known[i] * mask[i]));
-            features.extend_from_slice(&mask[p * b..(p + 1) * b]);
+            features.extend_from_slice(&x_src[p * fe..(p + 1) * fe]);
+            features.extend((p * fe..(p + 1) * fe).map(|i| known[i] * mask[i]));
+            features.extend_from_slice(&mask[p * fe..(p + 1) * fe]);
             features.extend([
                 t,
                 1. - t,
@@ -534,7 +607,8 @@ impl Model {
                 let mut gated_act = vec![0f32; cf * w];
                 for q in 0..cf {
                     for c in 0..w {
-                        let a = pre[q * 2 * w + c].tanh();
+                        let raw_a = pre[q * 2 * w + c];
+                        let a = if is_glu { raw_a } else { raw_a.tanh() };
                         let s = 1. / (1. + (-pre[q * 2 * w + w + c]).exp());
                         nl[q * 2 * w + c] = a;
                         nl[q * 2 * w + w + c] = s;
@@ -549,7 +623,7 @@ impl Model {
                 };
                 let mut next = vec![0f32; frames * w];
                 for i in 0..frames * w {
-                    next[i] = h[i] + 0.5 * rep[i];
+                    next[i] = h[i] + res_scale * rep[i];
                 }
                 films.push(film);
                 inv_rms_all.push(inv_rms);
@@ -582,11 +656,11 @@ impl Model {
             h = z;
         }
         let (out, head_a0) = if !self.head.is_empty() {
-            let mut h0 = self.head[0].forward(&h, n);
+            let mut h0 = self.head[0].forward(&h, time_steps);
             for v in &mut h0 {
                 *v = v.tanh();
             }
-            let h1 = self.head[1].forward(&h0, n);
+            let h1 = self.head[1].forward(&h0, time_steps);
             let out: Vec<f32> = h.iter().zip(&h1).map(|(&hi, &ri)| hi + 0.5 * ri).collect();
             (out, h0)
         } else {
@@ -611,21 +685,29 @@ impl Model {
     }
     /// Exact reverse-mode derivatives for the specialized convolution/tanh/gated-FiLM/residual graph.
     pub fn backward(&self, tape: &Tape, dy: &[f32]) -> Vec<f32> {
+        let ch = self.architecture.channels;
         let b = self.architecture.block;
+        let fe = b * ch;
         let w = self.architecture.width;
         let n = dy.len();
-        let frames = n / b;
-        let gated = self.architecture.block_style == BlockStyle::GatedFilm;
+        let time_steps = n / ch;
+        let frames = n / fe;
+        let gated = self.architecture.block_style.uses_film();
+        let is_glu = self.architecture.block_style.is_glu();
+        let res_scale = self
+            .architecture
+            .block_style
+            .residual_scale(self.architecture.dilations.len());
         let (mut dh, head_grads) = if !self.head.is_empty() {
             let dh1: Vec<f32> = dy.iter().map(|&g| 0.5 * g).collect();
-            let (d_h0, dw_h1, db_h1) = self.head[1].backward(&tape.head_a0, &dh1, n);
+            let (d_h0, dw_h1, db_h1) = self.head[1].backward(&tape.head_a0, &dh1, time_steps);
             let dz_h0: Vec<f32> = d_h0
                 .iter()
                 .zip(&tape.head_a0)
                 .map(|(&g, &a)| g * (1. - a * a))
                 .collect();
             let h_raw = tape.acts.last().expect("frame activations");
-            let (d_hraw, dw_h0, db_h0) = self.head[0].backward(h_raw, &dz_h0, n);
+            let (d_hraw, dw_h0, db_h0) = self.head[0].backward(h_raw, &dz_h0, time_steps);
             let dh_frame: Vec<f32> = dy.iter().zip(&d_hraw).map(|(&a, &b)| a + b).collect();
             let hg: Vec<f32> = dw_h0
                 .into_iter()
@@ -659,10 +741,14 @@ impl Model {
                 let mut dz = vec![0f32; cf * 2 * w];
                 for q in 0..cf {
                     for c in 0..w {
-                        let g = 0.5 * g_rep[q * w + c];
+                        let g = res_scale * g_rep[q * w + c];
                         let ta = nl[q * 2 * w + c];
                         let sb = nl[q * 2 * w + w + c];
-                        dz[q * 2 * w + c] = g * sb * (1. - ta * ta);
+                        dz[q * 2 * w + c] = if is_glu {
+                            g * sb
+                        } else {
+                            g * sb * (1. - ta * ta)
+                        };
                         dz[q * 2 * w + w + c] = g * ta * sb * (1. - sb);
                     }
                 }
@@ -743,22 +829,22 @@ impl Model {
         }
         let mut out: Vec<f32> = grads.into_iter().chain(time_proj_grads).flatten().collect();
         if !self.stem.is_empty() {
-            let stride = 3 * b + 4;
+            let stride = 3 * fe + 4;
             let mut dz_s1 = Vec::with_capacity(n);
             for p in 0..frames {
-                for c in 0..b {
-                    let i = p * b + c;
+                for c in 0..fe {
+                    let i = p * fe + c;
                     let a = tape.stem_a1[i];
                     dz_s1.push(dh[p * stride + c] * 0.5 * (1. - a * a));
                 }
             }
-            let (d_s0, dw_s1, db_s1) = self.stem[1].backward(&tape.stem_a0, &dz_s1, n);
+            let (d_s0, dw_s1, db_s1) = self.stem[1].backward(&tape.stem_a0, &dz_s1, time_steps);
             let dz_s0: Vec<f32> = d_s0
                 .iter()
                 .zip(&tape.stem_a0)
                 .map(|(&g, &a)| g * (1. - a * a))
                 .collect();
-            let (_, dw_s0, db_s0) = self.stem[0].backward(&tape.stem_in, &dz_s0, n);
+            let (_, dw_s0, db_s0) = self.stem[0].backward(&tape.stem_in, &dz_s0, time_steps);
             out.extend(dw_s0);
             out.extend(db_s0);
             out.extend(dw_s1);
@@ -811,6 +897,9 @@ impl Model {
 impl Velocity for Model {
     fn block(&self) -> usize {
         self.architecture.block
+    }
+    fn channels(&self) -> usize {
+        self.architecture.channels
     }
     fn velocity(&self, x: &[f32], known: &[f32], mask: &[f32], t: f32) -> Vec<f32> {
         self.forward(x, known, mask, t).0

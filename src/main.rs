@@ -4,7 +4,7 @@ use feral::{
     audio::{self, Preprocess},
     flow::Sampling,
     model::{Architecture, BlockStyle},
-    parameterization::{FlowConfig, LrSchedule, TimeSampling},
+    parameterization::{FlowConfig, HorizonSchedule, LrSchedule, TimeSampling},
     runtime::{self, Mode, RenderConfig, TrainConfig},
 };
 use std::{fs, path::PathBuf};
@@ -102,8 +102,8 @@ struct AudioArgs {
     sample_rate: u32,
     #[arg(long, default_value_t = 30.)]
     max_file_seconds: f32,
-    /// mix down stereo, or select left/right; neural output is mono.
-    #[arg(long, default_value = "mix")]
+    /// Channel mode: mix (mono), left, right, or stereo (interleaved 2-channel L/R).
+    #[arg(long, default_value = "mix", value_parser = ["mix", "left", "right", "stereo"])]
     channel: String,
     #[arg(long)]
     no_normalize: bool,
@@ -136,9 +136,9 @@ struct TrainArgs {
     /// or cycles (two full ascending dilation passes).
     #[arg(long, default_value = "ascending", value_parser = ["ascending", "symmetric", "cycles"])]
     dilation_pattern: String,
-    /// Residual block style: tanh (legacy) or gated-film (pre-RMSNorm + per-block FiLM time
-    /// conditioning + WaveNet gated activation; CPU and CUDA backends only).
-    #[arg(long, default_value = "tanh", value_parser = ["tanh", "gated-film"])]
+    /// Residual block type: tanh (legacy), gated-film (pre-RMSNorm + FiLM + tanh*sigmoid), or
+    /// glu-film (pre-RMSNorm + FiLM + linear*sigmoid gated linear unit; CPU and CUDA backends only).
+    #[arg(long, default_value = "tanh", value_parser = ["tanh", "gated-film", "glu-film"])]
     block_style: String,
     /// Samples per frame before the first convolution (16/32/64/128). Larger frames are cheaper
     /// per sample and multiply the receptive field by the same factor.
@@ -192,6 +192,20 @@ struct TrainArgs {
     /// Checkpointed; CPU and CUDA backends only.
     #[arg(long, default_value_t = 0.)]
     ema_decay: f32,
+    /// Decoupled AdamW weight decay on 2D convolution/projection weights (0 disables; e.g. 0.01).
+    /// Biases stay unregularized. Checkpointed; CPU and CUDA backends only.
+    #[arg(long, default_value_t = 0.)]
+    weight_decay: f32,
+    /// Comma-separated crop durations in seconds for multi-scale training horizons (e.g.
+    /// 0.512,1.024,2.048,4.096). Keeps samples/step ~ constant across horizons; CPU & CUDA only.
+    #[arg(long, value_delimiter = ',')]
+    crop_horizons: Vec<f32>,
+    /// Multi-scale crop horizon schedule: fixed (legacy), random, short-to-long, or long-to-short.
+    #[arg(long, default_value = "fixed", value_parser = ["fixed", "random", "short-to-long", "long-to-short"])]
+    horizon_schedule: String,
+    /// Total schedule steps for ordered multi-horizon schedules (defaults to `--steps`).
+    #[arg(long)]
+    horizon_steps: Option<usize>,
     /// Optional odd sample-level 1D conv kernel size around the frame stack (0 disables; odd 3..=15).
     /// Bridges frame boundaries with shift-equivariant sample context; CPU and CUDA backends only.
     #[arg(long, default_value_t = 0, value_parser = parse_sample_conv)]
@@ -389,10 +403,10 @@ fn main() -> Result<()> {
         } => {
             let p = args.config();
             let x = audio::decode(&input, &p)?;
-            audio::write_wav(&output, &x, p.sample_rate)?;
+            audio::write_wav_channels(&output, &x, p.sample_rate, p.channels())?;
             runtime::write_json(
                 &output.with_extension("json"),
-                &serde_json::json!({"input":fs::canonicalize(&input)?,"input_sha256":feral::data::hash_file(&input)?,"preprocess":p,"samples":x.len()}),
+                &serde_json::json!({"input":fs::canonicalize(&input)?,"input_sha256":feral::data::hash_file(&input)?,"preprocess":p,"samples":x.len() / p.channels()}),
             )?;
         }
         Commands::Train(a) => {
@@ -418,6 +432,8 @@ fn main() -> Result<()> {
             } else {
                 LrSchedule::Constant
             };
+            let preprocess = a.audio.config();
+            let audio_channels = preprocess.channels();
             runtime::train(TrainConfig {
                 flow: if a.parameterization == "preconditioned" {
                     FlowConfig::Preconditioned {
@@ -432,13 +448,22 @@ fn main() -> Result<()> {
                 time_sampling,
                 lr_schedule,
                 ema_decay: a.ema_decay,
+                weight_decay: a.weight_decay,
+                crop_horizons: a.crop_horizons,
+                horizon_schedule: match a.horizon_schedule.as_str() {
+                    "random" => HorizonSchedule::Random,
+                    "short-to-long" => HorizonSchedule::ShortToLong,
+                    "long-to-short" => HorizonSchedule::LongToShort,
+                    _ => HorizonSchedule::Fixed,
+                },
+                horizon_steps: a.horizon_steps,
                 backend: a.backend,
                 input: a.input,
                 run: a.run,
                 steps: a.steps,
                 seed: a.seed,
                 crop_seconds: a.crop_seconds,
-                preprocess: a.audio.config(),
+                preprocess,
                 lr: a.learning_rate,
                 preview_every: a.preview_every,
                 checkpoint_every: a.checkpoint_every,
@@ -459,11 +484,12 @@ fn main() -> Result<()> {
                 })
                 .with_width(a.width)?
                 .with_frame_samples(a.block)?
+                .with_channels(audio_channels)?
                 .with_sample_conv(a.sample_conv)?
-                .with_block_style(if a.block_style == "gated-film" {
-                    BlockStyle::GatedFilm
-                } else {
-                    BlockStyle::Tanh
+                .with_block_style(match a.block_style.as_str() {
+                    "gated-film" => BlockStyle::GatedFilm,
+                    "glu-film" => BlockStyle::GluFilm,
+                    _ => BlockStyle::Tanh,
                 })?,
             })?;
         }
@@ -567,6 +593,10 @@ fn main() -> Result<()> {
                 time_sampling: TimeSampling::Uniform,
                 lr_schedule: LrSchedule::Constant,
                 ema_decay: 0.,
+                weight_decay: 0.,
+                crop_horizons: vec![],
+                horizon_schedule: HorizonSchedule::Fixed,
+                horizon_steps: None,
                 backend: "cpu".into(),
                 input: corpus,
                 run: run.join("training"),

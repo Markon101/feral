@@ -3,7 +3,8 @@ use feral::{
     flow::{self, Sampling},
     model::{Architecture, Model, Velocity},
     parameterization::{
-        self, ConfiguredVelocity, FlowConfig, GaussianReference, LrSchedule, TimeSampling,
+        self, ConfiguredVelocity, FlowConfig, GaussianReference, HorizonSchedule, LrSchedule,
+        TimeSampling,
     },
     rng::Rng,
     runtime::{self, Checkpoint, TrainConfig},
@@ -31,6 +32,7 @@ fn tiny() -> Architecture {
         scales: vec![1, 2],
         sample_conv: 0,
         block_style: feral::model::BlockStyle::Tanh,
+        channels: 1,
     }
 }
 #[test]
@@ -165,6 +167,10 @@ fn config(root: &Path, name: &str, steps: usize, resume: Option<PathBuf>) -> Tra
         time_sampling: TimeSampling::Uniform,
         lr_schedule: LrSchedule::Constant,
         ema_decay: 0.,
+        weight_decay: 0.,
+        crop_horizons: vec![],
+        horizon_schedule: HorizonSchedule::Fixed,
+        horizon_steps: None,
         backend: "cpu".into(),
         input: root.join("corpus"),
         run: root.join(name),

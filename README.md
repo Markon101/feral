@@ -44,7 +44,7 @@ Audio and checkpoints remain local and are ignored by Git.
   --seconds 0.512 --seed 42 --output runs/first/new.wav
 ```
 
-A directory selects supported extensions nonrecursively (1–128 files). A `.txt`
+A directory selects supported extensions nonrecursively (1–512 files). A `.txt`
 manifest selects files with one path per line, relative to the manifest directory;
 blank lines and `#` comments are ignored. A single input file can use any format
 FFmpeg recognizes. WAV, FLAC, MP3, Ogg Vorbis, Ogg Opus, WebM Opus and M4A AAC are
@@ -59,13 +59,16 @@ reported and skipped for training; no usable files is an error.
   --max-file-seconds 30 --sample-rate 16000 --channel mix
 ```
 
-Canonical PCM is finite mono f32, normally 16 kHz. `--channel mix|left|right`
-controls stereo ingestion; stereo generation is not implemented. Training
-normalizes each selected file to peak 0.8 unless `--no-normalize` is given.
-`--silence-rms` rejects silent files and retries silent crops. Each file is decoded
-once into RAM; the total decoded dataset is capped at 128 MB. Source files are
-never altered or copied into the run. Hashes, absolute source paths, preprocessing
-and decode rejections are recorded.
+Canonical PCM is finite f32 (mono by default, or native 2-channel interleaved
+`[L0, R0, ...]` with `--channel stereo`), normally 16 kHz.
+`--channel mix|left|right|stereo` selects ingestion layout and matching float
+WAV output; `mix`/`left`/`right` produce mono waveforms while `stereo` jointly
+normalizes channels (preserving L/R balance unless `--no-normalize` is given).
+`--silence-rms` rejects silent files and retries silent crops. Each file is
+decoded once into RAM; the total decoded scalar dataset defaults to a 1024 MB
+cap (4 byte/sample, adjustable from 256 to 4096 MB via `FERAL_MAX_DATASET_MB`).
+Source files are never altered or copied into the run. Hashes, absolute source
+paths, preprocessing and decode rejections are recorded.
 
 ## Transform and extend
 
@@ -122,18 +125,24 @@ from noise at t=0 to audio at t=1. Trajectories reject nonfinite or extreme valu
 new audio has an explicit hard safety limiter at 0.98. No file is overwritten.
 Output JSON records checkpoint/input/output hashes, seed, solver, timings, masks'
 boundary metrics and preservation checks. Unusual outputs remain beside their
-metadata instead of being silently discarded. Generation is bounded to 5 seconds
-and 160000 samples, solver steps to 512. Longer windows are outside training's
-scale and may be poor even if finite.
+metadata instead of being silently discarded. Generation is bounded to 16 seconds
+per call (`--seconds <= 16.0`), conditioned windows to 512,000 time frames (32 s
+at 16 kHz), and solver steps to 512. Longer windows than training's horizons
+are OOD and may be poor even if finite.
 
 Full resume restores weights, Adam moments/step and the training RNG, requires the
-same dataset/preprocessing/crop/learning rate, and writes a fresh run. `--weights-only`
-explicitly resets optimizer/RNG and permits another dataset. `--steps` always means
-additional steps. Full resume restores the original RNG stream, so `--seed`
-only selects a new stream for fresh or weights-only training. Tests compare
-uninterrupted and resumed parameters exactly on CPU. Checkpoints are versioned, portable JSON, hash checked, written compact (a
-1.215M-parameter checkpoint is 49.6 MB; artifacts such as metrics.json stay readable), and capped at 192 MB (enough for
-the largest architecture the CLI allows; the cap is a guard against untrusted files, not a model limit).
+same dataset/preprocessing/crop/learning rate/weight decay/horizon configuration,
+and writes a fresh run. `--weights-only` explicitly resets optimizer/RNG and
+permits another dataset. `--steps` always means additional steps. Full resume
+restores the original RNG stream, so `--seed` only selects a new stream for fresh
+or weights-only training. Tests compare uninterrupted and resumed parameters
+exactly on CPU and CUDA. Checkpoints up to 4,000,000 parameters are written as
+versioned, compact, hash-checked JSON (a 1.215M-parameter checkpoint is 49.6 MB);
+models above 4,000,000 parameters automatically use the single-file `FERALCK1`
+binary format (JSON metadata + SHA-256-verified contiguous LE f32 payload for
+weights, Adam `m`/`v`, EMA weights and RNG state; capped at 2 GiB on load and
+auto-detected transparently by `Checkpoint::load`; artifacts such as `metrics.json`
+stay readable).
 Run metadata includes architecture, parameter count, source/Git identity, data
 hash, objective, preprocessing, optimizer and seed. `losses.jsonl` records every
 step, task, loss, gradient norm, time and RNG state. Previews use a fixed seed.
@@ -268,30 +277,38 @@ and is implemented on the CPU and CUDA backends.
 `--spectral-weight <w>` adds a non-quadratic multiresolution Hann STFT log-magnitude smooth-L1
 loss (`FFT sizes 128/512/2048`, `hop = N/4`) on the predicted clean endpoint
 `y_hat = x_t + (1 - t) * v_pred`, weighted by `w * t` with strictly zero gradient on protected
-samples. CPU uses `rustfft`; CUDA executes a resident radix-2 shared-memory STFT kernel with zero
-PCIe sync and deterministic 4-slot overlap accumulation. `0` (default) disables it with zero
-overhead.
+samples. On stereo (`--channel stereo`), all four streams — Left, Right, Mid `(L+R)/sqrt(2)`,
+and Side `(L-R)/sqrt(2)` — are weighted equally (`1/4` each). CPU uses `rustfft`; CUDA
+executes a resident radix-2 shared-memory STFT kernel with zero PCIe sync and deterministic
+4-slot overlap accumulation. `0` (default) disables it with zero overhead.
 
-Training schedule, time sampling and EMA controls (all opt-in, checkpointed, and deterministic on
-resume; defaults preserve v1–v3 behavior bit for bit):
+Training schedule, optimizer, horizon and EMA controls (all opt-in, checkpointed, and
+deterministic on resume; defaults preserve v1–v3 behavior bit for bit):
 - `--time-sampling uniform|logit-normal` with `--time-mean` (default `0.0`) and `--time-std`
   (default `1.0`) concentrates flow-time updates around mid-trajectory `t` where structure forms.
   With `--parameterization preconditioned`, pair `--prior-std` with `--data-scale` so `0 dB` SNR
   aligns with `t = 0.5`.
 - `--lr-schedule constant|cosine` with `--warmup-steps`, `--min-lr` (default `1e-5`) and optional
   `--schedule-steps` (defaults to `--steps`) applies linear warmup and cosine decay to Adam.
+- `--weight-decay <w>` (e.g. `0.01`; `0` disables) applies decoupled AdamW weight decay on
+  convolution and projection weights while keeping biases unregularized (CPU and CUDA).
 - `--ema-decay <d>` (e.g. `0.999`; `0` disables) maintains checkpointed exponential-moving-average
   weights on CPU and CUDA. Training previews, validation, `generate`/`continue`/`inpaint`/`variation`
   and `evaluate` automatically use EMA weights when present; pass `--no-ema` to inspect raw weights.
+- `--crop-horizons <s1,s2,...>`, `--horizon-schedule fixed|random|short-to-long|long-to-short` and
+  optional `--horizon-steps <n>` select multi-scale training crop durations while adjusting per-horizon
+  batch size to keep frames per step roughly constant across horizons (CPU and CUDA; in an
+  equal-compute 4-way stereo ablation, `short-to-long` outperformed `fixed`, `random`, and
+  `long-to-short` on all held-out evaluation metrics).
 
 Architecture options (opt-in; CPU and CUDA):
 - `--dilation-pattern ascending|symmetric|cycles` controls the residual dilation schedule for
   `--network baseline`: `ascending` (`1..2^(b-1)`, legacy default), `symmetric`
   (`1..2^(b-1)..1`, U-Net coarse-to-fine refinement after global context), or `cycles` (two full
   `1..2^(b-1)` passes).
-- `--block-style tanh|gated-film` selects either the legacy `h + 0.5 * tanh(Conv(h))` block or
-  pre-RMSNorm + per-block 32-dim sinusoidal FiLM time conditioning + WaveNet gated activation
-  `h + 0.5 * (tanh(a) * sigmoid(b))`.
+- `--block-style tanh|gated-film|glu-film` selects the legacy `h + 0.5 * tanh(Conv(h))` block,
+  pre-RMSNorm + FiLM + double-bounded WaveNet gate `h + 0.5 * (tanh(a) * sigmoid(b))`, or
+  pre-RMSNorm + FiLM + non-saturating depth-scaled GLU `h + (a * sigmoid(b)) / sqrt(num_blocks)`.
 - `--sample-conv <K>` (`0` disables; odd `3..=15` enables) wraps the `block`-sample frame stack with
   two-layer residual sample-domain 1D convolutions (16 hidden channels) before packing and after
   unpacking, bridging frame boundaries with shift-equivariant sample context while preserving exact
@@ -328,4 +345,10 @@ describe provenance and limits.
 The `structure_eval` example compares10ms envelopes with seeded phase-randomized
 surrogates preserving the whole-clip spectrum. These diagnostics test organization
 beyond a spectral envelope; they are not music/quality scores. The owner still
-hears broadband noise from the100k model. Stereo remains deferred.
+hears broadband noise from the100k model. Native 2-channel stereo (`--channel
+stereo`), non-saturating `glu-film` blocks, decoupled AdamW weight decay,
+multi-scale crop horizons, and single-file `FERALCK1` binary checkpoints are now
+implemented and verified up to a 24.6M-parameter stereo baseline (50,000 steps;
+see [reports/INVESTIGATION_2026-11-20.md](reports/INVESTIGATION_2026-11-20.md)).
+Numerical and spectral diagnostics remain separate from human listening and do
+not establish perceptual quality or musical coherence.

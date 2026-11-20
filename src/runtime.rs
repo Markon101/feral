@@ -5,7 +5,9 @@ use crate::{
     data::{self, Dataset, DatasetIdentity},
     flow::{self, Sampling},
     model::{Architecture, Model},
-    parameterization::{self, ConfiguredVelocity, FlowConfig, LrSchedule, TimeSampling},
+    parameterization::{
+        self, ConfiguredVelocity, FlowConfig, HorizonSchedule, LrSchedule, TimeSampling,
+    },
     rng::Rng,
 };
 use anyhow::{ensure, Context, Result};
@@ -13,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, OpenOptions},
-    io::Write,
+    io::{BufReader, BufWriter, Read, Seek, Write},
     path::{Path, PathBuf},
     process::Command,
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -87,11 +89,28 @@ impl Adam {
         self.update_with_lr(model, grad, lr)
     }
     pub fn update_with_lr(&mut self, model: &mut Model, grad: &[f32], lr: f32) -> Result<f32> {
+        self.update_with_lr_wd(model, grad, lr, 0., None)
+    }
+    pub fn update_with_lr_wd(
+        &mut self,
+        model: &mut Model,
+        grad: &[f32],
+        lr: f32,
+        weight_decay: f32,
+        decay_mask: Option<&[f32]>,
+    ) -> Result<f32> {
         ensure!(
             grad.len() == self.m.len() && grad.iter().all(|g| g.is_finite()),
             "nonfinite or invalid gradients"
         );
         ensure!(lr.is_finite() && lr >= 0., "invalid step learning rate");
+        ensure!(
+            weight_decay.is_finite() && weight_decay >= 0.,
+            "invalid weight decay"
+        );
+        if let Some(mask) = decay_mask {
+            ensure!(mask.len() == self.m.len(), "invalid weight decay mask");
+        }
         let norm = grad.iter().map(|g| (*g as f64).powi(2)).sum::<f64>().sqrt() as f32;
         let scale = 1. / norm.max(1.);
         self.step += 1;
@@ -102,6 +121,9 @@ impl Adam {
             let g = grad[i] * scale;
             self.m[i] = 0.9 * self.m[i] + 0.1 * g;
             self.v[i] = 0.999 * self.v[i] + 0.001 * g * g;
+            if weight_decay > 0. {
+                p[i] *= 1. - lr * weight_decay * decay_mask.map_or(1., |mask| mask[i]);
+            }
             p[i] -= lr * (self.m[i] / c1) / ((self.v[i] / c2).sqrt() + 1e-8);
         }
         ensure!(
@@ -114,6 +136,9 @@ impl Adam {
 }
 fn is_zero_f32(v: &f32) -> bool {
     *v == 0.
+}
+fn is_zero_usize(v: &usize) -> bool {
+    *v == 0
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Checkpoint {
@@ -136,6 +161,18 @@ pub struct Checkpoint {
     /// Exponential moving average decay for inference weights; 0 disables EMA.
     #[serde(default, skip_serializing_if = "is_zero_f32")]
     pub ema_decay: f32,
+    /// Decoupled AdamW weight decay on 2D convolution/projection weights; 0 disables it.
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub weight_decay: f32,
+    /// Multi-scale crop lengths in samples; empty means fixed legacy `crop_samples`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub horizon_samples: Vec<usize>,
+    /// Multi-horizon crop schedule; older checkpoints default to Fixed.
+    #[serde(default, skip_serializing_if = "HorizonSchedule::is_fixed")]
+    pub horizon_schedule: HorizonSchedule,
+    /// Total schedule steps for ordered multi-horizon schedules; 0 means N/A.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub horizon_total_steps: usize,
     /// Checkpointed EMA parameter shadow (empty when `ema_decay == 0`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ema_weights: Vec<f32>,
@@ -182,18 +219,111 @@ pub fn source_hash() -> Result<String> {
 }
 /// Guard against absurd or untrusted files rather than a model-size limit.
 ///
-/// A checkpoint stores weights plus both Adam moments as decimal JSON, about 13.5 bytes per
-/// number. The largest architecture the CLI permits (width 512, 10 dilations, block 128) is
-/// ~16.2 M parameters -> 48.6 M numbers -> ~660 MB; 768 MB leaves headroom without accepting
-/// multi-gigabyte garbage. Encoding the arrays as base64 would cut this ~3x (see the note in
-/// reports/CUDA.md); until then, a run's checkpoints are large.
-pub const MAX_CHECKPOINT_BYTES: u64 = 768 * 1024 * 1024;
+/// Legacy checkpoints <= 4M parameters write JSON (~13.5 bytes per float); larger checkpoints
+/// automatically use single-file `FERALCK1` binary format (~16 bytes per parameter for
+/// weights + m + v + EMA, so 24.4M parameters is ~390 MB).
+pub const MAX_CHECKPOINT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub const BINARY_CHECKPOINT_MAGIC: &[u8; 8] = b"FERALCK1";
+pub const BINARY_CHECKPOINT_THRESHOLD: usize = 4_000_000;
+const MAX_BINARY_HEADER_BYTES: usize = 16 * 1024 * 1024;
+const MAX_BINARY_FLOATS: usize = 256_000_000;
+
+#[derive(Serialize, Deserialize)]
+struct BinaryCheckpointHeader {
+    metadata: Checkpoint,
+    param_count: usize,
+    has_ema: bool,
+    tensors_sha256: String,
+}
+
+fn binary_model_hash(architecture: &Architecture, params: &[f32]) -> Result<String> {
+    let mut h = Sha256::new();
+    h.update(BINARY_CHECKPOINT_MAGIC);
+    h.update(serde_json::to_vec(architecture)?);
+    for &v in params {
+        h.update(v.to_le_bytes());
+    }
+    Ok(format!("{:x}", h.finalize()))
+}
+
+fn hash_tensor_bytes(h: &mut Sha256, data: &[f32]) {
+    for &v in data {
+        h.update(v.to_le_bytes());
+    }
+}
+
+fn tensors_hash(params: &[f32], m: &[f32], v: &[f32], ema: &[f32]) -> String {
+    let mut h = Sha256::new();
+    hash_tensor_bytes(&mut h, params);
+    hash_tensor_bytes(&mut h, m);
+    hash_tensor_bytes(&mut h, v);
+    hash_tensor_bytes(&mut h, ema);
+    format!("{:x}", h.finalize())
+}
+
+fn take_layer_vecs(model: &mut Model) -> Vec<(Vec<f32>, Vec<f32>)> {
+    model
+        .layers
+        .iter_mut()
+        .chain(&mut model.time_proj)
+        .chain(&mut model.stem)
+        .chain(&mut model.head)
+        .map(|l| (std::mem::take(&mut l.w), std::mem::take(&mut l.b)))
+        .collect()
+}
+
+fn restore_layer_vecs(model: &mut Model, vecs: Vec<(Vec<f32>, Vec<f32>)>) {
+    for (l, (w, b)) in model
+        .layers
+        .iter_mut()
+        .chain(&mut model.time_proj)
+        .chain(&mut model.stem)
+        .chain(&mut model.head)
+        .zip(vecs)
+    {
+        l.w = w;
+        l.b = b;
+    }
+}
+
+fn write_f32_slice<W: Write>(writer: &mut W, data: &[f32]) -> Result<()> {
+    let mut buf = [0u8; 4096];
+    for chunk in data.chunks(1024) {
+        let bytes = chunk.len() * 4;
+        let (slots, _) = buf.as_chunks_mut::<4>();
+        for (&val, slot) in chunk.iter().zip(slots) {
+            *slot = val.to_le_bytes();
+        }
+        writer.write_all(&buf[..bytes])?;
+    }
+    Ok(())
+}
+
+fn read_f32_vec<R: Read>(reader: &mut R, len: usize) -> Result<Vec<f32>> {
+    let mut out = vec![0f32; len];
+    let mut buf = [0u8; 4096];
+    let mut pos = 0;
+    while pos < len {
+        let take = (len - pos).min(1024);
+        reader.read_exact(&mut buf[..take * 4])?;
+        let (chunks, _) = buf[..take * 4].as_chunks::<4>();
+        for (dst, chunk) in out[pos..pos + take].iter_mut().zip(chunks) {
+            *dst = f32::from_le_bytes(*chunk);
+        }
+        pos += take;
+    }
+    Ok(out)
+}
+
 impl Checkpoint {
     pub fn velocity(&self) -> ConfiguredVelocity<'_> {
         ConfiguredVelocity {
             model: &self.model,
             config: &self.flow,
         }
+    }
+    pub fn channels(&self) -> usize {
+        self.model.architecture.channels
     }
     pub fn has_ema(&self) -> bool {
         !self.ema_weights.is_empty()
@@ -208,8 +338,143 @@ impl Checkpoint {
         m
     }
     pub fn save(&mut self, path: &Path) -> Result<()> {
+        if self.model.count() > BINARY_CHECKPOINT_THRESHOLD {
+            return self.save_binary(path);
+        }
         self.model_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&self.model)?));
         write_json_compact(path, self)
+    }
+    /// Save checkpoint in single-file `FERALCK1` binary format (compact JSON header + raw LE f32
+    /// payloads for weights, Adam `m`, Adam `v`, and optional EMA weights).
+    pub fn save_binary(&mut self, path: &Path) -> Result<()> {
+        let params = self.model.parameters();
+        let param_count = params.len();
+        ensure!(
+            self.adam.m.len() == param_count && self.adam.v.len() == param_count,
+            "optimizer state length mismatch while saving binary checkpoint"
+        );
+        self.model_hash = binary_model_hash(&self.model.architecture, &params)?;
+        let tensors_sha256 = tensors_hash(&params, &self.adam.m, &self.adam.v, &self.ema_weights);
+        let has_ema = !self.ema_weights.is_empty();
+
+        // Strip large f32 vectors into locals before cloning metadata so serialization uses KB
+        // instead of duplicating multi-hundred-MB weight/optimizer arrays in JSON.
+        let saved_layers = take_layer_vecs(&mut self.model);
+        let saved_m = std::mem::take(&mut self.adam.m);
+        let saved_v = std::mem::take(&mut self.adam.v);
+        let saved_ema = std::mem::take(&mut self.ema_weights);
+        let metadata = self.clone();
+        restore_layer_vecs(&mut self.model, saved_layers);
+        self.adam.m = saved_m;
+        self.adam.v = saved_v;
+        self.ema_weights = saved_ema;
+
+        let header = BinaryCheckpointHeader {
+            metadata,
+            param_count,
+            has_ema,
+            tensors_sha256,
+        };
+        let header_json = serde_json::to_vec(&header)?;
+        ensure!(
+            header_json.len() <= MAX_BINARY_HEADER_BYTES,
+            "binary checkpoint header exceeds {} MB",
+            MAX_BINARY_HEADER_BYTES >> 20
+        );
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("create {} (will not overwrite)", path.display()))?;
+        let mut writer = BufWriter::new(file);
+        writer.write_all(BINARY_CHECKPOINT_MAGIC)?;
+        writer.write_all(&(header_json.len() as u64).to_le_bytes())?;
+        writer.write_all(&header_json)?;
+        write_f32_slice(&mut writer, &params)?;
+        write_f32_slice(&mut writer, &self.adam.m)?;
+        write_f32_slice(&mut writer, &self.adam.v)?;
+        if has_ema {
+            write_f32_slice(&mut writer, &self.ema_weights)?;
+        }
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        Ok(())
+    }
+    fn load_binary<R: Read>(mut reader: R) -> Result<Self> {
+        let mut len_buf = [0u8; 8];
+        reader.read_exact(&mut len_buf)?;
+        let header_len = u64::from_le_bytes(len_buf) as usize;
+        ensure!(
+            (2..=MAX_BINARY_HEADER_BYTES).contains(&header_len),
+            "invalid binary checkpoint header size"
+        );
+        let mut header_bytes = vec![0u8; header_len];
+        reader.read_exact(&mut header_bytes)?;
+        let header: BinaryCheckpointHeader = serde_json::from_slice(&header_bytes)?;
+        ensure!(
+            header.param_count > 0 && header.param_count <= MAX_BINARY_FLOATS,
+            "invalid binary checkpoint parameter count"
+        );
+        let mut c = header.metadata;
+        c.model.architecture.validate()?;
+        let mut expected = 0usize;
+        for l in c
+            .model
+            .layers
+            .iter_mut()
+            .chain(&mut c.model.time_proj)
+            .chain(&mut c.model.stem)
+            .chain(&mut c.model.head)
+        {
+            let w_len = l
+                .input
+                .checked_mul(l.output)
+                .and_then(|v| v.checked_mul(l.kernel))
+                .context("binary layer dimension overflow")?;
+            let layer_total = w_len
+                .checked_add(l.output)
+                .context("binary layer count overflow")?;
+            expected = expected
+                .checked_add(layer_total)
+                .context("binary model count overflow")?;
+            ensure!(
+                expected <= MAX_BINARY_FLOATS,
+                "binary layer dimensions exceed limit"
+            );
+            l.w = vec![0f32; w_len];
+            l.b = vec![0f32; l.output];
+        }
+        ensure!(
+            expected == header.param_count,
+            "binary checkpoint parameter count mismatch"
+        );
+        let params = read_f32_vec(&mut reader, expected)?;
+        let m = read_f32_vec(&mut reader, expected)?;
+        let v = read_f32_vec(&mut reader, expected)?;
+        let ema = if header.has_ema {
+            read_f32_vec(&mut reader, expected)?
+        } else {
+            vec![]
+        };
+        let mut extra = [0u8; 1];
+        ensure!(
+            reader.read(&mut extra)? == 0,
+            "unexpected trailing bytes in binary checkpoint"
+        );
+        ensure!(
+            tensors_hash(&params, &m, &v, &ema) == header.tensors_sha256,
+            "binary checkpoint payload checksum mismatch"
+        );
+        ensure!(
+            binary_model_hash(&c.model.architecture, &params)? == c.model_hash,
+            "binary checkpoint model hash mismatch"
+        );
+        c.model.set_parameters(&params);
+        c.adam.m = m;
+        c.adam.v = v;
+        c.ema_weights = ema;
+        c.validate(false)?;
+        Ok(c)
     }
     pub fn load(path: &Path) -> Result<Self> {
         ensure!(
@@ -217,7 +482,18 @@ impl Checkpoint {
             "checkpoint exceeds {} MB",
             MAX_CHECKPOINT_BYTES >> 20
         );
-        let c: Self = serde_json::from_reader(std::io::BufReader::new(fs::File::open(path)?))?;
+        let mut file = fs::File::open(path)?;
+        let mut magic = [0u8; 8];
+        if file.read_exact(&mut magic).is_ok() && &magic == BINARY_CHECKPOINT_MAGIC {
+            return Self::load_binary(BufReader::new(file));
+        }
+        file.rewind()?;
+        let c: Self = serde_json::from_reader(BufReader::new(file))?;
+        c.validate(true)?;
+        Ok(c)
+    }
+    fn validate(&self, verify_json_hash: bool) -> Result<()> {
+        let c = self;
         ensure!(
             [1, 2, 3].contains(&c.format_version),
             "unsupported checkpoint version"
@@ -230,6 +506,10 @@ impl Checkpoint {
         ensure!(
             c.spectral_weight.is_finite() && (0. ..=100.).contains(&c.spectral_weight),
             "invalid spectral weight"
+        );
+        ensure!(
+            c.weight_decay.is_finite() && (0. ..=10.).contains(&c.weight_decay),
+            "invalid weight decay"
         );
         c.time_sampling.validate()?;
         c.lr_schedule.validate(c.adam.lr)?;
@@ -274,10 +554,25 @@ impl Checkpoint {
             "invalid checkpoint audio configuration"
         );
         ensure!(
-            format!("{:x}", Sha256::digest(serde_json::to_vec(&c.model)?)) == c.model_hash,
-            "checkpoint model hash mismatch"
+            c.horizon_samples.len() <= 16
+                && c.horizon_samples.iter().all(|&s| {
+                    (32..=crate::model::MAX_WINDOW_SAMPLES).contains(&s)
+                        && s.is_multiple_of(c.model.architecture.block)
+                }),
+            "invalid checkpoint crop horizon samples"
         );
-        Ok(c)
+        ensure!(
+            c.horizon_schedule.is_fixed()
+                || (!c.horizon_samples.is_empty() && c.horizon_total_steps > 0),
+            "invalid checkpoint horizon schedule configuration"
+        );
+        if verify_json_hash {
+            ensure!(
+                format!("{:x}", Sha256::digest(serde_json::to_vec(&c.model)?)) == c.model_hash,
+                "checkpoint model hash mismatch"
+            );
+        }
+        Ok(())
     }
 }
 #[derive(Clone)]
@@ -309,6 +604,14 @@ pub struct TrainConfig {
     pub lr_schedule: LrSchedule,
     /// Exponential moving average decay for inference weights; 0 disables EMA.
     pub ema_decay: f32,
+    /// Decoupled AdamW weight decay on 2D weights / conv kernels (`0.` disables).
+    pub weight_decay: f32,
+    /// Multi-scale crop horizons in seconds; empty preserves fixed `crop_seconds`.
+    pub crop_horizons: Vec<f32>,
+    /// Multi-scale crop horizon scheduling across training steps.
+    pub horizon_schedule: HorizonSchedule,
+    /// Total schedule steps for ordered multi-horizon schedules; `None` uses `steps`.
+    pub horizon_steps: Option<usize>,
     /// Crops per optimizer step. The loss and gradients are averaged over the batch.
     pub batch: usize,
     /// Optional held-out corpus for periodic validation. Unset means train-set probes only.
@@ -322,6 +625,7 @@ fn evaluation(
     dataset: &Dataset,
     n: usize,
 ) -> f32 {
+    let ch = field.channels();
     let mut rng = Rng::new(901);
     let mut sum = 0.;
     for _ in 0..4 {
@@ -329,8 +633,10 @@ fn evaluation(
         if clean.is_empty() {
             return f32::NAN;
         }
-        let (mask, _) = conditioning::training_mask(n, &mut rng);
-        let noise: Vec<f32> = (0..n).map(|_| rng.normal() * flow.prior_std()).collect();
+        let (mask, _) = conditioning::training_mask_channels(n, ch, &mut rng);
+        let noise: Vec<f32> = (0..clean.len())
+            .map(|_| rng.normal() * flow.prior_std())
+            .collect();
         sum += parameterization::loss(field, flow, &clean, &mask, &noise, 0.5);
     }
     sum / 4.
@@ -377,7 +683,7 @@ fn preview_sample(
     n: usize,
     cached: Option<&crate::sampler::DeviceVelocity<'_>>,
 ) -> Result<Vec<f32>> {
-    let zeros = vec![0.; n];
+    let zeros = vec![0.; n * ck.channels()];
     let model = ck.sampling_model(true);
     match c.backend.as_str() {
         "cuda" => {
@@ -447,29 +753,85 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         c.ema_decay.is_finite() && c.ema_decay >= 0. && c.ema_decay < 1.,
         "EMA decay must be finite and in [0, 1)"
     );
+    ensure!(
+        c.weight_decay.is_finite() && (0. ..=10.).contains(&c.weight_decay),
+        "weight decay must be finite and 0..10"
+    );
+    ensure!(
+        c.horizon_schedule.is_fixed() || !c.crop_horizons.is_empty(),
+        "multi-horizon schedule requires --crop-horizons"
+    );
+    ensure!(
+        !(c.horizon_schedule.is_fixed() && c.crop_horizons.len() > 1),
+        "multiple --crop-horizons require --horizon-schedule random|short-to-long|long-to-short"
+    );
+    ensure!(
+        c.crop_horizons.len() <= 16,
+        "at most 16 crop horizons are supported"
+    );
     c.architecture.validate()?;
     c.flow.validate()?;
     c.preprocess.validate()?;
+    ensure!(
+        c.architecture.channels == c.preprocess.channels(),
+        "architecture channel count ({}) does not match preprocessing channel mode ({})",
+        c.architecture.channels,
+        c.preprocess.channel
+    );
     ensure!(
         c.preview_every > 0 && c.checkpoint_every > 0 && c.validation_every > 0,
         "intervals must be positive"
     );
     ensure!((1..=64).contains(&c.batch), "batch size must be 1..64");
     let b = c.architecture.block;
-    let n = ((c.crop_seconds * c.preprocess.sample_rate as f32).round() as usize).div_ceil(b) * b;
-    ensure!(
-        n <= crate::model::MAX_WINDOW_SAMPLES,
-        "rounded crop ({n} samples) exceeds maximum window ({})",
-        crate::model::MAX_WINDOW_SAMPLES
-    );
+    let round_crop = |secs: f32| -> Result<usize> {
+        ensure!(
+            secs.is_finite()
+                && (0.032..=32.).contains(&secs)
+                && (secs * c.preprocess.sample_rate as f32) as usize
+                    <= crate::model::MAX_WINDOW_SAMPLES,
+            "crop seconds ({secs}) must be 0.032..32 and fit the maximum window"
+        );
+        let rounded = ((secs * c.preprocess.sample_rate as f32).round() as usize).div_ceil(b) * b;
+        ensure!(
+            rounded <= crate::model::MAX_WINDOW_SAMPLES,
+            "rounded crop ({rounded} samples) exceeds maximum window ({})",
+            crate::model::MAX_WINDOW_SAMPLES
+        );
+        Ok(rounded)
+    };
+    let n = round_crop(c.crop_seconds)?;
+    let mut horizon_samples = Vec::with_capacity(c.crop_horizons.len());
+    for &secs in &c.crop_horizons {
+        horizon_samples.push(round_crop(secs)?);
+    }
+    horizon_samples.sort_unstable();
+    horizon_samples.dedup();
+    let horizon_total_steps = if c.horizon_schedule.is_fixed() {
+        0
+    } else {
+        let hs = c.horizon_steps.unwrap_or(c.steps);
+        ensure!(hs > 0, "horizon steps must be positive");
+        hs
+    };
+    let samples_budget = n * c.batch;
+    let horizon_pairs: Vec<(usize, usize)> = if horizon_samples.is_empty() {
+        vec![(n, c.batch)]
+    } else {
+        horizon_samples
+            .iter()
+            .map(|&hn| (hn, (samples_budget / hn).clamp(1, 64)))
+            .collect()
+    };
+    let max_n = horizon_pairs.iter().map(|&(hn, _)| hn).max().unwrap_or(n);
     let pre_start = Instant::now();
-    let dataset = Dataset::load(&c.input, c.preprocess.clone(), n)?;
+    let dataset = Dataset::load(&c.input, c.preprocess.clone(), max_n)?;
     // Fixed probes and validation always use at most a 4 s window, whatever the training crop is.
     // Two reasons: the CPU reference evaluation costs parameters x window, which at a 16 s crop is
     // minutes per probe, and a constant window keeps `validation_loss` comparable across runs that
     // train at different crop lengths. It is a duration rather than a sample count so the window
     // covers the same span of audio at every rate; 64,000 samples was 4 s only at 16 kHz.
-    let eval_n = probe_window_samples(c.preprocess.sample_rate, n, b);
+    let eval_n = probe_window_samples(c.preprocess.sample_rate, max_n, b);
     let validation = match &c.validation {
         Some(path) => Some(Dataset::load(path, c.preprocess.clone(), eval_n)?),
         None => None,
@@ -514,6 +876,10 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
             ck.time_sampling = c.time_sampling;
             ck.lr_schedule = c.lr_schedule;
             ck.ema_decay = c.ema_decay;
+            ck.weight_decay = c.weight_decay;
+            ck.horizon_samples = horizon_samples.clone();
+            ck.horizon_schedule = c.horizon_schedule;
+            ck.horizon_total_steps = horizon_total_steps;
             ck.ema_weights = if c.ema_decay > 0. {
                 ck.model.parameters()
             } else {
@@ -554,6 +920,18 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
                 ck.ema_decay,
                 c.ema_decay
             );
+            ensure!(
+                ck.weight_decay == c.weight_decay,
+                "full resume requires the same weight decay ({} vs {})",
+                ck.weight_decay,
+                c.weight_decay
+            );
+            ensure!(
+                ck.horizon_samples == horizon_samples
+                    && ck.horizon_schedule == c.horizon_schedule
+                    && ck.horizon_total_steps == horizon_total_steps,
+                "full resume requires the same crop horizon schedule"
+            );
         }
         ck
     } else {
@@ -572,6 +950,10 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
             time_sampling: c.time_sampling,
             lr_schedule: c.lr_schedule,
             ema_decay: c.ema_decay,
+            weight_decay: c.weight_decay,
+            horizon_samples: horizon_samples.clone(),
+            horizon_schedule: c.horizon_schedule,
+            horizon_total_steps,
             ema_weights,
             model,
             adam,
@@ -610,12 +992,17 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
                 }
                 desc
             },
-            representation: "f32 mono waveform; lossless time-major blocks".into(),
+            representation: if c.architecture.channels == 2 {
+                "f32 interleaved stereo waveform [L,R]; lossless time-major blocks".into()
+            } else {
+                "f32 mono waveform; lossless time-major blocks".into()
+            },
             model_hash: String::new(),
             unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         }
     };
-    let mut trainer = Trainer::new(&c.backend, &ck.model, &ck.adam, n, &ck.flow, c.batch)?;
+    let mut trainer =
+        Trainer::new_with_horizons(&c.backend, &ck.model, &ck.adam, &horizon_pairs, &ck.flow)?;
     trainer.configure_ema(ck.ema_decay, &ck.ema_weights)?;
     if let Some(parent) = c.run.parent() {
         fs::create_dir_all(parent)?;
@@ -627,10 +1014,24 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         )
     })?;
     let current_source = source_hash()?;
-    write_json(
-        &c.run.join("run.json"),
-        &serde_json::json!({"git_commit":git(&["rev-parse","HEAD"]),"git_dirty":!git(&["status","--porcelain"]).is_empty(),"source_hash":current_source,"dataset":dataset.identity,"parameters":ck.model.count(),"architecture":ck.model.architecture,"crop_samples":n,"batch":c.batch,"samples_per_step":n*c.batch,"validation_input":c.validation,"sample_rate":ck.sample_rate,"additional_steps":c.steps,"seed":c.seed,"lr":ck.adam.lr,"lr_schedule":ck.lr_schedule,"time_sampling":ck.time_sampling,"ema_decay":ck.ema_decay,"spectral_weight":ck.spectral_weight,"optimizer":"Adam beta1=.9 beta2=.999 eps=1e-8 global gradient clip=1","resume":c.resume,"weights_only":c.weights_only,"backend":trainer.name(),"backend_info":trainer.info(),"objective":ck.objective,"representation":ck.representation,"flow":ck.flow,"detail":ck.detail}),
-    )?;
+    let ch = ck.channels();
+    let mut run_json = serde_json::json!({"git_commit":git(&["rev-parse","HEAD"]),"git_dirty":!git(&["status","--porcelain"]).is_empty(),"source_hash":current_source,"dataset":dataset.identity,"parameters":ck.model.count(),"architecture":ck.model.architecture,"channels":ch,"crop_samples":n,"batch":c.batch,"samples_per_step":n*c.batch,"validation_input":c.validation,"sample_rate":ck.sample_rate,"additional_steps":c.steps,"seed":c.seed,"lr":ck.adam.lr,"lr_schedule":ck.lr_schedule,"time_sampling":ck.time_sampling,"ema_decay":ck.ema_decay,"spectral_weight":ck.spectral_weight,"optimizer":"AdamW beta1=.9 beta2=.999 eps=1e-8 global gradient clip=1","resume":c.resume,"weights_only":c.weights_only,"backend":trainer.name(),"backend_info":trainer.info(),"objective":ck.objective,"representation":ck.representation,"flow":ck.flow,"detail":ck.detail});
+    if let Some(obj) = run_json.as_object_mut() {
+        obj.insert("weight_decay".into(), serde_json::json!(ck.weight_decay));
+        obj.insert(
+            "horizon_samples".into(),
+            serde_json::json!(ck.horizon_samples),
+        );
+        obj.insert(
+            "horizon_schedule".into(),
+            serde_json::json!(ck.horizon_schedule),
+        );
+        obj.insert(
+            "horizon_total_steps".into(),
+            serde_json::json!(ck.horizon_total_steps),
+        );
+    }
+    write_json(&c.run.join("run.json"), &run_json)?;
     ck.save(&c.run.join("initial.json"))?;
     let cached_eval = if c.backend == "cuda" {
         Some(make_cuda_velocity(&ck, eval_n)?)
@@ -651,10 +1052,11 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     let start = Instant::now();
     let initial_audio = preview_sample(&ck, &c, &sample_config, n, preview_field)?;
     sampling_ms += start.elapsed().as_secs_f64() * 1000.;
-    audio::write_wav(
+    audio::write_wav_channels(
         &c.run.join("untrained-or-resumed-initial.wav"),
         &initial_audio,
         ck.sample_rate,
+        ch,
     )?;
     write_json(&c.run.join("preview-config.json"), &sample_config)?;
     let initial_eval =
@@ -694,23 +1096,46 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     let mut silence_retries = 0usize;
     let training_start = Instant::now();
     eprintln!(
-        "FERAL training: {} parameters, {} samples/crop, {} files, preprocessing {:.1} ms",
+        "FERAL training: {} parameters, {}ch, {} frames/crop, {} files, preprocessing {:.1} ms",
         ck.model.count(),
+        ch,
         n,
         dataset.audio.len(),
         preprocessing_ms
     );
-    let items = c.batch;
+    let max_items = horizon_pairs
+        .iter()
+        .map(|&(_, hi)| hi)
+        .max()
+        .unwrap_or(c.batch);
+    let samples_cap = horizon_pairs
+        .iter()
+        .map(|&(hn, hi)| hn * hi * ch)
+        .max()
+        .unwrap_or(n * c.batch * ch);
     let debug_timing = std::env::var_os("FERAL_DEBUG_TIMING").is_some();
-    let mut clean_batch: Vec<f32> = Vec::with_capacity(items * n);
-    let mut mask_batch: Vec<f32> = Vec::with_capacity(items * n);
-    let mut noise_batch: Vec<f32> = Vec::with_capacity(items * n);
-    let mut t_batch: Vec<f32> = Vec::with_capacity(items);
-    let mut batch_tasks: Vec<&'static str> = Vec::with_capacity(items);
-    let mut batch_sources: Vec<usize> = Vec::with_capacity(items);
-    let mut batch_starts: Vec<usize> = Vec::with_capacity(items);
+    let mut clean_batch: Vec<f32> = Vec::with_capacity(samples_cap);
+    let mut mask_batch: Vec<f32> = Vec::with_capacity(samples_cap);
+    let mut noise_batch: Vec<f32> = Vec::with_capacity(samples_cap);
+    let mut t_batch: Vec<f32> = Vec::with_capacity(max_items);
+    let mut batch_tasks: Vec<&'static str> = Vec::with_capacity(max_items);
+    let mut batch_sources: Vec<usize> = Vec::with_capacity(max_items);
+    let mut batch_starts: Vec<usize> = Vec::with_capacity(max_items);
     for local in 1..=c.steps {
         let start = Instant::now();
+        let horizon_idx = if horizon_pairs.len() == 1 || ck.horizon_schedule.is_fixed() {
+            0
+        } else {
+            ck.horizon_schedule.select_index(
+                horizon_pairs.len(),
+                ck.completed_steps + 1,
+                ck.horizon_total_steps,
+                &mut ck.rng,
+            )
+        };
+        let (step_n, step_items) = horizon_pairs[horizon_idx];
+        let step_scalars = step_n * ch;
+        trainer.set_shape(step_n, step_items)?;
         clean_batch.clear();
         mask_batch.clear();
         noise_batch.clear();
@@ -721,10 +1146,10 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         let mut t_crop = 0f64;
         let mut t_mask = 0f64;
         let mut t_noise = 0f64;
-        for _ in 0..items {
+        for _ in 0..step_items {
             let mark = Instant::now();
             let crop = dataset
-                .crop_traced_into(n, &mut ck.rng, &mut clean_batch)
+                .crop_traced_into(step_n, &mut ck.rng, &mut clean_batch)
                 .context(
                     "16 crop attempts were silent; reduce --silence-rms or select useful audio",
                 )?;
@@ -733,15 +1158,16 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
             t_crop += mark.elapsed().as_secs_f64() * 1000.;
             let mark = Instant::now();
             let mask_start = mask_batch.len();
-            mask_batch.resize(mask_start + n, 0.);
-            let task = conditioning::training_mask_into(
-                &mut mask_batch[mask_start..mask_start + n],
+            mask_batch.resize(mask_start + step_scalars, 0.);
+            let task = conditioning::training_mask_channels_into(
+                &mut mask_batch[mask_start..mask_start + step_scalars],
+                ch,
                 &mut ck.rng,
             );
             *task_counts.entry(task).or_insert(0usize) += 1;
             t_mask += mark.elapsed().as_secs_f64() * 1000.;
             let mark = Instant::now();
-            noise_batch.extend((0..n).map(|_| ck.rng.normal() * ck.flow.prior_std()));
+            noise_batch.extend((0..step_scalars).map(|_| ck.rng.normal() * ck.flow.prior_std()));
             t_noise += mark.elapsed().as_secs_f64() * 1000.;
             t_batch.push(ck.time_sampling.sample(&mut ck.rng));
             batch_tasks.push(task);
@@ -770,6 +1196,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
                 detail: ck.detail,
                 spectral: ck.spectral_weight,
                 lr: step_lr,
+                weight_decay: ck.weight_decay,
             },
         )?;
         if c.backend == "cpu" && ck.ema_decay > 0. {
@@ -791,7 +1218,7 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         writeln!(
             log,
             "{}",
-            serde_json::json!({"step":ck.completed_steps,"loss":loss,"gradient_norm":norm,"lr":step_lr,"task":task,"t":t,"milliseconds":ms,"rng_state":ck.rng.state,"batch_items":items,"batch_sources":batch_sources,"batch_start_samples":batch_starts,"batch_tasks":batch_tasks,"batch_t":t_batch})
+            serde_json::json!({"step":ck.completed_steps,"loss":loss,"gradient_norm":norm,"lr":step_lr,"task":task,"t":t,"milliseconds":ms,"rng_state":ck.rng.state,"crop_samples":step_n,"batch_items":step_items,"batch_sources":batch_sources,"batch_start_samples":batch_starts,"batch_tasks":batch_tasks,"batch_t":t_batch})
         )?;
         if local == 1 || local % 10 == 0 || local == c.steps {
             eprintln!(
@@ -829,10 +1256,11 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
             let now = Instant::now();
             let x = preview_sample(&ck, &c, &sample_config, n, preview_field)?;
             sampling_ms += now.elapsed().as_secs_f64() * 1000.;
-            audio::write_wav(
+            audio::write_wav_channels(
                 &c.run.join(format!("preview-{:06}.wav", ck.completed_steps)),
                 &x,
                 ck.sample_rate,
+                ch,
             )?;
         }
         if local % c.checkpoint_every == 0 && local != c.steps {
@@ -866,13 +1294,18 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
     let now = Instant::now();
     let final_audio = preview_sample(&ck, &c, &sample_config, n, preview_field)?;
     let final_sampling_ms = now.elapsed().as_secs_f64() * 1000.;
-    audio::write_wav(&c.run.join("generated.wav"), &final_audio, ck.sample_rate)?;
+    audio::write_wav_channels(
+        &c.run.join("generated.wav"),
+        &final_audio,
+        ck.sample_rate,
+        ch,
+    )?;
     let delta = initial_audio
         .iter()
         .zip(&final_audio)
         .map(|(a, b)| (a - b).powi(2))
         .sum::<f32>()
-        / n as f32;
+        / (n * ch) as f32;
     let out = c.run.join("checkpoint.json");
     ck.save(&out)?;
     step_ms.sort_by(|a, b| a.total_cmp(b));
@@ -886,6 +1319,20 @@ pub fn train(c: TrainConfig) -> Result<PathBuf> {
         obj.insert("lr_schedule".into(), serde_json::json!(ck.lr_schedule));
         obj.insert("ema_decay".into(), serde_json::json!(ck.ema_decay));
         obj.insert("using_ema".into(), serde_json::json!(ck.has_ema()));
+        obj.insert("weight_decay".into(), serde_json::json!(ck.weight_decay));
+        obj.insert(
+            "horizon_samples".into(),
+            serde_json::json!(ck.horizon_samples),
+        );
+        obj.insert(
+            "horizon_schedule".into(),
+            serde_json::json!(ck.horizon_schedule),
+        );
+        obj.insert(
+            "horizon_total_steps".into(),
+            serde_json::json!(ck.horizon_total_steps),
+        );
+        obj.insert("channels".into(), serde_json::json!(ch));
     }
     write_json(&c.run.join("metrics.json"), &metrics)?;
     eprintln!(
@@ -948,6 +1395,7 @@ pub fn ensure_protected(output: &[f32], known: &[f32], mask: &[f32], mode: &str)
 }
 pub fn render(c: RenderConfig) -> Result<()> {
     let ck = Checkpoint::load(&c.checkpoint)?;
+    let ch = ck.channels();
     c.sampling.validate()?;
     ensure!(
         ["cpu", "cuda"].contains(&c.backend.as_str()),
@@ -959,8 +1407,8 @@ pub fn render(c: RenderConfig) -> Result<()> {
         "output or metadata already exists; choose a new name"
     );
     ensure!(
-        c.seconds.is_finite() && (0.01..=5.).contains(&c.seconds),
-        "seconds must be 0.01..5"
+        c.seconds.is_finite() && (0.01..=16.).contains(&c.seconds),
+        "seconds must be 0.01..16"
     );
     let start_time = Instant::now();
     let sr = ck.sample_rate;
@@ -970,7 +1418,11 @@ pub fn render(c: RenderConfig) -> Result<()> {
         max_seconds: c.max_input_seconds,
         normalize: false,
         silence_rms: 0.,
-        channel: "mix".into(),
+        channel: if ch == 2 {
+            "stereo".into()
+        } else {
+            "mix".into()
+        },
     };
     p.validate()?;
     ensure!(
@@ -989,69 +1441,79 @@ pub fn render(c: RenderConfig) -> Result<()> {
     let mut prefix = Vec::new();
     let mut suffix = Vec::new();
     let (mut known, mut mask, output_len, offset) = match c.mode {
-        Mode::Generate => (vec![0.; additional], vec![0.; additional], additional, 0),
+        Mode::Generate => (
+            vec![0.; additional * ch],
+            vec![0.; additional * ch],
+            additional,
+            0,
+        ),
         Mode::Variation => {
             let x = input.context("variation needs --input")?;
+            let n = x.len() / ch;
             ensure!(
-                x.len() <= crate::model::MAX_WINDOW_SAMPLES,
+                n <= crate::model::MAX_WINDOW_SAMPLES,
                 "variation limited to the maximum window; crop source first"
             );
-            let n = x.len();
-            (x, vec![0.; n], n, 0)
+            (x, vec![0.; n * ch], n, 0)
         }
         Mode::Continue => {
             let x = input.context("continue needs --input")?;
-            let context = (ck.crop_samples / 2).min(x.len());
-            let offset = x.len() - context;
-            prefix = x[..offset].to_vec();
-            let mut known = x[offset..].to_vec();
-            let mut mask = vec![1.; context];
-            known.resize(context + additional, 0.);
+            let x_frames = x.len() / ch;
+            let context = (ck.crop_samples / 2).min(x_frames);
+            let offset = x_frames - context;
+            prefix = x[..offset * ch].to_vec();
+            let mut known = x[offset * ch..].to_vec();
+            let mut mask = vec![1.; context * ch];
+            known.resize((context + additional) * ch, 0.);
             mask.resize(known.len(), 0.);
-            let n = known.len();
+            let n = context + additional;
             (known, mask, n, offset)
         }
         Mode::Inpaint => {
             let x = input.context("inpaint needs --input")?;
+            let x_frames = x.len() / ch;
             ensure!(
                 c.start.is_finite()
                     && c.end.is_finite()
                     && c.start >= 0.
                     && c.end > c.start
-                    && c.end <= x.len() as f32 / sr as f32,
+                    && c.end <= x_frames as f32 / sr as f32,
                 "invalid inpaint interval"
             );
             let a = (c.start * sr as f32).round() as usize;
             let b = (c.end * sr as f32).round() as usize;
-            ensure!(b > a && b <= x.len(), "empty/out of range inpaint interval");
+            ensure!(
+                b > a && b <= x_frames,
+                "empty/out of range inpaint interval"
+            );
             let collar = ck.crop_samples / 4;
             let left = a.saturating_sub(collar);
-            let right = (b + collar).min(x.len());
-            prefix = x[..left].to_vec();
-            suffix = x[right..].to_vec();
-            let known = x[left..right].to_vec();
+            let right = (b + collar).min(x_frames);
+            prefix = x[..left * ch].to_vec();
+            suffix = x[right * ch..].to_vec();
+            let known = x[left * ch..right * ch].to_vec();
             let mut mask = vec![1.; known.len()];
-            mask[a - left..b - left].fill(0.);
-            let n = known.len();
+            mask[(a - left) * ch..(b - left) * ch].fill(0.);
+            let n = right - left;
             (known, mask, n, left)
         }
     };
     let preprocess_ms = start_time.elapsed().as_secs_f64() * 1000.;
-    let n = known.len().div_ceil(block) * block;
+    let n = output_len.div_ceil(block) * block;
     ensure!(
         n <= crate::model::MAX_WINDOW_SAMPLES,
         "conditioned window exceeds the maximum window; request a shorter interval"
     );
-    known.resize(n, 0.);
-    mask.resize(n, 0.);
+    known.resize(n * ch, 0.);
+    mask.resize(n * ch, 0.);
     // Variation uses explicit protected anchors and the same masked flow path.
     let now = Instant::now();
     if matches!(c.mode, Mode::Variation) {
         // Experimental disconnected anchors; training uses contiguous mask patterns.
         let stride = (sr as usize / 32).max(block);
-        for (i, m) in mask.iter_mut().take(output_len).enumerate() {
-            if (i / stride) % 4 == 0 {
-                *m = 1.;
+        for f in 0..output_len {
+            if (f / stride) % 4 == 0 {
+                mask[f * ch..(f + 1) * ch].fill(1.);
             }
         }
     }
@@ -1075,7 +1537,11 @@ pub fn render(c: RenderConfig) -> Result<()> {
         other => anyhow::bail!("sampling backend must be cpu or cuda, got {other}"),
     };
     let sampling_ms = now.elapsed().as_secs_f64() * 1000.;
-    let jumps = conditioning::boundary_jumps(&output[..output_len], &mask[..output_len]);
+    let jumps = conditioning::boundary_jumps_channels(
+        &output[..output_len * ch],
+        &mask[..output_len * ch],
+        ch,
+    );
     let mode_label = match c.mode {
         Mode::Generate => "generate",
         Mode::Continue => "continue",
@@ -1086,14 +1552,14 @@ pub fn render(c: RenderConfig) -> Result<()> {
     // The check above refuses any changed protected sample, so a written take is always exact.
     // The field stays in the JSON because readers and existing reports key on it.
     let preserved = true;
-    output.truncate(output_len);
+    output.truncate(output_len * ch);
     let mut all = prefix;
     all.extend(output);
     all.extend(suffix);
-    audio::write_wav(&c.output, &all, sr)?;
+    audio::write_wav_channels(&c.output, &all, sr, ch)?;
     write_json(
         &c.output.with_extension("json"),
-        &serde_json::json!({"project":"FERAL","mode":match c.mode{Mode::Generate=>"generate",Mode::Continue=>"continue",Mode::Inpaint=>"inpaint",Mode::Variation=>"variation-masked-anchors"},"checkpoint":c.checkpoint,"checkpoint_sha256":data::hash_file(&c.checkpoint)?,"model_hash":ck.model_hash,"flow":ck.flow,"training_steps":ck.completed_steps,"git_commit":git(&["rev-parse","HEAD"]),"input":c.input,"input_sha256":input_hash,"preprocess":p,"sampling":c.sampling,"sampling_backend":c.backend,"using_ema":using_ema,"sample_rate":sr,"output_samples":all.len(),"window_offset_samples":offset,"inpaint_start":c.start,"inpaint_end":c.end,"preprocessing_ms":preprocess_ms,"sampling_ms":sampling_ms,"peak_rss_kib":peak_rss_kib(),"protected_samples_exact":preserved,"boundary_jumps":jumps,"rms":audio::rms(&all),"output_sha256":data::hash_file(&c.output)?}),
+        &serde_json::json!({"project":"FERAL","mode":match c.mode{Mode::Generate=>"generate",Mode::Continue=>"continue",Mode::Inpaint=>"inpaint",Mode::Variation=>"variation-masked-anchors"},"checkpoint":c.checkpoint,"checkpoint_sha256":data::hash_file(&c.checkpoint)?,"model_hash":ck.model_hash,"flow":ck.flow,"training_steps":ck.completed_steps,"git_commit":git(&["rev-parse","HEAD"]),"input":c.input,"input_sha256":input_hash,"preprocess":p,"sampling":c.sampling,"sampling_backend":c.backend,"using_ema":using_ema,"sample_rate":sr,"channels":ch,"output_samples":all.len()/ch,"window_offset_samples":offset,"inpaint_start":c.start,"inpaint_end":c.end,"preprocessing_ms":preprocess_ms,"sampling_ms":sampling_ms,"peak_rss_kib":peak_rss_kib(),"protected_samples_exact":preserved,"boundary_jumps":jumps,"rms":audio::rms(&all),"output_sha256":data::hash_file(&c.output)?}),
     )?;
     eprintln!(
         "wrote {} | {:.1} ms sampling | protected exact={}",

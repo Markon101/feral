@@ -3,7 +3,8 @@ use feral::{
     conditioning,
     data::Dataset,
     flow::{self, Sampling},
-    model::{Architecture, Model, Velocity},
+    model::{Architecture, BlockStyle, Model, Velocity},
+    parameterization::HorizonSchedule,
     rng::Rng,
     runtime::{self, Adam, Checkpoint, Mode, RenderConfig, TrainConfig},
 };
@@ -31,6 +32,7 @@ fn tiny() -> Model {
             scales: vec![],
             sample_conv: 0,
             block_style: feral::model::BlockStyle::Tanh,
+            channels: 1,
         },
         7,
     )
@@ -256,6 +258,10 @@ fn config(root: &Path, run: &str, steps: usize, resume: Option<PathBuf>) -> Trai
         time_sampling: feral::parameterization::TimeSampling::Uniform,
         lr_schedule: feral::parameterization::LrSchedule::Constant,
         ema_decay: 0.,
+        weight_decay: 0.,
+        crop_horizons: vec![],
+        horizon_schedule: HorizonSchedule::Fixed,
+        horizon_steps: None,
         backend: "cpu".into(),
         input: root.join("corpus"),
         run: root.join(run),
@@ -279,6 +285,7 @@ fn config(root: &Path, run: &str, steps: usize, resume: Option<PathBuf>) -> Trai
             scales: vec![],
             sample_conv: 0,
             block_style: feral::model::BlockStyle::Tanh,
+            channels: 1,
         },
     }
 }
@@ -409,6 +416,7 @@ fn pyramid_gradients_shapes_and_partial_pool_groups() {
         scales: vec![1, 2, 4],
         sample_conv: 0,
         block_style: feral::model::BlockStyle::Tanh,
+        channels: 1,
     };
     a.validate().unwrap();
     let mut m = Model::new(a, 7);
@@ -886,6 +894,7 @@ fn sample_conv_gradients_match_finite_differences_and_no_leakage() {
         scales: vec![1, 2],
         sample_conv: 0,
         block_style: feral::model::BlockStyle::Tanh,
+        channels: 1,
     };
     let sc_arch = base_arch.clone().with_sample_conv(7).unwrap();
     assert_eq!(
@@ -1076,6 +1085,7 @@ fn gated_film_symmetric_dilations_match_finite_differences_and_resume() {
         scales: vec![1, 2, 1],
         sample_conv: 5,
         block_style: BlockStyle::GatedFilm,
+        channels: 1,
     };
     arch.validate().unwrap();
     let mut m = Model::new(arch, 13);
@@ -1162,6 +1172,7 @@ fn gated_film_symmetric_dilations_match_finite_differences_and_resume() {
             scales: vec![],
             sample_conv: 5,
             block_style: BlockStyle::GatedFilm,
+            channels: 1,
         };
         c.spectral_weight = 0.25;
         c.time_sampling = TimeSampling::LogitNormal { mean: 0., std: 1. };
@@ -1183,5 +1194,491 @@ fn gated_film_symmetric_dilations_match_finite_differences_and_resume() {
     assert_eq!(a.adam.m, b.adam.m);
     assert_eq!(a.adam.v, b.adam.v);
     assert_eq!(a.rng.state, b.rng.state);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn glu_film_and_adamw_weight_decay_match_finite_differences_and_mask() {
+    use feral::parameterization::{self, FlowConfig};
+    use feral::spectral::SpectralEngine;
+    let flow = FlowConfig::Preconditioned {
+        data_scale: 0.16,
+        prior_std: 0.16,
+    };
+    let mut m = Model::new(
+        Architecture {
+            block: 4,
+            width: 6,
+            dilations: vec![1, 2, 1],
+            scales: vec![],
+            sample_conv: 5,
+            block_style: BlockStyle::GluFilm,
+            channels: 1,
+        },
+        41,
+    );
+    let mask_wd = m.weight_decay_mask();
+    let expected_wd: Vec<f32> = m
+        .layers
+        .iter()
+        .chain(&m.time_proj)
+        .chain(&m.stem)
+        .chain(&m.head)
+        .flat_map(|l| {
+            std::iter::repeat_n(1.0f32, l.w.len()).chain(std::iter::repeat_n(0.0f32, l.b.len()))
+        })
+        .collect();
+    assert_eq!(mask_wd, expected_wd);
+
+    let n = 32;
+    let mut rng = Rng::new(13);
+    let y: Vec<f32> = (0..n).map(|_| rng.normal() * 0.2).collect();
+    let z: Vec<f32> = (0..n).map(|_| rng.normal() * 0.16).collect();
+    let mut mask = vec![0.; n];
+    mask[..8].fill(1.);
+    let t = 0.61;
+    let engine = SpectralEngine::default();
+    let (_, g) = parameterization::loss_gradient_with_spectral(
+        &m, &flow, &y, &mask, &z, t, 0.5, 0.25, &engine,
+    );
+    let p = m.parameters();
+    let eps = 1e-3f32;
+    let step = (p.len() / 32).max(1);
+    for i in (0..p.len()).step_by(step) {
+        let mut q = p.clone();
+        q[i] += eps;
+        m.set_parameters(&q);
+        let hi = parameterization::loss_gradient_with_spectral(
+            &m, &flow, &y, &mask, &z, t, 0.5, 0.25, &engine,
+        )
+        .0;
+        q[i] -= 2. * eps;
+        m.set_parameters(&q);
+        let lo = parameterization::loss_gradient_with_spectral(
+            &m, &flow, &y, &mask, &z, t, 0.5, 0.25, &engine,
+        )
+        .0;
+        let fd = (hi - lo) / (2. * eps);
+        assert!(
+            (fd - g[i]).abs() < 1e-3 + 0.03 * fd.abs(),
+            "glu-film grad[{i}]: analytic={} fd={fd}",
+            g[i]
+        );
+    }
+    m.set_parameters(&p);
+
+    // Zero leakage of unknown clean audio.
+    let mut altered = y.clone();
+    for (v, &k) in altered.iter_mut().zip(&mask) {
+        if k == 0. {
+            *v += 50.;
+        }
+    }
+    assert_eq!(
+        m.velocity(&z, &y, &mask, 0.5),
+        m.velocity(&z, &altered, &mask, 0.5)
+    );
+
+    // AdamW decoupled weight decay decays weights (mask=1) and leaves biases (mask=0) untouched.
+    let mut adam = Adam::new(m.count(), 0.01);
+    let mut p_init = p.clone();
+    for (i, v) in p_init.iter_mut().enumerate() {
+        if mask_wd[i] == 0. {
+            *v = 0.25;
+        }
+    }
+    m.set_parameters(&p_init);
+    let zero_grad = vec![0.0f32; m.count()];
+    adam.update_with_lr_wd(&mut m, &zero_grad, 0.01, 0.5, Some(&mask_wd))
+        .unwrap();
+    let p_after = m.parameters();
+    for i in 0..p_after.len() {
+        let expected = if mask_wd[i] > 0. {
+            p_init[i] * (1. - 0.01 * 0.5)
+        } else {
+            p_init[i]
+        };
+        assert!(
+            (p_after[i] - expected).abs() <= 1e-7,
+            "AdamW param[{i}] got={} expected={expected}",
+            p_after[i]
+        );
+    }
+}
+
+#[test]
+fn binary_checkpoint_roundtrip_tamper_gate_and_full_resume() {
+    use feral::parameterization::{FlowConfig, LrSchedule, TimeSampling};
+    let dir = temp();
+    audio::synthetic(&dir.join("corpus"), 16000).unwrap();
+    let make = |name: &str, steps: usize, resume: Option<PathBuf>| {
+        let mut c = config(&dir, name, steps, resume);
+        c.flow = FlowConfig::Preconditioned {
+            data_scale: 0.16,
+            prior_std: 0.16,
+        };
+        c.architecture = Architecture {
+            block: 4,
+            width: 6,
+            dilations: vec![1, 2, 1],
+            scales: vec![],
+            sample_conv: 5,
+            block_style: BlockStyle::GluFilm,
+            channels: 1,
+        };
+        c.spectral_weight = 1.0;
+        c.weight_decay = 0.02;
+        c.time_sampling = TimeSampling::LogitNormal { mean: 0., std: 1. };
+        c.lr_schedule = LrSchedule::Cosine {
+            warmup_steps: 2,
+            total_steps: 6,
+            min_lr: 1e-4,
+        };
+        c.ema_decay = 0.9;
+        c
+    };
+    let all = runtime::train(make("all", 4, None)).unwrap();
+    let first = runtime::train(make("first", 2, None)).unwrap();
+
+    let mut ck_first = Checkpoint::load(&first).unwrap();
+    let bin_path = dir.join("first-bin.ck");
+    ck_first.save_binary(&bin_path).unwrap();
+    let raw = fs::read(&bin_path).unwrap();
+    assert_eq!(&raw[..8], b"FERALCK1");
+
+    let ck_loaded = Checkpoint::load(&bin_path).unwrap();
+    assert_eq!(ck_loaded.model.parameters(), ck_first.model.parameters());
+    assert_eq!(ck_loaded.adam.m, ck_first.adam.m);
+    assert_eq!(ck_loaded.adam.v, ck_first.adam.v);
+    assert_eq!(ck_loaded.ema_weights, ck_first.ema_weights);
+    assert_eq!(ck_loaded.weight_decay, 0.02);
+    assert_eq!(ck_loaded.rng.state, ck_first.rng.state);
+
+    let mut tampered = raw.clone();
+    let mid = tampered.len() - 17;
+    tampered[mid] ^= 0x55;
+    let bad_path = dir.join("tampered.ck");
+    fs::write(&bad_path, &tampered).unwrap();
+    assert!(Checkpoint::load(&bad_path).is_err());
+
+    let resumed = runtime::train(make("resumed", 2, Some(bin_path))).unwrap();
+    let a = Checkpoint::load(&all).unwrap();
+    let b = Checkpoint::load(&resumed).unwrap();
+    assert_eq!(a.model.parameters(), b.model.parameters());
+    assert_eq!(a.ema_weights, b.ema_weights);
+    assert_eq!(a.adam.m, b.adam.m);
+    assert_eq!(a.adam.v, b.adam.v);
+    assert_eq!(a.rng.state, b.rng.state);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn multi_horizon_schedules_and_deterministic_resume() {
+    use feral::parameterization::FlowConfig;
+    let dir = temp();
+    audio::synthetic(&dir.join("corpus"), 16000).unwrap();
+    let read_crops = |run: &str| -> Vec<(usize, usize)> {
+        fs::read_to_string(dir.join(run).join("losses.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                (
+                    v["crop_samples"].as_u64().unwrap() as usize,
+                    v["batch_items"].as_u64().unwrap() as usize,
+                )
+            })
+            .collect()
+    };
+
+    let make = |name: &str,
+                schedule: HorizonSchedule,
+                steps: usize,
+                horizon_steps: Option<usize>,
+                resume: Option<PathBuf>| {
+        let mut c = config(&dir, name, steps, resume);
+        c.flow = FlowConfig::Preconditioned {
+            data_scale: 0.16,
+            prior_std: 0.16,
+        };
+        c.architecture = Architecture {
+            block: 4,
+            width: 6,
+            dilations: vec![1, 2, 1],
+            scales: vec![],
+            sample_conv: 3,
+            block_style: BlockStyle::GluFilm,
+            channels: 1,
+        };
+        c.batch = 2;
+        c.crop_seconds = 0.032; // 512 samples * 2 batch = 1024 samples/step
+        c.crop_horizons = vec![0.032, 0.064]; // (512, 2) and (1024, 1)
+        c.horizon_schedule = schedule;
+        c.horizon_steps = horizon_steps;
+        c
+    };
+
+    runtime::train(make("s2l", HorizonSchedule::ShortToLong, 4, Some(4), None)).unwrap();
+    assert_eq!(
+        read_crops("s2l"),
+        vec![(512, 2), (512, 2), (1024, 1), (1024, 1)]
+    );
+
+    runtime::train(make("l2s", HorizonSchedule::LongToShort, 4, Some(4), None)).unwrap();
+    assert_eq!(
+        read_crops("l2s"),
+        vec![(1024, 1), (1024, 1), (512, 2), (512, 2)]
+    );
+
+    let all = runtime::train(make("rand-all", HorizonSchedule::Random, 4, Some(4), None)).unwrap();
+    let first = runtime::train(make(
+        "rand-first",
+        HorizonSchedule::Random,
+        2,
+        Some(4),
+        None,
+    ))
+    .unwrap();
+    let resumed = runtime::train(make(
+        "rand-resumed",
+        HorizonSchedule::Random,
+        2,
+        Some(4),
+        Some(first),
+    ))
+    .unwrap();
+    let a = Checkpoint::load(&all).unwrap();
+    let b = Checkpoint::load(&resumed).unwrap();
+    assert_eq!(a.model.parameters(), b.model.parameters());
+    assert_eq!(a.adam.m, b.adam.m);
+    assert_eq!(a.adam.v, b.adam.v);
+    assert_eq!(a.rng.state, b.rng.state);
+    assert_eq!(read_crops("rand-all")[2..], read_crops("rand-resumed")[..]);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn stereo_glu_film_stft_detail_and_conditioning_match_finite_differences() {
+    use feral::parameterization::{self, FlowConfig};
+    use feral::spectral::SpectralEngine;
+    let flow = FlowConfig::Preconditioned {
+        data_scale: 0.16,
+        prior_std: 0.16,
+    };
+    let mut m = Model::new(
+        Architecture {
+            block: 4,
+            width: 6,
+            dilations: vec![1, 2, 1],
+            scales: vec![],
+            sample_conv: 5,
+            block_style: BlockStyle::GluFilm,
+            channels: 2,
+        },
+        89,
+    );
+    let n_frames = 32usize;
+    let total = n_frames * 2;
+    let mut rng = Rng::new(31);
+    let mut y = vec![0f32; total];
+    let mut z = vec![0f32; total];
+    for t in 0..n_frames {
+        // Asymmetric stereo L != R so L/R/M/S spectral loss exercises both channels genuinely.
+        y[2 * t] = 0.18 * (t as f32 * 0.23).sin() + 0.05 * rng.normal();
+        y[2 * t + 1] = 0.14 * (t as f32 * 0.41 + 0.6).cos() + 0.05 * rng.normal();
+        z[2 * t] = rng.normal() * 0.16;
+        z[2 * t + 1] = rng.normal() * 0.16;
+    }
+    let (mask, _) = conditioning::training_mask_channels(n_frames, 2, &mut rng);
+    for t in 0..n_frames {
+        assert_eq!(mask[2 * t], mask[2 * t + 1]);
+    }
+    let t = 0.58;
+    let engine = SpectralEngine::default();
+    let (_, g) = parameterization::loss_gradient_with_spectral(
+        &m, &flow, &y, &mask, &z, t, 0.5, 0.5, &engine,
+    );
+    let p = m.parameters();
+    let eps = 1e-3f32;
+    let step = (p.len() / 36).max(1);
+    for i in (0..p.len()).step_by(step) {
+        let mut q = p.clone();
+        q[i] += eps;
+        m.set_parameters(&q);
+        let hi = parameterization::loss_gradient_with_spectral(
+            &m, &flow, &y, &mask, &z, t, 0.5, 0.5, &engine,
+        )
+        .0;
+        q[i] -= 2. * eps;
+        m.set_parameters(&q);
+        let lo = parameterization::loss_gradient_with_spectral(
+            &m, &flow, &y, &mask, &z, t, 0.5, 0.5, &engine,
+        )
+        .0;
+        let fd = (hi - lo) / (2. * eps);
+        assert!(
+            (fd - g[i]).abs() < 1e-3 + 0.03 * fd.abs(),
+            "stereo glu-film grad[{i}]: analytic={} fd={fd}",
+            g[i]
+        );
+    }
+    m.set_parameters(&p);
+
+    // Zero leakage of unknown clean audio on either L or R.
+    let mut hole_mask = vec![0f32; total];
+    hole_mask[..16].fill(1.);
+    hole_mask[48..].fill(1.);
+    let mut altered = y.clone();
+    for (v, &k) in altered.iter_mut().zip(&hole_mask) {
+        if k == 0. {
+            *v += 40.;
+        }
+    }
+    assert_eq!(
+        m.velocity(&z, &y, &hole_mask, 0.5),
+        m.velocity(&z, &altered, &hole_mask, 0.5)
+    );
+
+    // Stereo continuity collar retains protected samples bit-exactly per channel and softens edges.
+    let mut cand = z.clone();
+    conditioning::continuity_channels(&mut cand, &y, &hole_mask, 4, 2);
+    for i in 0..total {
+        if hole_mask[i] == 1. {
+            assert_eq!(cand[i].to_bits(), y[i].to_bits());
+        }
+    }
+    assert!(!conditioning::boundary_jumps_channels(&cand, &hole_mask, 2).is_empty());
+
+    // Stereo WAV roundtrip check.
+    let dir = temp();
+    let wav_path = dir.join("stereo.wav");
+    audio::write_wav_channels(&wav_path, &y, 16000, 2).unwrap();
+    let reader = hound::WavReader::open(&wav_path).unwrap();
+    assert_eq!(reader.spec().channels, 2);
+    let read_samples: Vec<f32> = reader.into_samples::<f32>().map(Result::unwrap).collect();
+    assert_eq!(read_samples, y);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn stereo_training_binary_checkpoint_and_render_roundtrip() {
+    use feral::parameterization::{FlowConfig, LrSchedule, TimeSampling};
+    let dir = temp();
+    audio::synthetic_stereo(&dir.join("corpus"), 16000).unwrap();
+    let make = |name: &str, steps: usize, resume: Option<PathBuf>| {
+        let mut c = config(&dir, name, steps, resume);
+        c.preprocess = Preprocess {
+            channel: "stereo".into(),
+            ..Preprocess::default()
+        };
+        c.flow = FlowConfig::Preconditioned {
+            data_scale: 0.20,
+            prior_std: 0.20,
+        };
+        c.architecture = Architecture {
+            block: 4,
+            width: 6,
+            dilations: vec![1, 2, 1],
+            scales: vec![],
+            sample_conv: 5,
+            block_style: BlockStyle::GluFilm,
+            channels: 2,
+        };
+        c.spectral_weight = 0.5;
+        c.weight_decay = 0.02;
+        c.time_sampling = TimeSampling::LogitNormal { mean: 0., std: 1. };
+        c.lr_schedule = LrSchedule::Cosine {
+            warmup_steps: 2,
+            total_steps: 6,
+            min_lr: 1e-4,
+        };
+        c.ema_decay = 0.9;
+        c.batch = 2;
+        c.crop_seconds = 0.032;
+        c.crop_horizons = vec![0.032, 0.064];
+        c.horizon_schedule = HorizonSchedule::Random;
+        c.horizon_steps = Some(4);
+        c
+    };
+
+    let all = runtime::train(make("all", 4, None)).unwrap();
+    let first = runtime::train(make("first", 2, None)).unwrap();
+    let mut ck_first = Checkpoint::load(&first).unwrap();
+    assert_eq!(ck_first.channels(), 2);
+    let bin_path = dir.join("first-stereo.ck");
+    ck_first.save_binary(&bin_path).unwrap();
+    let resumed = runtime::train(make("resumed", 2, Some(bin_path))).unwrap();
+
+    let a = Checkpoint::load(&all).unwrap();
+    let b = Checkpoint::load(&resumed).unwrap();
+    assert_eq!(a.model.parameters(), b.model.parameters());
+    assert_eq!(a.ema_weights, b.ema_weights);
+    assert_eq!(a.adam.m, b.adam.m);
+    assert_eq!(a.adam.v, b.adam.v);
+    assert_eq!(a.rng.state, b.rng.state);
+
+    let gen_spec = hound::WavReader::open(dir.join("all/generated.wav"))
+        .unwrap()
+        .spec();
+    assert_eq!(gen_spec.channels, 2);
+
+    let reference = dir.join("corpus/stereo-pattern-0.wav");
+    let orig_reader = hound::WavReader::open(&reference).unwrap();
+    assert_eq!(orig_reader.spec().channels, 2);
+    let original: Vec<f32> = orig_reader
+        .into_samples::<f32>()
+        .map(Result::unwrap)
+        .collect();
+    let orig_frames = original.len() / 2;
+    let context_frames = (a.crop_samples / 2).min(orig_frames);
+
+    for (name, mode) in [
+        ("gen", Mode::Generate),
+        ("continued", Mode::Continue),
+        ("inpainted", Mode::Inpaint),
+    ] {
+        let output = dir.join(format!("{name}.wav"));
+        runtime::render(RenderConfig {
+            checkpoint: all.clone(),
+            input: if matches!(mode, Mode::Generate) {
+                None
+            } else {
+                Some(reference.clone())
+            },
+            output: output.clone(),
+            seconds: 0.064,
+            start: 0.25,
+            end: 0.35,
+            sampling: Sampling {
+                seed: 7,
+                steps: 4,
+                ..Default::default()
+            },
+            mode,
+            backend: "cpu".into(),
+            use_ema: true,
+            max_input_seconds: 600.,
+        })
+        .unwrap();
+        let rd = hound::WavReader::open(&output).unwrap();
+        assert_eq!(rd.spec().channels, 2);
+        let samples: Vec<f32> = rd.into_samples::<f32>().map(Result::unwrap).collect();
+        assert_eq!(samples.len() % 2, 0);
+        if matches!(mode, Mode::Continue) {
+            assert_eq!(&samples[..original.len()], &original[..]);
+            assert_eq!(
+                samples.len(),
+                original.len() + (0.064f32 * 16000.).round() as usize * 2
+            );
+            let _ = context_frames;
+        }
+        if matches!(mode, Mode::Inpaint) {
+            assert_eq!(samples.len(), original.len());
+            let start_s = (0.25f32 * 16000.).round() as usize * 2;
+            let end_s = (0.35f32 * 16000.).round() as usize * 2;
+            assert_eq!(&samples[..start_s], &original[..start_s]);
+            assert_eq!(&samples[end_s..], &original[end_s..]);
+        }
+    }
     fs::remove_dir_all(dir).unwrap();
 }

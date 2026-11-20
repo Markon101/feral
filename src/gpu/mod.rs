@@ -83,6 +83,10 @@ impl OpenClTrainer {
         model.validate()?;
         flow.validate()?;
         ensure!(
+            model.architecture.channels == 1,
+            "stereo audio (2 channels) is implemented on the CPU and CUDA backends only"
+        );
+        ensure!(
             model.architecture.sample_conv == 0,
             "sample-level conv stem/head is implemented on the CPU and CUDA backends only"
         );
@@ -269,6 +273,9 @@ impl OpenClTrainer {
     }
     pub fn set_lr(&mut self, lr: f32) {
         self.lr = lr;
+    }
+    pub fn matches_shape(&self, n: usize, items: usize) -> bool {
+        self.n == n && items == 1
     }
     pub fn gradients(
         &mut self,

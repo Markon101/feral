@@ -92,28 +92,42 @@ pub fn select(input: &Path) -> Result<Vec<PathBuf>> {
     paths.sort();
     paths.dedup();
     ensure!(
-        !paths.is_empty() && paths.len() <= 128,
-        "select 1..128 files per run; directory selection is nonrecursive; use a .txt manifest"
+        !paths.is_empty() && paths.len() <= 512,
+        "select 1..512 files per run; directory selection is nonrecursive; use a .txt manifest"
     );
     Ok(paths)
 }
-/// Largest decoded corpus held in host memory, in samples.
+/// Largest decoded corpus held in host memory, in samples (1 GB default = ~4.4 hours at 16 kHz;
+/// desktop runs can raise up to 4 GB via `FERAL_MAX_DATASET_MB`).
 pub const MAX_DATASET_SAMPLES: usize = 256_000_000;
+pub fn max_dataset_samples() -> usize {
+    std::env::var("FERAL_MAX_DATASET_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|mb| mb.clamp(256, 4096) * 250_000)
+        .unwrap_or(MAX_DATASET_SAMPLES)
+}
 impl Dataset {
     pub fn load(input: &Path, p: Preprocess, crop: usize) -> Result<Self> {
+        let ch = p.channels();
+        let crop_scalars = crop * ch;
         let mut audio = vec![];
         let mut sources = vec![];
         let mut rejected = vec![];
         let mut total = 0;
+        let max_samples = max_dataset_samples();
         for path in select(input)? {
             let result = (|| -> Result<_> {
                 let x = audio::decode(&path, &p)?;
-                ensure!(x.len() >= crop, "shorter than one crop");
+                ensure!(
+                    x.len() >= crop_scalars && x.len().is_multiple_of(ch),
+                    "shorter than one crop"
+                );
                 ensure!(audio::rms(&x) >= p.silence_rms, "silent file");
                 let source = Source {
                     path: fs::canonicalize(&path)?,
                     sha256: hash_file(&path)?,
-                    samples: x.len(),
+                    samples: x.len() / ch,
                     rms: audio::rms(&x),
                 };
                 Ok((x, source))
@@ -123,13 +137,12 @@ impl Dataset {
                     total += x.len();
                     // 256 M samples is 1 GB of f32 at 16 kHz (about 4.4 hours): enough for the whole
                     // local corpus at 16 kHz inside the 3 GB mobile ceiling, while still refusing a
-                    // decode that would blow it. The desktop ceiling is 8 GB (AGENTS.md), so a
-                    // desktop run at a higher sample rate may raise this deliberately; a phone run
-                    // should select fewer files or a shorter --max-file-seconds instead.
+                    // decode that would blow it. Desktop runs on an 8 GB host can raise this via
+                    // FERAL_MAX_DATASET_MB (up to 4096 MB).
                     ensure!(
-                        total <= MAX_DATASET_SAMPLES,
-                        "decoded dataset exceeds {} MB; reduce --max-file-seconds or file selection",
-                        MAX_DATASET_SAMPLES * 4 / 1_000_000
+                        total <= max_samples,
+                        "decoded dataset exceeds {} MB; reduce --max-file-seconds, file selection, or raise FERAL_MAX_DATASET_MB",
+                        max_samples * 4 / 1_000_000
                     );
                     audio.push(x);
                     sources.push(s);
@@ -182,11 +195,15 @@ impl Dataset {
         rng: &mut Rng,
         dst: &mut Vec<f32>,
     ) -> Option<CropTrace> {
+        let ch = self.identity.preprocess.channels();
+        let crop_scalars = n * ch;
         for attempts in 1..=16 {
             let source_index = rng.index(self.audio.len());
             let a = &self.audio[source_index];
-            let start_sample = rng.index(a.len() - n + 1);
-            let x = &a[start_sample..start_sample + n];
+            let total_frames = a.len() / ch;
+            let start_sample = rng.index(total_frames - n + 1);
+            let start_scalar = start_sample * ch;
+            let x = &a[start_scalar..start_scalar + crop_scalars];
             if audio::rms(x) >= self.identity.preprocess.silence_rms {
                 dst.extend_from_slice(x);
                 return Some(CropTrace {

@@ -25,36 +25,55 @@ fn hann_window(size: usize) -> Vec<f32> {
 /// Multiresolution Hann STFT log(1+|FFT|) distance, FFT sizes 128/512/2048,
 /// hop=N/4. Tail frames are zero padded. Paired signal metric, not a MOS estimate.
 pub fn acoustic(reference: &[f32], estimate: &[f32]) -> Acoustic {
-    assert!(!reference.is_empty() && reference.len() == estimate.len());
+    acoustic_channels(reference, estimate, 1)
+}
+/// Channel-aware paired signal metric (interleaved mono or stereo).
+pub fn acoustic_channels(reference: &[f32], estimate: &[f32], channels: usize) -> Acoustic {
+    assert!(
+        !reference.is_empty()
+            && reference.len() == estimate.len()
+            && channels >= 1
+            && reference.len().is_multiple_of(channels)
+    );
+    let frames = reference.len() / channels;
     let mse = reference
         .iter()
         .zip(estimate)
         .map(|(&a, &b)| (a as f64 - b as f64).powi(2))
         .sum::<f64>()
         / reference.len() as f64;
-    let derivative_mse = (1..reference.len())
-        .map(|i| {
-            ((reference[i] - reference[i - 1]) as f64 - (estimate[i] - estimate[i - 1]) as f64)
-                .powi(2)
-        })
-        .sum::<f64>()
-        / (reference.len() - 1).max(1) as f64;
+    let mut deriv_sum = 0.0f64;
+    let mut deriv_count = 0usize;
+    for t in 1..frames {
+        for c in 0..channels {
+            let cur = t * channels + c;
+            let prev = (t - 1) * channels + c;
+            deriv_sum += ((reference[cur] - reference[prev]) - (estimate[cur] - estimate[prev]))
+                .powi(2) as f64;
+            deriv_count += 1;
+        }
+    }
+    let derivative_mse = deriv_sum / deriv_count.max(1) as f64;
     let coarse_mse = [4, 16, 64]
         .iter()
         .map(|&scale| {
             let mut sum = 0.;
             let mut count = 0;
-            for (a, b) in reference.chunks(scale).zip(estimate.chunks(scale)) {
-                let d = a
-                    .iter()
-                    .zip(b)
-                    .map(|(&a, &b)| a as f64 - b as f64)
-                    .sum::<f64>()
-                    / a.len() as f64;
-                sum += d * d;
-                count += 1;
+            for c in 0..channels {
+                for base in (0..frames).step_by(scale) {
+                    let len = scale.min(frames - base);
+                    let d: f64 = (0..len)
+                        .map(|i| {
+                            let idx = (base + i) * channels + c;
+                            reference[idx] as f64 - estimate[idx] as f64
+                        })
+                        .sum::<f64>()
+                        / len as f64;
+                    sum += d * d;
+                    count += 1;
+                }
             }
-            sum / count as f64
+            sum / count.max(1) as f64
         })
         .collect();
     let mut planner = FftPlanner::new();
@@ -66,20 +85,32 @@ pub fn acoustic(reference: &[f32], estimate: &[f32]) -> Acoustic {
         let mut b = vec![Complex::new(0f32, 0f32); size];
         let mut sum = 0.;
         let mut count = 0;
-        for start in (0..reference.len()).step_by(size / 4) {
-            for j in 0..size {
-                let w = window[j];
-                a[j] = Complex::new(reference.get(start + j).copied().unwrap_or(0.) * w, 0.);
-                b[j] = Complex::new(estimate.get(start + j).copied().unwrap_or(0.) * w, 0.);
-            }
-            fft.process(&mut a);
-            fft.process(&mut b);
-            for (a, b) in a[..=size / 2].iter().zip(&b[..=size / 2]) {
-                sum += (a.norm().ln_1p() as f64 - b.norm().ln_1p() as f64).abs();
-                count += 1;
+        for c in 0..channels {
+            for start in (0..frames).step_by(size / 4) {
+                for j in 0..size {
+                    let w = window[j];
+                    let ra = if start + j < frames {
+                        reference[(start + j) * channels + c]
+                    } else {
+                        0.
+                    };
+                    let eb = if start + j < frames {
+                        estimate[(start + j) * channels + c]
+                    } else {
+                        0.
+                    };
+                    a[j] = Complex::new(ra * w, 0.);
+                    b[j] = Complex::new(eb * w, 0.);
+                }
+                fft.process(&mut a);
+                fft.process(&mut b);
+                for (a, b) in a[..=size / 2].iter().zip(&b[..=size / 2]) {
+                    sum += (a.norm().ln_1p() as f64 - b.norm().ln_1p() as f64).abs();
+                    count += 1;
+                }
             }
         }
-        spectral += sum / count as f64;
+        spectral += sum / count.max(1) as f64;
     }
     Acoustic {
         mse,
@@ -108,21 +139,24 @@ pub fn probe<M: Velocity + ?Sized>(
     task: usize,
     t: f32,
 ) -> Probe {
-    let n = clean.len();
-    let mut mask = vec![0.; n];
+    let ch = model.channels();
+    assert!(clean.len().is_multiple_of(ch));
+    let total = clean.len();
+    let n_frames = total / ch;
+    let mut mask = vec![0.; total];
     let name = match task {
         0 => "unconditional",
         1 => {
-            mask[..n / 2].fill(1.);
+            mask[..(n_frames / 2) * ch].fill(1.);
             "prefix"
         }
         2 => {
             mask.fill(1.);
-            mask[n / 4..3 * n / 4].fill(0.);
+            mask[(n_frames / 4) * ch..(3 * n_frames / 4) * ch].fill(0.);
             "hole"
         }
         _ => {
-            mask[n / 2..].fill(1.);
+            mask[(n_frames / 2) * ch..].fill(1.);
             "suffix"
         }
     };
@@ -133,7 +167,7 @@ pub fn probe<M: Velocity + ?Sized>(
         .map(|((&y, &z), &m)| if m == 1. { y } else { (1. - t) * z + t * y })
         .collect();
     let pred = model.velocity(&x, clean, &mask, t);
-    assert_eq!(pred.len(), n);
+    assert_eq!(pred.len(), total);
     let count = mask.iter().filter(|&&m| m == 0.).count() as f64;
     let velocity_mse = pred
         .iter()
@@ -170,9 +204,9 @@ pub fn probe<M: Velocity + ?Sized>(
         t,
         velocity_mse,
         zero_velocity_mse,
-        endpoint: acoustic(&y, &estimate),
-        zero_audio: acoustic(&y, &vec![0.; y.len()]),
-        noisy_input: acoustic(&y, &input),
+        endpoint: acoustic_channels(&y, &estimate, ch),
+        zero_audio: acoustic_channels(&y, &vec![0.; y.len()], ch),
+        noisy_input: acoustic_channels(&y, &input, ch),
     }
 }
 /// Nearest absolute, mean-centered normalized correlation over stride-aligned windows.
@@ -259,12 +293,18 @@ pub fn evaluate_with_options(
     );
     let start = Instant::now();
     let ck = Checkpoint::load(checkpoint)?;
+    let ch = ck.channels();
     let active_model = ck.sampling_model(use_ema);
     let using_ema = use_ema && ck.has_ema();
     let p = Preprocess {
         sample_rate: ck.sample_rate,
         normalize: false,
         max_seconds: 60.,
+        channel: if ch == 2 {
+            "stereo".into()
+        } else {
+            "mix".into()
+        },
         ..Default::default()
     };
     let dataset = Dataset::load(input, p, ck.crop_samples)?;
@@ -288,11 +328,14 @@ pub fn evaluate_with_options(
     };
     let mut rng = Rng::new(seed);
     let mut rows = vec![];
+    let crop_scalars = ck.crop_samples * ch;
     for _ in 0..crops {
         let source = rng.index(dataset.audio.len());
         let a = &dataset.audio[source];
-        let at = rng.index(a.len() - ck.crop_samples + 1);
-        let clean = &a[at..at + ck.crop_samples];
+        let total_frames = a.len() / ch;
+        let at = rng.index(total_frames - ck.crop_samples + 1);
+        let at_scalar = at * ch;
+        let clean = &a[at_scalar..at_scalar + crop_scalars];
         let noise: Vec<f32> = (0..clean.len())
             .map(|_| rng.normal() * ck.flow.prior_std())
             .collect();

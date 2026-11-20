@@ -86,7 +86,8 @@ extern "C" __global__ void feral_loss_grad(const float *__restrict__ prediction,
                                            const float *__restrict__ unknown,
                                            float *__restrict__ dy, float *__restrict__ partial,
                                            unsigned n, int pre, float data_scale,
-                                           float prior_std, float detail, unsigned items) {
+                                           float prior_std, float detail, unsigned items,
+                                           unsigned audio_ch) {
   unsigned id = blockIdx.x * blockDim.x + threadIdx.x, lane = threadIdx.x;
   __shared__ float scratch[256];
   float value = 0.f;
@@ -104,17 +105,19 @@ extern "C" __global__ void feral_loss_grad(const float *__restrict__ prediction,
     float d = r * (1.0f - m);
     float dyv = 2.0f * d / u;
     value = d * d / u;
-    // Detail term: mean squared first difference of the residual over pairs where both samples
-    // are unknown, so known regions never leak in. Mirrors flow::loss_gradient_detailed.
+    // Detail term: mean squared first difference of the residual per audio channel over pairs
+    // where both samples are unknown, so known regions never leak in.
     if (detail > 0.f) {
       unsigned base = item * n, end = base + n;
-      if (m == 0.f && id + 1 < end && data[2u * total + id + 1] == 0.f) {
-        float delta = feral_residual(prediction, data, total, id + 1, pre, t, cskip, cout) - r;
+      if (m == 0.f && id + audio_ch < end && data[2u * total + id + audio_ch] == 0.f) {
+        float delta =
+            feral_residual(prediction, data, total, id + audio_ch, pre, t, cskip, cout) - r;
         value += detail * delta * delta / u;
         dyv -= 2.f * detail * delta / u;
       }
-      if (m == 0.f && id > base && data[2u * total + id - 1] == 0.f) {
-        float delta = r - feral_residual(prediction, data, total, id - 1, pre, t, cskip, cout);
+      if (m == 0.f && id >= base + audio_ch && data[2u * total + id - audio_ch] == 0.f) {
+        float delta =
+            r - feral_residual(prediction, data, total, id - audio_ch, pre, t, cskip, cout);
         dyv += 2.f * detail * delta / u;
       }
     }
@@ -189,13 +192,15 @@ extern "C" __global__ void feral_statistics(const float *__restrict__ grad,
 // stats[3] is the atomic error flag; never read it nonatomically here.
 extern "C" __global__ void feral_adam(float *__restrict__ weights, float *__restrict__ m,
                                       float *__restrict__ v, const float *__restrict__ grad,
-                                      float *__restrict__ stats, unsigned n, float lr, float c1,
-                                      float c2) {
+                                      float *__restrict__ stats, const float *__restrict__ decay_mask,
+                                      unsigned n, float lr, float c1, float c2, float wd) {
   unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n || !isfinite(stats[0]) || !isfinite(stats[1])) return;
   float g = grad[i] * stats[2], mm = 0.9f * m[i] + 0.1f * g,
         vv = 0.999f * v[i] + 0.001f * g * g;
-  float p = weights[i] - lr * (mm / c1) / (sqrtf(vv / c2) + 1e-8f);
+  float w = weights[i];
+  if (wd > 0.0f) w *= (1.0f - lr * wd * decay_mask[i]);
+  float p = w - lr * (mm / c1) / (sqrtf(vv / c2) + 1e-8f);
   m[i] = mm;
   v[i] = vv;
   weights[i] = p;
@@ -224,17 +229,22 @@ extern "C" __global__ void feral_ema(float *__restrict__ ema, const float *__res
 // Sample-level residual conv helpers (sample_conv = K odd in 3..=15).
 extern "C" __global__ void feral_unpack_stem_in(const float *__restrict__ x_features,
                                                 float *__restrict__ stem_in, unsigned frames,
-                                                unsigned block, unsigned items) {
+                                                unsigned block, unsigned audio_ch,
+                                                unsigned items) {
   unsigned total = items * frames * block;
   unsigned idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= total) return;
   unsigned p = idx / block;
   unsigned c = idx % block;
-  unsigned channels = 3u * block + 4u;
+  unsigned frame_elems = block * audio_ch;
+  unsigned channels = 3u * frame_elems + 4u;
   unsigned base = p * channels;
-  stem_in[idx * 3u + 0u] = x_features[base + c];
-  stem_in[idx * 3u + 1u] = x_features[base + block + c];
-  stem_in[idx * 3u + 2u] = x_features[base + 2u * block + c];
+  unsigned dst = idx * (3u * audio_ch);
+  for (unsigned ch = 0u; ch < audio_ch; ch++) {
+    stem_in[dst + ch] = x_features[base + c * audio_ch + ch];
+    stem_in[dst + audio_ch + ch] = x_features[base + frame_elems + c * audio_ch + ch];
+    stem_in[dst + 2u * audio_ch + ch] = x_features[base + 2u * frame_elems + c * audio_ch + ch];
+  }
 }
 
 extern "C" __global__ void feral_apply_stem_residual(float *__restrict__ x_features,
@@ -426,7 +436,7 @@ extern "C" __global__ void feral_rmsnorm_film_fwd(
 
 extern "C" __global__ void feral_gated_residual_fwd(
     float *__restrict__ z, const float *__restrict__ skip, float *__restrict__ y, unsigned frames,
-    unsigned width, unsigned scale, unsigned items) {
+    unsigned width, unsigned scale, int is_glu, float res_scale, unsigned items) {
   unsigned cf = (frames + scale - 1u) / scale;
   unsigned total = items * cf * width;
   unsigned id = blockIdx.x * blockDim.x + threadIdx.x;
@@ -436,7 +446,8 @@ extern "C" __global__ void feral_gated_residual_fwd(
   unsigned item = pg / cf;
   unsigned q = pg % cf;
   unsigned base = pg * 2u * width;
-  float ta = tanhf(z[base + c]);
+  float raw_a = z[base + c];
+  float ta = is_glu ? raw_a : tanhf(raw_a);
   float sb = 1.0f / (1.0f + expf(-z[base + width + c]));
   z[base + c] = ta;
   z[base + width + c] = sb;
@@ -444,13 +455,14 @@ extern "C" __global__ void feral_gated_residual_fwd(
   unsigned count = min(scale, frames - q * scale);
   for (unsigned r = 0u; r < count; r++) {
     unsigned at = (item * frames + q * scale + r) * width + c;
-    y[at] = skip[at] + 0.5f * act;
+    y[at] = skip[at] + res_scale * act;
   }
 }
 
 extern "C" __global__ void feral_gated_activation_grad(
     const float *__restrict__ dh, const float *__restrict__ z, float *__restrict__ dz,
-    unsigned frames, unsigned width, unsigned scale, unsigned items) {
+    unsigned frames, unsigned width, unsigned scale, int is_glu, float res_scale,
+    unsigned items) {
   unsigned cf = (frames + scale - 1u) / scale;
   unsigned total = items * cf * width;
   unsigned id = blockIdx.x * blockDim.x + threadIdx.x;
@@ -464,11 +476,11 @@ extern "C" __global__ void feral_gated_activation_grad(
   for (unsigned r = 0u; r < count; r++) {
     g += dh[(item * frames + q * scale + r) * width + c];
   }
-  g *= 0.5f;
+  g *= res_scale;
   unsigned base = pg * 2u * width;
   float ta = z[base + c];
   float sb = z[base + width + c];
-  dz[base + c] = g * sb * (1.0f - ta * ta);
+  dz[base + c] = is_glu ? (g * sb) : (g * sb * (1.0f - ta * ta));
   dz[base + width + c] = g * ta * sb * (1.0f - sb);
 }
 
@@ -602,16 +614,18 @@ extern "C" __global__ void feral_stft_frame(
     const float *__restrict__ pred, const float *__restrict__ data, float *__restrict__ overlap,
     float *__restrict__ frame_losses, unsigned n, unsigned items, unsigned size, unsigned log2_n,
     unsigned hop, unsigned frame_count, int pre, float data_scale, float prior_std,
-    float spectral_weight, float num_resolutions) {
+    float spectral_weight, float num_resolutions, unsigned audio_ch, int mode, float num_streams) {
   unsigned frame_idx = blockIdx.x;
-  unsigned item = blockIdx.y;
+  unsigned by = blockIdx.y;
+  unsigned item = by / audio_ch;
+  unsigned ch = by % audio_ch;
   if (frame_idx >= frame_count || item >= items) return;
   unsigned tid = threadIdx.x;
   unsigned nthreads = blockDim.x;
-  unsigned total = items * n;
+  unsigned total = items * n * audio_ch;
   float t = data[3u * total + 4u * item];
   if (spectral_weight <= 0.0f || t <= 0.0f || t >= 1.0f) {
-    if (tid == 0u) frame_losses[item * frame_count + frame_idx] = 0.0f;
+    if (tid == 0u) frame_losses[by * frame_count + frame_idx] = 0.0f;
     return;
   }
 
@@ -625,20 +639,46 @@ extern "C" __global__ void feral_stft_frame(
   unsigned start = frame_idx * hop;
   unsigned len = (start < n) ? min(size, n - start) : 0u;
   float inv_size_tau = 6.2831853071795864769f / (float)size;
+  const float inv_sqrt2 = 0.7071067811865475f;
 
   // Pack real yhat_w into Re and real clean_w into Im (exact 1-FFT real-pair transform).
   for (unsigned j = tid; j < size; j += nthreads) {
     float yhw = 0.0f, yw = 0.0f;
     if (j < len) {
-      unsigned idx = item * n + start + j;
-      float y = data[idx], z = data[total + idx], m = data[2u * total + idx];
-      float yh;
-      if (m == 1.0f) {
-        yh = y;
+      float y, yh;
+      if (mode == 0) {
+        unsigned idx = (item * n + start + j) * audio_ch + ch;
+        y = data[idx];
+        float z = data[total + idx], m = data[2u * total + idx];
+        if (m == 1.0f) {
+          yh = y;
+        } else {
+          float xt = omt * z + t * y;
+          float v = cskip * xt + cout * pred[idx];
+          yh = xt + omt * v;
+        }
       } else {
-        float xt = omt * z + t * y;
-        float v = cskip * xt + cout * pred[idx];
-        yh = xt + omt * v;
+        unsigned idxL = (item * n + start + j) * 2u;
+        unsigned idxR = idxL + 1u;
+        float yL = data[idxL], zL = data[total + idxL], mL = data[2u * total + idxL];
+        float yR = data[idxR], zR = data[total + idxR], mR = data[2u * total + idxR];
+        float yhL, yhR;
+        if (mL == 1.0f) {
+          yhL = yL;
+        } else {
+          float xtL = omt * zL + t * yL;
+          float vL = cskip * xtL + cout * pred[idxL];
+          yhL = xtL + omt * vL;
+        }
+        if (mR == 1.0f) {
+          yhR = yR;
+        } else {
+          float xtR = omt * zR + t * yR;
+          float vR = cskip * xtR + cout * pred[idxR];
+          yhR = xtR + omt * vR;
+        }
+        y = (ch == 0u) ? inv_sqrt2 * (yL + yR) : inv_sqrt2 * (yL - yR);
+        yh = (ch == 0u) ? inv_sqrt2 * (yhL + yhR) : inv_sqrt2 * (yhL - yhR);
       }
       float w = 0.5f - 0.5f * cosf(inv_size_tau * (float)j);
       yhw = yh * w;
@@ -653,7 +693,7 @@ extern "C" __global__ void feral_stft_frame(
   feral_radix2_fft(s_re, s_im, size, -1.0f);
 
   unsigned bins = (size >> 1) + 1u;
-  float scale = 1.0f / (num_resolutions * (float)(frame_count * bins));
+  float scale = 1.0f / (num_streams * num_resolutions * (float)(frame_count * bins));
   const float eps_sq = 1e-10f;
   const float delta = 1e-5f;
   const float delta_sq = 1e-10f;
@@ -696,12 +736,16 @@ extern "C" __global__ void feral_stft_frame(
 
   float weight = spectral_weight * t;
   float grad_scale = weight * omt * cout;
-  unsigned slot_base = (frame_idx & 3u) * total + item * n + start;
+  unsigned slot_base = (frame_idx & 3u) * total + (item * n + start) * audio_ch;
   for (unsigned j = tid; j < len; j += nthreads) {
-    unsigned idx = item * n + start + j;
-    if (data[2u * total + idx] == 0.0f) {
-      float w = 0.5f - 0.5f * cosf(inv_size_tau * (float)j);
-      overlap[slot_base + j] = w * s_re[j] * grad_scale;
+    float w = 0.5f - 0.5f * cosf(inv_size_tau * (float)j);
+    if (mode == 0) {
+      unsigned idx = (item * n + start + j) * audio_ch + ch;
+      if (data[2u * total + idx] == 0.0f) {
+        overlap[slot_base + j * audio_ch + ch] = w * s_re[j] * grad_scale;
+      }
+    } else {
+      overlap[slot_base + j * 2u + ch] = w * s_re[j] * grad_scale;
     }
   }
 
@@ -711,7 +755,7 @@ extern "C" __global__ void feral_stft_frame(
     if (tid < step) s_loss[tid] += s_loss[tid + step];
     __syncthreads();
   }
-  if (tid == 0u) frame_losses[item * frame_count + frame_idx] = s_loss[0] * scale * weight;
+  if (tid == 0u) frame_losses[by * frame_count + frame_idx] = s_loss[0] * scale * weight;
 }
 
 extern "C" __global__ void feral_stft_accum(float *__restrict__ dy,
@@ -721,6 +765,23 @@ extern "C" __global__ void feral_stft_accum(float *__restrict__ dy,
     dy[id] += overlap[id] + overlap[total + id] + overlap[2u * total + id] +
               overlap[3u * total + id];
   }
+}
+
+extern "C" __global__ void feral_stft_accum_ms(float *__restrict__ dy,
+                                               const float *__restrict__ overlap,
+                                               const float *__restrict__ data, unsigned total_time,
+                                               unsigned total_scalars) {
+  unsigned ti = blockIdx.x * blockDim.x + threadIdx.x;
+  if (ti >= total_time) return;
+  unsigned iL = ti * 2u;
+  unsigned iR = iL + 1u;
+  float gM = overlap[iL] + overlap[total_scalars + iL] + overlap[2u * total_scalars + iL] +
+             overlap[3u * total_scalars + iL];
+  float gS = overlap[iR] + overlap[total_scalars + iR] + overlap[2u * total_scalars + iR] +
+             overlap[3u * total_scalars + iR];
+  const float inv_s2 = 0.7071067811865475f;
+  if (data[2u * total_scalars + iL] == 0.0f) dy[iL] += inv_s2 * (gM + gS);
+  if (data[2u * total_scalars + iR] == 0.0f) dy[iR] += inv_s2 * (gM - gS);
 }
 
 extern "C" __global__ void feral_add_loss_sum(float *__restrict__ loss_parts,

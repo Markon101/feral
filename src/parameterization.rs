@@ -53,6 +53,43 @@ impl TimeSampling {
     }
 }
 
+/// Multi-scale crop horizon scheduling across training steps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HorizonSchedule {
+    #[default]
+    Fixed,
+    Random,
+    ShortToLong,
+    LongToShort,
+}
+impl HorizonSchedule {
+    pub fn is_fixed(&self) -> bool {
+        matches!(self, Self::Fixed)
+    }
+    /// Select a sorted ascending horizon index in `0..len` for 1-indexed `step`.
+    pub fn select_index(
+        &self,
+        len: usize,
+        step: usize,
+        total_steps: usize,
+        rng: &mut Rng,
+    ) -> usize {
+        if len <= 1 || matches!(self, Self::Fixed) {
+            return 0;
+        }
+        match *self {
+            Self::Fixed => 0,
+            Self::Random => rng.index(len),
+            Self::ShortToLong => ((step.saturating_sub(1) * len) / total_steps.max(1)).min(len - 1),
+            Self::LongToShort => {
+                let idx = ((step.saturating_sub(1) * len) / total_steps.max(1)).min(len - 1);
+                (len - 1) - idx
+            }
+        }
+    }
+}
+
 /// Optimizer learning-rate schedule.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -206,6 +243,9 @@ impl Velocity for ConfiguredVelocity<'_> {
     fn block(&self) -> usize {
         self.model.block()
     }
+    fn channels(&self) -> usize {
+        self.model.channels()
+    }
     fn velocity(&self, x: &[f32], known: &[f32], mask: &[f32], t: f32) -> Vec<f32> {
         if self.config.is_legacy() {
             return self.model.velocity(x, known, mask, t);
@@ -242,6 +282,7 @@ pub fn loss_gradient_detailed(
     if config.is_legacy() {
         return flow::loss_gradient_detailed(model, clean, mask, noise, t, detail);
     }
+    let ch = model.architecture.channels.max(1);
     let x: Vec<f32> = clean
         .iter()
         .zip(noise)
@@ -264,12 +305,12 @@ pub fn loss_gradient_detailed(
         dy[i] = 2. * d / count;
     }
     if detail > 0. {
-        for i in 0..n.saturating_sub(1) {
-            if mask[i] == 0. && mask[i + 1] == 0. {
-                let delta = r[i + 1] - r[i];
+        for i in 0..n.saturating_sub(ch) {
+            if mask[i] == 0. && mask[i + ch] == 0. {
+                let delta = r[i + ch] - r[i];
                 loss += detail * delta * delta / count;
                 dy[i] -= 2. * detail * delta / count;
-                dy[i + 1] += 2. * detail * delta / count;
+                dy[i + ch] += 2. * detail * delta / count;
             }
         }
     }
@@ -292,6 +333,7 @@ pub fn loss_gradient_with_spectral(
     if spectral_weight <= 0. {
         return loss_gradient_detailed(model, config, clean, mask, noise, t, detail);
     }
+    let ch = model.architecture.channels.max(1);
     let x: Vec<f32> = clean
         .iter()
         .zip(noise)
@@ -318,17 +360,25 @@ pub fn loss_gradient_with_spectral(
         dy[i] = 2. * d / count;
     }
     if detail > 0. {
-        for i in 0..n.saturating_sub(1) {
-            if mask[i] == 0. && mask[i + 1] == 0. {
-                let delta = r[i + 1] - r[i];
+        for i in 0..n.saturating_sub(ch) {
+            if mask[i] == 0. && mask[i + ch] == 0. {
+                let delta = r[i + ch] - r[i];
                 loss += detail * delta * delta / count;
                 dy[i] -= 2. * detail * delta / count;
-                dy[i + 1] += 2. * detail * delta / count;
+                dy[i + ch] += 2. * detail * delta / count;
             }
         }
     }
-    let (spec_loss, dy_spec) =
-        spectral.endpoint_loss_gradient(config, clean, mask, noise, &pred, t, spectral_weight);
+    let (spec_loss, dy_spec) = spectral.endpoint_loss_gradient_channels(
+        clean,
+        mask,
+        noise,
+        &pred,
+        config,
+        t,
+        spectral_weight,
+        ch,
+    );
     loss += spec_loss;
     for (d, s) in dy.iter_mut().zip(&dy_spec) {
         *d += s;

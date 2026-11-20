@@ -16,6 +16,7 @@ pub struct DeviceVelocity<'a> {
     config: FlowConfig,
     n: usize,
     block: usize,
+    channels: usize,
 }
 
 impl<'a> DeviceVelocity<'a> {
@@ -25,8 +26,17 @@ impl<'a> DeviceVelocity<'a> {
         n: usize,
         block: usize,
     ) -> Result<Self> {
+        Self::new_with_channels(device, config, n, block, 1)
+    }
+    pub fn new_with_channels(
+        device: Box<dyn Resident + 'a>,
+        config: &FlowConfig,
+        n: usize,
+        block: usize,
+        channels: usize,
+    ) -> Result<Self> {
         ensure!(
-            n > 0 && n.is_multiple_of(block),
+            n > 0 && n.is_multiple_of(block) && (1..=2).contains(&channels),
             "device sampling window must be a positive multiple of the block"
         );
         Ok(Self {
@@ -34,13 +44,14 @@ impl<'a> DeviceVelocity<'a> {
             config: config.clone(),
             n,
             block,
+            channels,
         })
     }
     /// Upload fresh parameters onto the cached resident device without recreating its context.
     pub fn load_weights(&self, model: &crate::model::Model) -> Result<()> {
         self.device.borrow().load_weights(model)
     }
-    /// Construct a CUDA-backed [`Velocity`] field for a fixed window length `n`.
+    /// Construct a CUDA-backed [`Velocity`] field for a fixed window length `n` (in time frames).
     pub fn from_cuda(
         model: &crate::model::Model,
         lr: f32,
@@ -51,7 +62,13 @@ impl<'a> DeviceVelocity<'a> {
         {
             let adam = crate::runtime::Adam::new(model.count(), lr);
             let trainer = crate::cuda::CudaTrainer::new(model, &adam, n, 1, flow.clone())?;
-            Self::new(Box::new(trainer), flow, n, model.architecture.block)
+            Self::new_with_channels(
+                Box::new(trainer),
+                flow,
+                n,
+                model.architecture.block,
+                model.architecture.channels,
+            )
         }
         #[cfg(not(feature = "cuda"))]
         {
@@ -70,6 +87,9 @@ impl Velocity for DeviceVelocity<'_> {
     fn block(&self) -> usize {
         self.block
     }
+    fn channels(&self) -> usize {
+        self.channels
+    }
     fn velocity(&self, x: &[f32], known: &[f32], mask: &[f32], t: f32) -> Vec<f32> {
         match self.try_velocity(x, known, mask, t) {
             Ok(v) => v,
@@ -77,10 +97,10 @@ impl Velocity for DeviceVelocity<'_> {
         }
     }
     fn try_velocity(&self, x: &[f32], known: &[f32], mask: &[f32], t: f32) -> Result<Vec<f32>> {
+        let expected = self.n * self.channels;
         ensure!(
-            x.len() == self.n && known.len() == self.n && mask.len() == self.n,
-            "device sampler window mismatch: expected {} samples",
-            self.n
+            x.len() == expected && known.len() == expected && mask.len() == expected,
+            "device sampler window mismatch: expected {expected} samples"
         );
         // `feral_features` builds x_t = mask ? clean : (1-t)*noise + t*clean, applies the
         // parameterization scaling itself, and feeds clean*mask as the known-side feature. Passing

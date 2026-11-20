@@ -26,6 +26,13 @@ impl Default for Preprocess {
     }
 }
 impl Preprocess {
+    pub fn channels(&self) -> usize {
+        if self.channel == "stereo" {
+            2
+        } else {
+            1
+        }
+    }
     pub fn validate(&self) -> Result<()> {
         ensure!(
             (8000..=48000).contains(&self.sample_rate),
@@ -36,8 +43,8 @@ impl Preprocess {
             "decode limit must be >0 and <=600 seconds"
         );
         ensure!(
-            ["mix", "left", "right"].contains(&self.channel.as_str()),
-            "channel must be mix, left or right"
+            ["mix", "left", "right", "stereo"].contains(&self.channel.as_str()),
+            "channel must be mix, left, right or stereo"
         );
         ensure!(
             self.silence_rms.is_finite() && self.silence_rms >= 0.,
@@ -94,10 +101,11 @@ pub fn decode(path: &Path, p: &Preprocess) -> Result<Vec<f32>> {
     if p.channel == "right" {
         cmd.args(["-af", "pan=mono|c0=c1"]);
     }
+    let ch = p.channels();
     let out = cmd
         .args([
             "-ac",
-            "1",
+            &ch.to_string(),
             "-ar",
             &p.sample_rate.to_string(),
             "-f",
@@ -122,11 +130,11 @@ pub fn decode(path: &Path, p: &Preprocess) -> Result<Vec<f32>> {
         .map(|b| f32::from_le_bytes(*b))
         .collect();
     ensure!(
-        !x.is_empty() && x.iter().all(|x| x.is_finite()),
+        !x.is_empty() && x.len().is_multiple_of(ch) && x.iter().all(|x| x.is_finite()),
         "empty or nonfinite decoded audio"
     );
     ensure!(
-        x.len() <= (p.sample_rate as f32 * p.max_seconds).ceil() as usize + 8192,
+        x.len() <= ((p.sample_rate as f32 * p.max_seconds).ceil() as usize + 8192) * ch,
         "decoder exceeded duration bound"
     );
     if p.normalize {
@@ -144,9 +152,14 @@ pub fn rms(x: &[f32]) -> f32 {
 }
 /// IEEE-float WAV retains canonical protected samples bit-for-bit. Never replaces files.
 pub fn write_wav(path: &Path, x: &[f32], sr: u32) -> Result<()> {
+    write_wav_channels(path, x, sr, 1)
+}
+/// IEEE-float WAV writer supporting 1-channel mono or 2-channel interleaved stereo `[L0,R0,...]`.
+pub fn write_wav_channels(path: &Path, x: &[f32], sr: u32, channels: usize) -> Result<()> {
+    ensure!([1, 2].contains(&channels), "WAV channels must be 1 or 2");
     ensure!(
-        !x.is_empty() && x.iter().all(|v| v.is_finite()),
-        "refusing empty/nonfinite WAV"
+        !x.is_empty() && x.len().is_multiple_of(channels) && x.iter().all(|v| v.is_finite()),
+        "refusing empty/misaligned/nonfinite WAV"
     );
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -159,7 +172,7 @@ pub fn write_wav(path: &Path, x: &[f32], sr: u32) -> Result<()> {
     let mut w = hound::WavWriter::new(
         std::io::BufWriter::new(file),
         hound::WavSpec {
-            channels: 1,
+            channels: channels as u16,
             sample_rate: sr,
             bits_per_sample: 32,
             sample_format: hound::SampleFormat::Float,
@@ -191,6 +204,42 @@ pub fn synthetic(dir: &Path, sr: u32) -> Result<()> {
             })
             .collect();
         write_wav(&dir.join(format!("pattern-{kind}.wav")), &x, sr)?;
+    }
+    Ok(())
+}
+/// Deterministic 2-channel interleaved stereo diagnostic patterns with L/R pitch, phase, and panning.
+pub fn synthetic_stereo(dir: &Path, sr: u32) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    for kind in 0..4 {
+        let mut rng = crate::rng::Rng::new(200 + kind);
+        let mut x = Vec::with_capacity((sr * 2) as usize * 2);
+        for i in 0..sr * 2 {
+            let t = i as f32 / sr as f32;
+            let pan = 0.5 + 0.4 * (std::f32::consts::TAU * 0.7 * t).sin();
+            let env = (std::f32::consts::PI * (t % 0.5) / 0.5).sin().powi(2);
+            let (l, r) = match kind {
+                0 => (
+                    0.5 * (std::f32::consts::TAU * 220. * t).sin(),
+                    0.5 * (std::f32::consts::TAU * 330. * t + 0.7).sin(),
+                ),
+                1 => (
+                    0.4 * pan * (std::f32::consts::TAU * 330. * t).sin(),
+                    0.4 * (1. - pan) * (std::f32::consts::TAU * 660. * t).sin(),
+                ),
+                2 => (
+                    0.55 * env * (std::f32::consts::TAU * (110. * t + 180. * t * t)).sin(),
+                    0.55 * env * (std::f32::consts::TAU * (165. * t + 180. * t * t)).cos(),
+                ),
+                _ => {
+                    let mid = 0.12 * rng.normal() * env;
+                    let side = 0.08 * rng.normal() * env;
+                    (mid + side, mid - side)
+                }
+            };
+            x.push(l);
+            x.push(r);
+        }
+        write_wav_channels(&dir.join(format!("stereo-pattern-{kind}.wav")), &x, sr, 2)?;
     }
     Ok(())
 }

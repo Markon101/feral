@@ -17,6 +17,7 @@ fn tiny() -> Model {
             scales: vec![1, 2],
             sample_conv: 0,
             block_style: BlockStyle::Tanh,
+            channels: 1,
         },
         7,
     )
@@ -211,6 +212,7 @@ fn large_frame_and_wide_dilation_parity() {
             scales: vec![],
             sample_conv: 0,
             block_style: BlockStyle::Tanh,
+            channels: 1,
         },
         7,
     );
@@ -386,6 +388,7 @@ fn repeated_trainer_creation_stays_valid() {
             scales: vec![],
             sample_conv: 0,
             block_style: BlockStyle::Tanh,
+            channels: 1,
         },
         7,
     );
@@ -425,6 +428,7 @@ fn mixed_size_trainer_sequence() {
             scales: vec![],
             sample_conv: 0,
             block_style: BlockStyle::Tanh,
+            channels: 1,
         },
         7,
     );
@@ -654,6 +658,7 @@ fn cuda_train_and_evaluate_match_cpu_with_batched_preconditioned_flow() {
             scales: vec![1, 2],
             sample_conv: 0,
             block_style: BlockStyle::Tanh,
+            channels: 1,
         },
         flow: FlowConfig::Preconditioned {
             data_scale: 0.16,
@@ -664,6 +669,10 @@ fn cuda_train_and_evaluate_match_cpu_with_batched_preconditioned_flow() {
         time_sampling: feral::parameterization::TimeSampling::Uniform,
         lr_schedule: feral::parameterization::LrSchedule::Constant,
         ema_decay: 0.,
+        weight_decay: 0.,
+        crop_horizons: vec![],
+        horizon_schedule: feral::parameterization::HorizonSchedule::Fixed,
+        horizon_steps: None,
         batch: 3,
         validation: Some(root.join("corpus")),
         validation_every: 2,
@@ -732,6 +741,7 @@ fn sample_conv_and_spectral_loss_cuda_match_cpu_batched() {
         scales: vec![1, 2],
         sample_conv: 7,
         block_style: BlockStyle::Tanh,
+        channels: 1,
     };
     let model = Model::new(arch, 11);
     let adam = Adam::new(model.count(), 0.0003);
@@ -892,6 +902,7 @@ fn cuda_e2e_train_with_all_new_features_matches_cpu() {
             scales: vec![1, 2],
             sample_conv: 5,
             block_style: BlockStyle::Tanh,
+            channels: 1,
         },
         flow: FlowConfig::Preconditioned {
             data_scale: 0.16,
@@ -906,6 +917,10 @@ fn cuda_e2e_train_with_all_new_features_matches_cpu() {
             min_lr: 1e-4,
         },
         ema_decay: 0.9,
+        weight_decay: 0.,
+        crop_horizons: vec![],
+        horizon_schedule: feral::parameterization::HorizonSchedule::Fixed,
+        horizon_steps: None,
         batch: 2,
         validation: Some(root.join("corpus")),
         validation_every: 2,
@@ -989,6 +1004,7 @@ fn gated_film_symmetric_and_gpu_stft_cuda_match_cpu_batched() {
         scales: vec![1, 2, 1, 2, 1],
         sample_conv: 7,
         block_style: BlockStyle::GatedFilm,
+        channels: 1,
     };
     let model = Model::new(arch, 17);
     let adam = Adam::new(model.count(), 0.0003);
@@ -1146,6 +1162,7 @@ fn cuda_e2e_train_gated_film_and_resume_matches_cpu() {
             scales: vec![],
             sample_conv: 5,
             block_style: BlockStyle::GatedFilm,
+            channels: 1,
         },
         flow: FlowConfig::Preconditioned {
             data_scale: 0.16,
@@ -1160,6 +1177,10 @@ fn cuda_e2e_train_gated_film_and_resume_matches_cpu() {
             min_lr: 1e-4,
         },
         ema_decay: 0.9,
+        weight_decay: 0.,
+        crop_horizons: vec![],
+        horizon_schedule: feral::parameterization::HorizonSchedule::Fixed,
+        horizon_steps: None,
         batch: 2,
         validation: Some(root.join("corpus")),
         validation_every: 2,
@@ -1195,5 +1216,501 @@ fn cuda_e2e_train_gated_film_and_resume_matches_cpu() {
         "CUDA gated-film + GPU STFT resume must be bit-exact"
     );
     assert_eq!(g.ema_weights, r.ema_weights);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn glu_film_adamw_and_multi_horizon_cuda_match_cpu() {
+    use feral::{
+        audio::{self, Preprocess},
+        backend::{Batch, Trainer},
+        parameterization::{HorizonSchedule, LrSchedule, TimeSampling},
+        rng::Rng,
+        runtime::{self, Adam, Checkpoint, TrainConfig},
+    };
+
+    // Part A: Low-level Trainer::new_with_horizons + dynamic set_shape + AdamW weight decay.
+    let model = Model::new(
+        Architecture {
+            block: 4,
+            width: 6,
+            dilations: vec![1, 2, 1],
+            scales: vec![],
+            sample_conv: 5,
+            block_style: BlockStyle::GluFilm,
+            channels: 1,
+        },
+        53,
+    );
+    let flow = FlowConfig::Preconditioned {
+        data_scale: 0.16,
+        prior_std: 0.16,
+    };
+    let horizons = [(512, 4), (1024, 2), (2048, 1)];
+    let adam0 = Adam::new(model.count(), 0.0005);
+    let mut cpu_model = model.clone();
+    let mut cpu_adam = adam0.clone();
+    let mut cpu = Trainer::new_with_horizons("cpu", &cpu_model, &cpu_adam, &horizons, &flow)
+        .expect("cpu trainer");
+    let mut gpu_model = model.clone();
+    let mut gpu_adam = adam0;
+    let mut gpu = Trainer::new_with_horizons("cuda", &gpu_model, &gpu_adam, &horizons, &flow)
+        .expect("cuda trainer");
+    let init_p = cpu_model.parameters();
+    let mut cpu_ema = init_p.clone();
+    let mut gpu_ema = init_p;
+    let ema_decay = 0.9f32;
+    cpu.configure_ema(ema_decay, &cpu_ema).unwrap();
+    gpu.configure_ema(ema_decay, &gpu_ema).unwrap();
+
+    let mut rng = Rng::new(71);
+    let mut cpu_steps = Vec::new();
+    let mut gpu_steps = Vec::new();
+    let schedule = [(512, 4), (1024, 2), (2048, 1), (512, 4)];
+    for (step_idx, &(sn, sitems)) in schedule.iter().enumerate() {
+        let total = sn * sitems;
+        let clean: Vec<f32> = (0..total).map(|_| rng.normal() * 0.16).collect();
+        let mask: Vec<f32> = (0..total)
+            .map(|k| if (k % sn) < sn / 4 { 1. } else { 0. })
+            .collect();
+        let noise: Vec<f32> = (0..total).map(|_| rng.normal() * 0.16).collect();
+        let t: Vec<f32> = (0..sitems).map(|i| 0.15 + 0.2 * i as f32).collect();
+        let lr = 0.0005 * (1. + 0.1 * step_idx as f32);
+
+        cpu.set_shape(sn, sitems).unwrap();
+        gpu.set_shape(sn, sitems).unwrap();
+
+        let cs = cpu
+            .step(
+                &mut cpu_model,
+                &mut cpu_adam,
+                &flow,
+                Batch {
+                    clean: &clean,
+                    mask: &mask,
+                    noise: &noise,
+                    t: &t,
+                    detail: 0.5,
+                    spectral: 1.0,
+                    lr,
+                    weight_decay: 0.05,
+                },
+            )
+            .unwrap();
+        let cp = cpu_model.parameters();
+        for (e, &w) in cpu_ema.iter_mut().zip(&cp) {
+            *e = ema_decay * *e + (1. - ema_decay) * w;
+        }
+        let gs = gpu
+            .step(
+                &mut gpu_model,
+                &mut gpu_adam,
+                &flow,
+                Batch {
+                    clean: &clean,
+                    mask: &mask,
+                    noise: &noise,
+                    t: &t,
+                    detail: 0.5,
+                    spectral: 1.0,
+                    lr,
+                    weight_decay: 0.05,
+                },
+            )
+            .unwrap();
+        cpu_steps.push(cs);
+        gpu_steps.push(gs);
+    }
+    // CUDA reported loss/norm lags by 1 step after step 0 (step 0 syncs immediately).
+    for (step_idx, gs) in gpu_steps.iter().enumerate() {
+        let cs = &cpu_steps[step_idx.saturating_sub(1)];
+        assert!(
+            (cs.loss - gs.loss).abs() <= 2e-5,
+            "step {step_idx} lagged loss drift cpu={} cuda={}",
+            cs.loss,
+            gs.loss
+        );
+        assert!(
+            (cs.norm - gs.norm).abs() <= 5e-5,
+            "step {step_idx} lagged norm drift cpu={} cuda={}",
+            cs.norm,
+            gs.norm
+        );
+    }
+    gpu.sync(&mut gpu_model, &mut gpu_adam).unwrap();
+    gpu.sync_ema(&mut gpu_ema).unwrap();
+    let max_w = cpu_model
+        .parameters()
+        .iter()
+        .zip(gpu_model.parameters())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(max_w <= 5e-5, "GluFilm AdamW weight drift: {max_w}");
+    let max_m = cpu_adam
+        .m
+        .iter()
+        .zip(&gpu_adam.m)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(max_m <= 5e-5, "GluFilm AdamW m drift: {max_m}");
+    let max_e = cpu_ema
+        .iter()
+        .zip(&gpu_ema)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(max_e <= 5e-5, "GluFilm EMA drift: {max_e}");
+
+    // Part B: End-to-end multi-horizon Random schedule training & resume on CPU vs CUDA.
+    let root = std::env::temp_dir().join(format!("feral-cuda-mh-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir(&root).unwrap();
+    audio::synthetic(&root.join("corpus"), 16000).unwrap();
+
+    let make = |run_name: &str, backend: &str, steps: usize, resume| TrainConfig {
+        input: root.join("corpus"),
+        run: root.join(run_name),
+        backend: backend.into(),
+        steps,
+        seed: 61,
+        crop_seconds: 0.032,
+        preprocess: Preprocess::default(),
+        lr: 0.0005,
+        preview_every: 2,
+        checkpoint_every: 2,
+        resume,
+        weights_only: false,
+        grow_crop: false,
+        architecture: Architecture {
+            block: 4,
+            width: 6,
+            dilations: vec![1, 2, 1],
+            scales: vec![],
+            sample_conv: 5,
+            block_style: BlockStyle::GluFilm,
+            channels: 1,
+        },
+        flow: flow.clone(),
+        detail: 0.5,
+        spectral_weight: 1.0,
+        time_sampling: TimeSampling::LogitNormal { mean: 0., std: 1. },
+        lr_schedule: LrSchedule::Cosine {
+            warmup_steps: 2,
+            total_steps: 6,
+            min_lr: 1e-4,
+        },
+        ema_decay: 0.9,
+        weight_decay: 0.02,
+        crop_horizons: vec![0.032, 0.064],
+        horizon_schedule: HorizonSchedule::Random,
+        horizon_steps: Some(4),
+        batch: 2,
+        validation: Some(root.join("corpus")),
+        validation_every: 2,
+    };
+
+    let cpu_all = runtime::train(make("cpu-all", "cpu", 4, None)).expect("cpu train");
+    let cuda_all = runtime::train(make("cuda-all", "cuda", 4, None)).expect("cuda train");
+    let cuda_first = runtime::train(make("cuda-first", "cuda", 2, None)).expect("cuda first");
+    let cuda_resumed =
+        runtime::train(make("cuda-resumed", "cuda", 2, Some(cuda_first))).expect("cuda resume");
+
+    let c = Checkpoint::load(&cpu_all).unwrap();
+    let g = Checkpoint::load(&cuda_all).unwrap();
+    let r = Checkpoint::load(&cuda_resumed).unwrap();
+    let max_param = c
+        .model
+        .parameters()
+        .iter()
+        .zip(g.model.parameters())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(
+        max_param <= 5e-5,
+        "multi-horizon CPU/CUDA drift: {max_param}"
+    );
+    let max_ema = c
+        .ema_weights
+        .iter()
+        .zip(&g.ema_weights)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(
+        max_ema <= 5e-5,
+        "multi-horizon EMA CPU/CUDA drift: {max_ema}"
+    );
+    assert_eq!(g.model.parameters(), r.model.parameters());
+    assert_eq!(g.ema_weights, r.ema_weights);
+    assert_eq!(g.rng.state, r.rng.state);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn stereo_glu_film_multi_horizon_cuda_matches_cpu_and_resumes() {
+    use feral::{
+        audio::{self, Preprocess},
+        backend::{Batch, Trainer},
+        conditioning, evaluate,
+        parameterization::{HorizonSchedule, LrSchedule, TimeSampling},
+        rng::Rng,
+        runtime::{self, Adam, Checkpoint, TrainConfig},
+    };
+
+    // Part A: Low-level Trainer::new_with_horizons + dynamic set_shape + stereo L/R/M/S STFT.
+    let model = Model::new(
+        Architecture {
+            block: 4,
+            width: 6,
+            dilations: vec![1, 2, 1],
+            scales: vec![],
+            sample_conv: 5,
+            block_style: BlockStyle::GluFilm,
+            channels: 2,
+        },
+        97,
+    );
+    let flow = FlowConfig::Preconditioned {
+        data_scale: 0.20,
+        prior_std: 0.20,
+    };
+    let horizons = [(256, 4), (512, 2), (1024, 1)];
+    let adam0 = Adam::new(model.count(), 0.0005);
+    let mut cpu_model = model.clone();
+    let mut cpu_adam = adam0.clone();
+    let mut cpu = Trainer::new_with_horizons("cpu", &cpu_model, &cpu_adam, &horizons, &flow)
+        .expect("cpu trainer");
+    let mut gpu_model = model.clone();
+    let mut gpu_adam = adam0;
+    let mut gpu = Trainer::new_with_horizons("cuda", &gpu_model, &gpu_adam, &horizons, &flow)
+        .expect("cuda trainer");
+    let init_p = cpu_model.parameters();
+    let mut cpu_ema = init_p.clone();
+    let mut gpu_ema = init_p;
+    let ema_decay = 0.9f32;
+    cpu.configure_ema(ema_decay, &cpu_ema).unwrap();
+    gpu.configure_ema(ema_decay, &gpu_ema).unwrap();
+
+    let mut rng = Rng::new(103);
+    let mut cpu_steps = Vec::new();
+    let mut gpu_steps = Vec::new();
+    let schedule = [(256, 4), (512, 2), (1024, 1), (256, 4)];
+    for (step_idx, &(sn, sitems)) in schedule.iter().enumerate() {
+        let total_scalars = sn * 2 * sitems;
+        let mut clean = vec![0f32; total_scalars];
+        for i in 0..sn * sitems {
+            clean[2 * i] = 0.2 * (i as f32 * 0.13).sin() + 0.05 * rng.normal();
+            clean[2 * i + 1] = 0.2 * (i as f32 * 0.29 + 0.7).cos() + 0.05 * rng.normal();
+        }
+        let mut mask = vec![0f32; total_scalars];
+        for item in 0..sitems {
+            let start = item * sn * 2;
+            let _ = conditioning::training_mask_channels_into(
+                &mut mask[start..start + sn * 2],
+                2,
+                &mut rng,
+            );
+        }
+        let noise: Vec<f32> = (0..total_scalars).map(|_| rng.normal() * 0.20).collect();
+        let t: Vec<f32> = (0..sitems).map(|i| 0.15 + 0.2 * i as f32).collect();
+        let lr = 0.0005 * (1. + 0.1 * step_idx as f32);
+
+        cpu.set_shape(sn, sitems).unwrap();
+        gpu.set_shape(sn, sitems).unwrap();
+
+        let cs = cpu
+            .step(
+                &mut cpu_model,
+                &mut cpu_adam,
+                &flow,
+                Batch {
+                    clean: &clean,
+                    mask: &mask,
+                    noise: &noise,
+                    t: &t,
+                    detail: 0.5,
+                    spectral: 1.0,
+                    lr,
+                    weight_decay: 0.05,
+                },
+            )
+            .unwrap();
+        let cp = cpu_model.parameters();
+        for (e, &w) in cpu_ema.iter_mut().zip(&cp) {
+            *e = ema_decay * *e + (1. - ema_decay) * w;
+        }
+        let gs = gpu
+            .step(
+                &mut gpu_model,
+                &mut gpu_adam,
+                &flow,
+                Batch {
+                    clean: &clean,
+                    mask: &mask,
+                    noise: &noise,
+                    t: &t,
+                    detail: 0.5,
+                    spectral: 1.0,
+                    lr,
+                    weight_decay: 0.05,
+                },
+            )
+            .unwrap();
+        cpu_steps.push(cs);
+        gpu_steps.push(gs);
+    }
+    for (step_idx, gs) in gpu_steps.iter().enumerate() {
+        let cs = &cpu_steps[step_idx.saturating_sub(1)];
+        assert!(
+            (cs.loss - gs.loss).abs() <= 2e-5,
+            "stereo step {step_idx} lagged loss drift cpu={} cuda={}",
+            cs.loss,
+            gs.loss
+        );
+        assert!(
+            (cs.norm - gs.norm).abs() <= 5e-5,
+            "stereo step {step_idx} lagged norm drift cpu={} cuda={}",
+            cs.norm,
+            gs.norm
+        );
+    }
+    gpu.sync(&mut gpu_model, &mut gpu_adam).unwrap();
+    gpu.sync_ema(&mut gpu_ema).unwrap();
+    let max_w = cpu_model
+        .parameters()
+        .iter()
+        .zip(gpu_model.parameters())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(max_w <= 5e-5, "stereo GluFilm weight drift: {max_w}");
+    let max_m = cpu_adam
+        .m
+        .iter()
+        .zip(&gpu_adam.m)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(max_m <= 5e-5, "stereo GluFilm AdamW m drift: {max_m}");
+    let max_e = cpu_ema
+        .iter()
+        .zip(&gpu_ema)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(max_e <= 5e-5, "stereo GluFilm EMA drift: {max_e}");
+
+    // Part B: End-to-end stereo multi-horizon training, evaluation, and deterministic resume.
+    let root = std::env::temp_dir().join(format!("feral-cuda-stereo-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir(&root).unwrap();
+    audio::synthetic_stereo(&root.join("corpus"), 16000).unwrap();
+
+    let make = |run_name: &str, backend: &str, steps: usize, resume| TrainConfig {
+        input: root.join("corpus"),
+        run: root.join(run_name),
+        backend: backend.into(),
+        steps,
+        seed: 73,
+        crop_seconds: 0.032,
+        preprocess: Preprocess {
+            channel: "stereo".into(),
+            ..Preprocess::default()
+        },
+        lr: 0.0005,
+        preview_every: 2,
+        checkpoint_every: 2,
+        resume,
+        weights_only: false,
+        grow_crop: false,
+        architecture: Architecture {
+            block: 4,
+            width: 6,
+            dilations: vec![1, 2, 1],
+            scales: vec![],
+            sample_conv: 5,
+            block_style: BlockStyle::GluFilm,
+            channels: 2,
+        },
+        flow: flow.clone(),
+        detail: 0.5,
+        spectral_weight: 1.0,
+        time_sampling: TimeSampling::LogitNormal { mean: 0., std: 1. },
+        lr_schedule: LrSchedule::Cosine {
+            warmup_steps: 2,
+            total_steps: 6,
+            min_lr: 1e-4,
+        },
+        ema_decay: 0.9,
+        weight_decay: 0.02,
+        crop_horizons: vec![0.032, 0.064],
+        horizon_schedule: HorizonSchedule::Random,
+        horizon_steps: Some(4),
+        batch: 2,
+        validation: Some(root.join("corpus")),
+        validation_every: 2,
+    };
+
+    let cpu_all = runtime::train(make("cpu-all", "cpu", 4, None)).expect("cpu train");
+    let cuda_all = runtime::train(make("cuda-all", "cuda", 4, None)).expect("cuda train");
+    let cuda_first = runtime::train(make("cuda-first", "cuda", 2, None)).expect("cuda first");
+    let cuda_resumed =
+        runtime::train(make("cuda-resumed", "cuda", 2, Some(cuda_first))).expect("cuda resume");
+
+    let c = Checkpoint::load(&cpu_all).unwrap();
+    let g = Checkpoint::load(&cuda_all).unwrap();
+    let r = Checkpoint::load(&cuda_resumed).unwrap();
+    assert_eq!(c.channels(), 2);
+    assert_eq!(g.channels(), 2);
+    let max_param = c
+        .model
+        .parameters()
+        .iter()
+        .zip(g.model.parameters())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(max_param <= 5e-5, "stereo CPU/CUDA drift: {max_param}");
+    let max_ema = c
+        .ema_weights
+        .iter()
+        .zip(&g.ema_weights)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    assert!(max_ema <= 5e-5, "stereo EMA CPU/CUDA drift: {max_ema}");
+    assert_eq!(g.model.parameters(), r.model.parameters());
+    assert_eq!(g.ema_weights, r.ema_weights);
+    assert_eq!(g.rng.state, r.rng.state);
+
+    let gen_spec = hound::WavReader::open(root.join("cuda-all/generated.wav"))
+        .unwrap()
+        .spec();
+    assert_eq!(gen_spec.channels, 2);
+
+    evaluate::evaluate_with_options(
+        &cuda_all,
+        &root.join("corpus"),
+        &root.join("eval-cpu.json"),
+        2,
+        1,
+        "cpu",
+        true,
+    )
+    .unwrap();
+    evaluate::evaluate_with_options(
+        &cuda_all,
+        &root.join("corpus"),
+        &root.join("eval-cuda.json"),
+        2,
+        1,
+        "cuda",
+        true,
+    )
+    .unwrap();
+    let ec: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("eval-cpu.json")).unwrap()).unwrap();
+    let eg: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("eval-cuda.json")).unwrap()).unwrap();
+    let diff_eval = (ec["mean_velocity_mse"].as_f64().unwrap()
+        - eg["mean_velocity_mse"].as_f64().unwrap())
+    .abs();
+    assert!(
+        diff_eval <= 1e-5,
+        "stereo evaluate CPU/CUDA drift: {diff_eval}"
+    );
     std::fs::remove_dir_all(root).unwrap();
 }

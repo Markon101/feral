@@ -21,6 +21,8 @@ pub struct Batch<'a> {
     pub spectral: f32,
     /// Learning rate for this optimizer step (allows scheduled decay without mutating base lr).
     pub lr: f32,
+    /// Decoupled AdamW weight decay factor applied only to weights (not biases); 0 disables it.
+    pub weight_decay: f32,
 }
 impl Batch<'_> {
     pub fn items(&self) -> usize {
@@ -51,6 +53,12 @@ pub trait Resident {
     fn set_spectral(&mut self, _weight: f32) {}
     /// Override the learning rate used by subsequent optimizer steps.
     fn set_lr(&mut self, _lr: f32) {}
+    /// Decoupled AdamW weight decay factor applied to weights (0 disables).
+    fn set_weight_decay(&mut self, _wd: f32) {}
+    /// Switch active `(crop_samples, batch_items)` within preallocated multi-horizon capacity.
+    fn set_shape(&mut self, _n: usize, _items: usize) -> Result<()> {
+        bail!("dynamic multi-horizon shapes are not supported by this backend")
+    }
     /// Forward-only field evaluation. A backend without a cheaper path stays correct by running a
     /// full step without an update; the CUDA resident skips the backward pass instead.
     fn predict(&mut self, x: &[f32], mask: &[f32], t: f32) -> Result<Vec<f32>> {
@@ -71,8 +79,12 @@ pub trait Resident {
     fn info(&self) -> Value;
     fn completed_steps(&self) -> usize;
 }
+pub struct CpuState {
+    pub spectral: SpectralEngine,
+    pub decay_mask: Vec<f32>,
+}
 pub enum Trainer {
-    Cpu(Box<SpectralEngine>),
+    Cpu(Box<CpuState>),
     #[cfg(feature = "opencl")]
     OpenCl(Box<crate::gpu::OpenClTrainer>),
     #[cfg(feature = "cuda")]
@@ -87,12 +99,32 @@ impl Trainer {
         flow: &FlowConfig,
         batch: usize,
     ) -> Result<Self> {
-        ensure!((1..=64).contains(&batch), "batch size must be 1..64");
+        Self::new_with_horizons(name, model, adam, &[(n, batch)], flow)
+    }
+    pub fn new_with_horizons(
+        name: &str,
+        model: &Model,
+        adam: &Adam,
+        horizons: &[(usize, usize)],
+        flow: &FlowConfig,
+    ) -> Result<Self> {
+        ensure!(!horizons.is_empty(), "at least one horizon is required");
+        for &(_, batch) in horizons {
+            ensure!((1..=64).contains(&batch), "batch size must be 1..64");
+        }
         match name {
-            "cpu" => Ok(Self::Cpu(Box::default())),
+            "cpu" => Ok(Self::Cpu(Box::new(CpuState {
+                spectral: SpectralEngine::new(),
+                decay_mask: model.weight_decay_mask(),
+            }))),
             "opencl" => {
                 #[cfg(feature = "opencl")]
                 {
+                    ensure!(
+                        horizons.len() == 1,
+                        "multi-horizon training is implemented on CPU and CUDA backends only"
+                    );
+                    let (n, batch) = horizons[0];
                     ensure!(
                         batch == 1,
                         "the OpenCL backend is single-crop; use --backend cuda or --batch 1"
@@ -106,28 +138,48 @@ impl Trainer {
                 }
                 #[cfg(not(feature = "opencl"))]
                 {
-                    let _ = (model, adam, n, flow, batch);
+                    let _ = (model, adam, horizons, flow);
                     bail!("OpenCL was requested but not compiled; cargo build --locked --offline --release --features opencl -j 8")
                 }
             }
             "cuda" => {
                 #[cfg(feature = "cuda")]
                 {
-                    Ok(Self::Cuda(Box::new(crate::cuda::CudaTrainer::new(
-                        model,
-                        adam,
-                        n,
-                        batch,
-                        flow.clone(),
-                    )?)))
+                    Ok(Self::Cuda(Box::new(
+                        crate::cuda::CudaTrainer::new_with_horizons(
+                            model,
+                            adam,
+                            horizons,
+                            flow.clone(),
+                        )?,
+                    )))
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    let _ = (model, adam, n, flow, batch);
+                    let _ = (model, adam, horizons, flow);
                     bail!("CUDA was requested but not compiled; cargo build --locked --offline --release --features cuda -j 8")
                 }
             }
             _ => bail!("backend must be cpu, opencl or cuda"),
+        }
+    }
+    /// Switch active `(crop_samples, batch_items)` within preallocated multi-horizon bounds.
+    pub fn set_shape(&mut self, n: usize, items: usize) -> Result<()> {
+        match self {
+            Self::Cpu(_) => {
+                let _ = (n, items);
+                Ok(())
+            }
+            #[cfg(feature = "opencl")]
+            Self::OpenCl(g) => {
+                ensure!(
+                    g.matches_shape(n, items),
+                    "multi-horizon shape changes are not supported on the OpenCL backend"
+                );
+                Ok(())
+            }
+            #[cfg(feature = "cuda")]
+            Self::Cuda(g) => g.set_shape(n, items),
         }
     }
     /// Configure optional EMA weight tracking on resident GPU trainers (CPU tracks EMA in host
@@ -178,10 +230,11 @@ impl Trainer {
         batch: Batch<'_>,
     ) -> Result<Step> {
         match self {
-            Self::Cpu(spectral) => {
+            Self::Cpu(state) => {
                 let items = batch.items();
+                let ch = model.architecture.channels.max(1);
                 ensure!(
-                    items > 0 && batch.clean.len().is_multiple_of(items),
+                    items > 0 && batch.clean.len().is_multiple_of(items * ch),
                     "invalid CPU batch shape"
                 );
                 let n = batch.clean.len() / items;
@@ -204,7 +257,7 @@ impl Trainer {
                         batch.t[i],
                         batch.detail,
                         batch.spectral,
-                        spectral,
+                        &state.spectral,
                     );
                     loss += item_loss;
                     for (dst, src) in accumulated.iter_mut().zip(&g) {
@@ -216,7 +269,13 @@ impl Trainer {
                 }
                 let neural_ms = neural.elapsed().as_secs_f64() * 1000.;
                 let optimizer = Instant::now();
-                let norm = adam.update_with_lr(model, &accumulated, batch.lr)?;
+                let norm = adam.update_with_lr_wd(
+                    model,
+                    &accumulated,
+                    batch.lr,
+                    batch.weight_decay,
+                    Some(&state.decay_mask),
+                )?;
                 Ok(Step {
                     loss: loss / items as f32,
                     norm,
@@ -238,6 +297,10 @@ impl Trainer {
                     batch.spectral == 0.,
                     "spectral loss is implemented on the CPU and CUDA backends only"
                 );
+                ensure!(
+                    batch.weight_decay == 0.,
+                    "AdamW weight decay is implemented on the CPU and CUDA backends only"
+                );
                 g.set_lr(batch.lr);
                 let s = g.train_step(
                     batch.clean,
@@ -258,6 +321,7 @@ impl Trainer {
                 g.set_detail(batch.detail);
                 g.set_spectral(batch.spectral);
                 g.set_lr(batch.lr);
+                g.set_weight_decay(batch.weight_decay);
                 let s = g.train_step(batch.clean, batch.mask, batch.noise, batch.t)?;
                 adam.step = g.step;
                 Ok(Step {

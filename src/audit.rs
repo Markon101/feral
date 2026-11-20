@@ -143,6 +143,7 @@ pub fn audit(checkpoint: &Path, output: &Path, steps: usize, make: &Factory<'_>)
             scales: vec![1, 2],
             sample_conv: 0,
             block_style: crate::model::BlockStyle::Tanh,
+            channels: 1,
         },
         7,
     );
@@ -206,7 +207,8 @@ pub fn audit(checkpoint: &Path, output: &Path, steps: usize, make: &Factory<'_>)
     for i in 0..steps + 2 {
         let clean = dataset.crop(ck.crop_samples, &mut rng);
         ensure!(!clean.is_empty(), "silent audit crop");
-        let (mask, _) = conditioning::training_mask(clean.len(), &mut rng);
+        let ch = ck.channels();
+        let (mask, _) = conditioning::training_mask_channels(ck.crop_samples, ch, &mut rng);
         let noise: Vec<f32> = (0..clean.len())
             .map(|_| rng.normal() * ck.flow.prior_std())
             .collect();
@@ -267,7 +269,8 @@ pub fn audit(checkpoint: &Path, output: &Path, steps: usize, make: &Factory<'_>)
     let loaded = Checkpoint::load(&state_path)?;
     let mut resumed = make(&loaded.model, &loaded.adam, ck.crop_samples, &ck.flow)?;
     let clean = dataset.crop(ck.crop_samples, &mut rng);
-    let (mask, _) = conditioning::training_mask(clean.len(), &mut rng);
+    let ch = ck.channels();
+    let (mask, _) = conditioning::training_mask_channels(ck.crop_samples, ch, &mut rng);
     let noise: Vec<f32> = (0..clean.len())
         .map(|_| rng.normal() * ck.flow.prior_std())
         .collect();
@@ -299,7 +302,7 @@ pub fn audit(checkpoint: &Path, output: &Path, steps: usize, make: &Factory<'_>)
         close(&portable.model.parameters(), &gm.parameters(), 5e-6, 1e-4),
         "device checkpoint cannot continue with CPU within tolerance"
     );
-    let zeros = vec![0.; ck.crop_samples];
+    let zeros = vec![0.; ck.crop_samples * ch];
     let sample = flow::sample(
         &loaded.velocity(),
         &zeros,
@@ -309,7 +312,7 @@ pub fn audit(checkpoint: &Path, output: &Path, steps: usize, make: &Factory<'_>)
             ..Default::default()
         },
     )?;
-    audio::write_wav(&output.with_extension("wav"), &sample, ck.sample_rate)?;
+    audio::write_wav_channels(&output.with_extension("wav"), &sample, ck.sample_rate, ch)?;
     let cpu_mean = cpu_ms.iter().sum::<f64>() / steps as f64;
     let device_mean = device_ms.iter().sum::<f64>() / steps as f64;
     runtime::write_json(

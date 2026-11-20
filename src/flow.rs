@@ -88,13 +88,14 @@ pub fn loss_gradient_detailed(
         loss += d * d / count;
         dy[i] = 2. * d / count;
     }
+    let ch = model.architecture.channels.max(1);
     if detail > 0. {
-        for i in 0..n.saturating_sub(1) {
-            if mask[i] == 0. && mask[i + 1] == 0. {
-                let delta = r[i + 1] - r[i];
+        for i in 0..n.saturating_sub(ch) {
+            if mask[i] == 0. && mask[i + ch] == 0. {
+                let delta = r[i + ch] - r[i];
                 loss += detail * delta * delta / count;
                 dy[i] -= 2. * detail * delta / count;
-                dy[i + 1] += 2. * detail * delta / count;
+                dy[i + ch] += 2. * detail * delta / count;
             }
         }
     }
@@ -128,6 +129,7 @@ pub fn sample<M: Velocity + ?Sized>(
     c: &Sampling,
 ) -> Result<Vec<f32>> {
     c.validate()?;
+    let ch = model.channels();
     ensure!(
         model.prior_std().is_finite() && model.prior_std() > 0.,
         "invalid backend prior standard deviation"
@@ -135,8 +137,8 @@ pub fn sample<M: Velocity + ?Sized>(
     ensure!(
         !known.is_empty()
             && known.len() == mask.len()
-            && known.len().is_multiple_of(model.block())
-            && known.len() <= crate::model::MAX_WINDOW_SAMPLES,
+            && known.len().is_multiple_of(model.block() * ch)
+            && known.len() <= crate::model::MAX_WINDOW_SAMPLES * ch,
         "invalid sample shape or beyond the maximum window",
     );
     ensure!(
@@ -178,7 +180,7 @@ pub fn sample<M: Velocity + ?Sized>(
             *v = v.clamp(-0.98, 0.98);
         }
     }
-    conditioning::continuity(&mut x, known, mask, c.collar);
+    conditioning::continuity_channels(&mut x, known, mask, c.collar, ch);
     for (v, &m) in x.iter_mut().zip(mask) {
         if m == 0. {
             *v = v.clamp(-0.98, 0.98);
